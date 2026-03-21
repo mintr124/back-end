@@ -33,18 +33,18 @@ class DocumentService:
         self.departments = DepartmentRepository()
         self.projects = ProjectRepository()
 
-    def _resolve_department(self, db: Session, code: str) -> Department:
-        dept = self.departments.get_by_code(db, code)
+    def _resolve_department(self, db: Session, id: str) -> Department:
+        dept = self.departments.get_by_id(db, id)
         if not dept:
-            raise HTTPException(status_code=404, detail=f"Department not found: {code}")
+            raise HTTPException(status_code=404, detail=f"Department not found: {id}")
         return dept
 
-    def _resolve_project(self, db: Session, code: str, department_id: str) -> Project:
-        proj = self.projects.get_by_code(db, code)
+    def _resolve_project(self, db: Session, project_id: str, department_id: str) -> Project:
+        proj = self.projects.get_by_id(db, project_id)
         if proj and proj.department_id != department_id:
             raise HTTPException(status_code=400, detail="Project does not belong to selected department")
         if not proj:
-            proj = self.projects.create(db, code, code, department_id)
+            proj = self.projects.create(db, project_id, department_id)
         return proj
 
     def _policy_contract(self, doc: Document) -> dict:
@@ -65,7 +65,7 @@ class DocumentService:
             "violation_action": "mask",
             "allowed_roles": doc.allowed_roles,
             "policy_version": settings.default_policy_version,
-        }
+        } #TODO: change to policy-as-code, now is hard code
 
     def list_documents(self, db: Session, user: User) -> list[Document]:
         docs = self.docs.list_all(db)
@@ -102,7 +102,7 @@ class DocumentService:
             db.commit()
             raise HTTPException(status_code=403, detail=reason)
 
-        proj = self._resolve_project(db, payload.project_code, dept.id) if payload.project_code else None
+        proj = self._resolve_project(db, payload.project_id, dept.id) if payload.project_id else None
 
         doc = Document(
             title=payload.title,
@@ -158,14 +158,14 @@ class DocumentService:
         if payload.department_id:
             dept = self._resolve_department(db, payload.department_id)
             doc.department_id = dept.id
-            if payload.project_code:
-                proj = self._resolve_project(db, payload.project_code, dept.id)
+            if payload.project_id:
+                proj = self._resolve_project(db, payload.project_id, dept.id)
                 doc.project_id = proj.id
             else:
                 doc.project_id = None
 
-        if payload.project_code and not payload.department_id:
-            proj = self._resolve_project(db, payload.project_code, doc.department_id)
+        if payload.project_id and not payload.department_id:
+            proj = self._resolve_project(db, payload.project_id, doc.department_id)
             doc.project_id = proj.id
 
         if payload.title is not None:
@@ -261,7 +261,7 @@ class DocumentService:
         self.versions.create(db, version)
 
         doc.current_version_id = version.id
-        doc.status = "uploaded"
+        # Only update current_version_id here ? do not modify other Document fields
 
         snapshot = DocumentPolicySnapshot(
             document_version_id=version.id,

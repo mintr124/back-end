@@ -47,6 +47,7 @@ class JobService:
             step_name=step_name,
             status="running",
             detail_json=detail_json or {},
+            started_at=datetime.now(timezone.utc),
         )
         self.repo.add_step(db, step)
         return step

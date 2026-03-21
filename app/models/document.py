@@ -21,6 +21,7 @@ class Document(Base, TimestampMixin):
     data_type = Column(String(64), nullable=False, default="text")
 
     allowed_roles = Column(JSON, nullable=False, default=list)
+    tags = Column(JSON, nullable=False, default=list)
     status = Column(String(32), nullable=False, default="draft")
     current_version_id = Column(String(36), ForeignKey("document_versions.id"), nullable=True, index=True)
 

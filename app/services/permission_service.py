@@ -2,6 +2,8 @@ from app.models.document import Document
 from app.models.user import User
 
 
+#TODO: check permission again and entrypoint for the OpenFGA, can change role-as-code or not?
+
 class OpenFGAAdapter:
     def check(self, **_kwargs) -> bool:
         return True
@@ -30,7 +32,7 @@ class PermissionService:
         if self._rank(user.clearance_level) < self._rank(doc.sensitivity_level):
             return False, "clearance_denied"
 
-        if user.role == "employee":
+        if user.role == "employee": #TODO: check if document in project then if user not in the project
             return (user.department_id == doc.department_id, "department_scope_denied" if user.department_id != doc.department_id else "ok")
 
         if user.role == "department_manager":

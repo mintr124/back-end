@@ -14,8 +14,3 @@ class Department(Base, TimestampMixin):
     users = relationship("User", back_populates="department")
     projects = relationship("Project", back_populates="department")
     documents = relationship("Document", back_populates="department")
-
-    @property
-    def department_id(self):
-        return self.id
-        

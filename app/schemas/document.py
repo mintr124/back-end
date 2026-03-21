@@ -30,6 +30,7 @@ class DocumentCreateRequest(BaseModel):
             "admin_auditor",
         ]
     )
+    tags: Optional[list[str]] = None
 
 
 class DocumentUpdateRequest(BaseModel):
@@ -41,6 +42,7 @@ class DocumentUpdateRequest(BaseModel):
     sensitivity_level: Optional[str] = None
     data_type: Optional[str] = None
     allowed_roles: Optional[list[str]] = None
+    tags: Optional[list[str]] = None
 
 
 class DocumentRead(BaseModel):
@@ -56,6 +58,7 @@ class DocumentRead(BaseModel):
     sensitivity_level: str
     data_type: str
     allowed_roles: list[str]
+    allowed_roles: Optional[list[str]] = None
     status: str
     current_version_id: Optional[str] = None
     version_count: int = 0
@@ -68,7 +71,8 @@ class DocumentVersionRead(BaseModel):
 
     id: str
     document_id: str
-    version_id: str
+    version_id: str = Field(alias="id")
+    version_no: int
     file_name: str
     mime_type: str
     checksum: str

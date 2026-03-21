@@ -5,7 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class LoginRequest(BaseModel):
     email: Optional[str] = None
-    role: Optional[str] = None
+    role: Optional[str] = None #TODO: delete role just receive payload email enough
 
 
 class UserRead(BaseModel):

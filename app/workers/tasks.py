@@ -6,6 +6,7 @@ celery_app = Celery(
     "ingest_embedding",
     broker=settings.redis_url,
     backend=settings.redis_url,
+    include=["app.workers.ingest_tasks"],
 )
 
 celery_app.conf.update(

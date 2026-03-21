@@ -30,7 +30,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 configure_logging()
 
-app = FastAPI(title="ingest-embedding-api", version="1.0.0")
+app = FastAPI(title="rag-role-enterprise-api", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,

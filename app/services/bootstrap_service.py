@@ -10,16 +10,18 @@ class BootstrapService:
         if db.query(User).count() > 0:
             return
 
-        engineering = Department(code="engineering", name="Engineering")
-        knowledge = Department(code="knowledge-management", name="Knowledge Management")
-        it_admin = Department(code="it-administration", name="IT Administration")
-        finance = Department(code="finance", name="Finance")
+        engineering = Department(name="Engineering")
+        bod = Department(name="Board of Directors")
+        hr = Department(name="HR")
+        it_admin = Department(name="IT Administration")
+        finance = Department(name="Finance")
+        sale = Department(name="Sales")
 
-        db.add_all([engineering, knowledge, it_admin, finance])
+        db.add_all([engineering, bod, it_admin, finance])
         db.flush()
 
-        project_erp = Project(code="ERP_upgrade", name="ERP Upgrade", department_id=finance.id)
-        project_kb = Project(code="KB_platform", name="Knowledge Base Platform", department_id=knowledge.id)
+        project_erp = Project(name="ERP Upgrade", department_id=finance.id)
+        project_kb = Project(name="Knowledge Base Platform", department_id=bod.id)
 
         db.add_all([project_erp, project_kb])
         db.flush()
@@ -38,15 +40,15 @@ class BootstrapService:
                 name="Tran Binh",
                 role="department_manager",
                 clearance_level="confidential",
-                department_id=engineering.id,
+                department_id=finance.id,
                 status="active",
             ),
             User(
                 email="cuong.le@company.com",
                 name="Le Cuong",
-                role="knowledge_director",
+                role="director",
                 clearance_level="restricted",
-                department_id=knowledge.id,
+                department_id=bod.id,
                 status="active",
             ),
             User(

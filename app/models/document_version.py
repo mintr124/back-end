@@ -10,6 +10,7 @@ class DocumentVersion(Base, TimestampMixin):
 
     id = Column(String(36), primary_key=True, default=new_uuid)
     document_id = Column(String(36), ForeignKey("documents.id"), nullable=False, index=True)
+    version_no = Column(Integer, nullable=False)
 
     file_name = Column(String(255), nullable=False)
     mime_type = Column(String(128), nullable=False)

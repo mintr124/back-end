@@ -4,13 +4,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    app_name: str = "ingest-embedding-api"
+    app_name: str = "rag-role-enterprise-api"
     env: str = "dev"
 
     database_url: str = "mysql+pymysql://rag:rag@mysql:3306/ragdb?charset=utf8mb4"
     redis_url: str = "redis://redis:6379/0"
 
-    jwt_secret_key: str = "change-me-please"
+    jwt_secret_key: str = "secret"
     jwt_algorithm: str = "HS256"
     access_token_exp_minutes: int = 1440
 
