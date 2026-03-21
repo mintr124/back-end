@@ -261,7 +261,7 @@ class DocumentService:
         self.versions.create(db, version)
 
         doc.current_version_id = version.id
-        # Only update current_version_id here ? do not modify other Document fields
+        doc.status = "uploaded"
 
         snapshot = DocumentPolicySnapshot(
             document_version_id=version.id,

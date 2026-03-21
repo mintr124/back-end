@@ -3,7 +3,7 @@ import math
 import re
 
 
-class EmbeddingService:
+class EmbeddingService: #TODO: change to use model provide by openAPI
     def __init__(self, dims: int = 384, model_name: str = "hash-embedding-v1"):
         self.dims = dims
         self.model_name = model_name

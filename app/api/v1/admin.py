@@ -6,6 +6,7 @@ from app.models.user import User
 
 router = APIRouter()
 
+#TODO: do after for refresh phase
 
 def require_admin(user: User):
     if user.role not in {"director", "admin_auditor"}:
