@@ -1,4 +1,4 @@
-from app.schemas.auth import LoginRequest, TokenResponse, UserRead
+from app.schemas.auth import LoginRequest, TokenResponse
 from app.schemas.audit import AuditRead
 from app.schemas.document import (
     DocumentCreateRequest,
@@ -10,6 +10,7 @@ from app.schemas.document import (
 )
 from app.schemas.health import HealthResponse
 from app.schemas.job import JobRead, JobStepRead
+from app.schemas.user import UserRead
 
 __all__ = [
     "LoginRequest",

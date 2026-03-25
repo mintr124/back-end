@@ -3,8 +3,9 @@ from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_user, get_db
 from app.models.user import User
-from app.schemas.auth import LoginRequest, TokenResponse, UserRead
+from app.schemas.auth import LoginRequest, TokenResponse
 from app.services.auth_service import auth_service
+from app.schemas.user import UserRead
 
 router = APIRouter()
 

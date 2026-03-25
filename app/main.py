@@ -13,6 +13,7 @@ from app.api.v1.jobs import router as jobs_router
 from app.api.v1.health import router as health_router
 from app.api.v1.admin import router as admin_router
 from app.api.v1.chat import router as chat_router
+from app.api.v1.users import router as users_router
 from app.core.exceptions import register_exception_handlers
 from app.db.init_db import init_db
 from app.db.session import SessionLocal, engine, get_db
@@ -97,3 +98,4 @@ app.include_router(documents_router, prefix="/documents", tags=["documents"])
 app.include_router(jobs_router, prefix="/jobs", tags=["jobs"])
 app.include_router(admin_router, prefix="/admin", tags=["admin"])
 app.include_router(chat_router, prefix="", tags=["chat"])
+app.include_router(users_router, prefix="", tags=["users"])

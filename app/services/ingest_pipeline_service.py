@@ -134,6 +134,7 @@ class IngestPipelineService:
                     "document_id": doc.id,
                     "document_version_id": version.id,
                     "department_id": doc.department_id,
+                    "document_title": doc.title,
                     "project_id": doc.project_id,
                     "document_type": doc.document_type,
                     "sensitivity_level": doc.sensitivity_level,

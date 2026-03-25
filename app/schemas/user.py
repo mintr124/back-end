@@ -1,7 +1,6 @@
 from typing import Optional
 from pydantic import BaseModel, ConfigDict
 
-
 class UserRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -10,6 +9,5 @@ class UserRead(BaseModel):
     name: str
     role: str
     clearance_level: str
-    department_id: str
+    department_id: Optional[str] = None
     status: str
-    last_active: str

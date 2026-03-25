@@ -9,6 +9,7 @@ class MessageSource(Base, TimestampMixin):
     id = Column(String(36), primary_key=True, default=new_uuid)
     message_id = Column(String(36), nullable=False, index=True)
     document_id = Column(String(36), nullable=True)
+    document_title = Column(String(1000), nullable=True)
     version_id = Column(String(36), nullable=True)
     section_path = Column(String(512), nullable=True) #TODO: add the section process
     relevance = Column(Float, nullable=True)

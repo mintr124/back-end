@@ -87,7 +87,7 @@ class ChatService:
                     "documentId": md.get("document_id"),
                     "documentTitle": md.get("document_title") or md.get("document_id"),
                     "versionId": md.get("document_version_id"),
-                    "sectionPath": md.get("section_path"),
+                    "sectionPath": md.get("section_path"), #TODO: check all sectionPath, generative when embedding
                     "relevance": r.get("score") if r.get("score") is not None else r.get("relevance"),
                     "excerpt": r.get("document_text") or md.get("excerpt"),
                 }
@@ -123,6 +123,7 @@ class ChatService:
             src = MessageSource(
                 message_id=assistant_message_id,
                 document_id=s.get("documentId"),
+                document_title=s.get("documentTitle"),
                 version_id=s.get("versionId"),
                 section_path=s.get("sectionPath"),
                 relevance=s.get("relevance"),
@@ -302,7 +303,7 @@ class ChatService:
                         sources_out.append(
                             {
                                 "documentId": s.document_id,
-                                "documentTitle": s.document_id,
+                                "documentTitle": s.document_title,
                                 "versionId": s.version_id,
                                 "sectionPath": s.section_path,
                                 "relevance": s.relevance,
