@@ -38,3 +38,13 @@ class ChromaRepository:
             embeddings=[embedding],
             metadatas=[flat],
         )
+
+    def query_by_embedding(self, *, embedding: list[float], top_k: int = 5) -> dict:
+        # returns a dict with ids, documents, metadatas, distances
+        res = self.collection.query(
+            query_embeddings=[embedding],
+            n_results=top_k,
+            # 'ids' is not a valid include item for chromadb query; ids are returned separately
+            include=["metadatas", "documents", "distances"],
+        )
+        return res

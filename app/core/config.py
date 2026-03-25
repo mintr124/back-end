@@ -28,5 +28,21 @@ class Settings(BaseSettings):
     max_upload_size_mb: int = 50
     default_policy_version: str = "v1"
 
+    # LLM configuration
+    # Set to 'openai' or 'olama' to enable an LLM backend. If None, LLM calls are disabled.
+    llm_provider: str | None = None
+
+    # OpenAI settings
+    openai_api_key: str | None = None
+    openai_api_base: str | None = None
+    openai_model: str | None = "gpt-4o-mini"
+
+    # Olama local server settings (e.g. http://localhost:11434)
+    olama_url: str | None = None
+    olama_model: str | None = None
+
+    # Timeout for LLM HTTP calls
+    llm_timeout_seconds: int = 30
+
 
 settings = Settings()
