@@ -126,7 +126,7 @@ class IngestPipelineService:
             version.chunk_status = "completed"
             db.commit()
 
-            embed_step = job_service.add_step(db, job_id=job.id, step_name="embed", detail_json={"dims": embedding_service.dims})
+            embed_step = job_service.add_step(db, job_id=job.id, step_name="embed", detail_json={"dimensions": embedding_service.dimensions})
             t0 = time.perf_counter()
             for chunk in chunk_models:
                 vector = embedding_service.embed(chunk.chunk_text)
@@ -158,7 +158,7 @@ class IngestPipelineService:
                         collection_name=settings.chroma_collection,
                         vector_id=chunk.id,
                         embedding_model=embedding_service.model_name,
-                        dims=embedding_service.dims,
+                        dimensions=embedding_service.dimensions,
                         embedding_status="completed",
                     )
                 )

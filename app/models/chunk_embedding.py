@@ -14,7 +14,7 @@ class ChunkEmbedding(Base, TimestampMixin):
     collection_name = Column(String(128), nullable=False)
     vector_id = Column(String(128), nullable=False, unique=True, index=True)
     embedding_model = Column(String(128), nullable=False)
-    dims = Column(Integer, nullable=False)
+    dimensions = Column(Integer, nullable=False)
     embedding_status = Column(String(32), nullable=False, default="completed")
     embedded_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
