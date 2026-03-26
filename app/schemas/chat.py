@@ -29,6 +29,7 @@ class MessageCreateRequest(BaseModel):
 class AssistantMessage(BaseModel):
     id: str
     content: str
+    status: Optional[str]
     createdAt: datetime
 
 

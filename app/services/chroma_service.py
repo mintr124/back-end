@@ -36,5 +36,8 @@ class ChromaService:
     def query_by_embedding(self, *, embedding: list[float], top_k: int = 5) -> dict:
         return self.repo.query_by_embedding(embedding=embedding, top_k=top_k)
 
+    def query_by_keyword(self, *, query: str, top_k: int = 5) -> dict:
+        return self.repo.query_by_keyword(query=query, top_k=top_k)
+
 
 chroma_service = ChromaService()

@@ -13,28 +13,30 @@ logger = logging.getLogger(__name__)
 
 _WORD_RE = re.compile(r"[0-9A-Za-z?-?_]+", re.UNICODE)
 
-
+# TODO: check permission retrieval for chunk
 class RetrievalService:
     def __init__(
         self,
         candidate_multiplier: int = 4,
         semantic_weight: float = 0.72,
         keyword_weight: float = 0.28,
-        minimum_score: float = 0.0,
+        minimum_score: float = 0.3,
+        lexical_candidate_k: int = 50,
     ):
         self.repo = ChromaRepository()
         self.candidate_multiplier = max(1, candidate_multiplier)
         self.semantic_weight = semantic_weight
         self.keyword_weight = keyword_weight
         self.minimum_score = minimum_score
+        self.lexical_candidate_k = lexical_candidate_k
 
     def _tokenize(self, text: str) -> list[str]:
         return _WORD_RE.findall((text or "").lower())
 
     def _distance_to_similarity(self, distance: Any) -> float:
         """
-        Chroma distance c? th? kh?c theo metric.
-        Chuy?n v? score ??n ?i?u: distance nh? -> similarity l?n.
+        Chuyển distance của Chroma sang similarity.
+        distance càng nhỏ thì similarity càng lớn.
         """
         try:
             d = float(distance)
@@ -59,10 +61,8 @@ class RetrievalService:
         overlap = sum(min(q_counter[t], d_counter[t]) for t in q_counter.keys())
         precision = overlap / max(1, len(d_tokens))
         recall = overlap / max(1, len(q_tokens))
-
         f1 = (2 * precision * recall) / max(1e-9, (precision + recall))
 
-        # th??ng nh? n?u query xu?t hi?n nguy?n c?m
         exact_phrase_bonus = 0.0
         q_phrase = " ".join(q_tokens[:12]).strip()
         d_norm = " ".join(d_tokens)
@@ -72,23 +72,52 @@ class RetrievalService:
         return min(1.0, f1 + exact_phrase_bonus)
 
     def _combine_score(self, semantic_score: float, keyword_score: float) -> float:
-        return (
-            self.semantic_weight * semantic_score
-            + self.keyword_weight * keyword_score
-        )
+        return self.semantic_weight * semantic_score + self.keyword_weight * keyword_score
 
-    def _rerank(self, query: str, raw: dict) -> list[dict]:
+    def _merge_candidates(self, semantic_raw: dict, lexical_raw: dict) -> list[dict]:
+        merged: dict[str, dict] = {}
+
+        def add_batch(raw: dict, source: str) -> None:
+            ids = raw.get("ids", [[]])[0] if raw.get("ids") else []
+            docs = raw.get("documents", [[]])[0] if raw.get("documents") else []
+            metadatas = raw.get("metadatas", [[]])[0] if raw.get("metadatas") else []
+            distances = raw.get("distances", [[]])[0] if raw.get("distances") else []
+
+            for i, chunk_id in enumerate(ids):
+                metadata = metadatas[i] if i < len(metadatas) and metadatas[i] else {}
+                document_text = docs[i] if i < len(docs) else ""
+                distance = distances[i] if i < len(distances) else None
+
+                if chunk_id not in merged:
+                    merged[chunk_id] = {
+                        "chunk_id": chunk_id,
+                        "document_text": document_text,
+                        "metadata": metadata,
+                        "distance": distance,
+                        "sources": {source},
+                    }
+                else:
+                    if not merged[chunk_id]["document_text"] and document_text:
+                        merged[chunk_id]["document_text"] = document_text
+                    if not merged[chunk_id]["metadata"] and metadata:
+                        merged[chunk_id]["metadata"] = metadata
+                    if merged[chunk_id]["distance"] is None and distance is not None:
+                        merged[chunk_id]["distance"] = distance
+                    merged[chunk_id]["sources"].add(source)
+
+        add_batch(semantic_raw or {}, "semantic")
+        add_batch(lexical_raw or {}, "lexical")
+
+        return list(merged.values())
+
+    def _rerank(self, query: str, candidates: list[dict]) -> list[dict]:
         results: list[dict] = []
 
-        ids = raw.get("ids", [[]])[0] if raw.get("ids") else []
-        docs = raw.get("documents", [[]])[0] if raw.get("documents") else []
-        metadatas = raw.get("metadatas", [[]])[0] if raw.get("metadatas") else []
-        distances = raw.get("distances", [[]])[0] if raw.get("distances") else []
-
-        for i, chunk_id in enumerate(ids):
-            metadata = metadatas[i] if i < len(metadatas) and metadatas[i] else {}
-            document_text = docs[i] if i < len(docs) else ""
-            distance = distances[i] if i < len(distances) else None
+        for item in candidates:
+            chunk_id = item.get("chunk_id")
+            metadata = item.get("metadata") or {}
+            document_text = item.get("document_text") or ""
+            distance = item.get("distance")
 
             semantic_score = self._distance_to_similarity(distance)
             keyword_score = self._keyword_score(query, document_text)
@@ -106,13 +135,14 @@ class RetrievalService:
                     "semantic_score": round(semantic_score, 6),
                     "keyword_score": round(keyword_score, 6),
                     "score": round(final_score, 6),
+                    "sources": sorted(list(item.get("sources", []))),
                 }
             )
 
         results.sort(key=lambda x: x["score"], reverse=True)
         return results
 
-    def retrieve(self, *, query: str, user=None, top_k: int = 5) -> list[dict]:
+    def retrieve(self, *, query: str, user=None, top_k: int = 3) -> list[dict]:
         query = (query or "").strip()
         if not query:
             return []
@@ -122,14 +152,21 @@ class RetrievalService:
 
         emb = embedding_service.embed(query)
 
-        candidate_k = max(top_k * self.candidate_multiplier, top_k)
-        raw = self.repo.query_by_embedding(embedding=emb, top_k=candidate_k)
+        semantic_k = max(top_k * self.candidate_multiplier, top_k)
+        lexical_k = max(self.lexical_candidate_k, top_k * self.candidate_multiplier)
 
-        if not raw or not raw.get("ids") or all(len(x) == 0 for x in raw.get("ids", [])):
-            logger.warning("Retrieval returned no ids for query=%s; raw=%s", query, raw)
+        semantic_raw = self.repo.query_by_embedding(embedding=emb, top_k=semantic_k)
+        lexical_raw = self.repo.query_by_keyword(query=query, top_k=lexical_k)
+
+        if (
+            (not semantic_raw or not semantic_raw.get("ids"))
+            and (not lexical_raw or not lexical_raw.get("ids"))
+        ):
+            logger.warning("Retrieval returned no candidates for query=%s", query)
             return []
 
-        ranked = self._rerank(query, raw)
+        merged_candidates = self._merge_candidates(semantic_raw, lexical_raw)
+        ranked = self._rerank(query, merged_candidates)
         return ranked[:top_k]
 
 

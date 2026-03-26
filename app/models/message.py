@@ -15,6 +15,7 @@ class Message(Base, TimestampMixin):
     token_usage = Column(JSON, nullable=True)
     parent_message_id = Column(String(36), nullable=True)
     client_message_id = Column(String(36), nullable=True, index=True)
+    status = Column(String(36), nullable=True, index=True)
     trace_id = Column(String(64), nullable=True, index=True)
 
     conversation = relationship("Conversation")

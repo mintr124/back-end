@@ -19,8 +19,8 @@ class ChromaRepository:
     Lazy-initialized Chroma repository.
 
     Notes:
-    - Uses Chroma 1.0+ `configuration` dict for index settings when available.
-    - Falls back to legacy metadata-based HNSW config for backward compatibility.
+    - Uses Chroma collection query API for semantic retrieval.
+    - Uses full-corpus scan for lexical candidate retrieval.
     - Avoids creating PersistentClient / collection at import time.
     """
 
@@ -96,3 +96,57 @@ class ChromaRepository:
             n_results=top_k,
             include=["documents", "metadatas", "distances"],
         )
+
+    def query_by_keyword(self, *, query: str, top_k: int = 5) -> dict:
+        """
+        Full-corpus lexical candidate retrieval.
+
+        This scans the whole collection and ranks documents by simple token overlap.
+        Returned shape is aligned with collection.query() as much as possible.
+        """
+        collection = self._get_collection()
+        query = (query or "").strip()
+        if not query:
+            return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
+
+        q_tokens = [t for t in query.lower().split() if t]
+        if not q_tokens:
+            return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
+
+        # Fetch the whole corpus for lexical scoring
+        raw = collection.get(include=["documents", "metadatas"])
+
+        ids = raw.get("ids", []) or []
+        docs = raw.get("documents", []) or []
+        metadatas = raw.get("metadatas", []) or []
+
+        scored: list[tuple[float, int]] = []
+
+        q_set = set(q_tokens)
+
+        for i, doc in enumerate(docs):
+            if not doc:
+                continue
+            d_tokens = [t for t in str(doc).lower().split() if t]
+            if not d_tokens:
+                continue
+
+            d_set = set(d_tokens)
+            overlap = len(q_set & d_set)
+            if overlap <= 0:
+                continue
+
+            precision = overlap / max(1, len(d_set))
+            recall = overlap / max(1, len(q_set))
+            f1 = (2 * precision * recall) / max(1e-9, (precision + recall))
+            scored.append((f1, i))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top_idx = [i for _, i in scored[:top_k]]
+
+        return {
+            "ids": [[ids[i] for i in top_idx]],
+            "documents": [[docs[i] for i in top_idx]],
+            "metadatas": [[metadatas[i] for i in top_idx]],
+            "distances": [[1.0 - scored[j][0] for j in range(min(len(top_idx), len(scored)))]],
+        }

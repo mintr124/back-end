@@ -18,6 +18,7 @@ from app.services.retrieval_service import retrieval_service
 from app.services.answer_service import answer_service
 from app.services.audit_service import audit_service
 from app.services.llm_service import llm_service
+from app.utils.status_answer import is_no_answer
 
 logger = logging.getLogger(__name__)
 
@@ -97,8 +98,8 @@ class ChatService:
 
     def _load_recent_history(self, db: Session, conversation_id: str, limit: int = 6) -> list[dict]:
         """
-        L?y v?i l??t chat g?n nh?t ?? t?ng t?nh m?ch l?c c?a c?u tr? l?i.
-        Ch? l?y user/assistant content, kh?ng nh?i to?n b? l?ch s?.
+        Hãy chỉ lấy lượt chat gần nhất để tăng tính mạch lạc của câu trả lời.
+        Chỉ lấy nội dung của user/assistant, không nhồi toàn bộ lịch sử.
         """
         msgs = self.msgs.list_by_conversation(db, conversation_id, limit=limit)
         history: list[dict] = []
@@ -171,7 +172,7 @@ class ChatService:
         db.flush()
 
         # retrieval
-        retrieved_raw = retrieval_service.retrieve(query=content, user=user, top_k=5)
+        retrieved_raw = retrieval_service.retrieve(query=content, user=user, top_k=3)
         retrieved = self._normalize_retrieved(retrieved_raw, limit=5)
 
         history = self._load_recent_history(db, conversation_id, limit=6)
@@ -188,8 +189,8 @@ class ChatService:
                     contexts=retrieved,
                     chat_history=history,
                     extra_instructions=(
-                        "N?u c?u h?i l? d?ng h?i tr?c ti?p v? m?t ng??i, "
-                        "h?y tr? l?i ??ng th?ng tin ??, ng?n g?n, kh?ng k?m d? li?u th?a."
+                        "Nếu câu hỏi là dạng hỏi trực tiếp về một người, "
+                        "hãy trả lời đúng thông tin đó, ngắn gọn, không kèm dữ liệu thừa."
                     ),
                 )
 
@@ -201,7 +202,15 @@ class ChatService:
 
                 if llm_text and llm_text.strip():
                     answer_text = llm_text.strip()
+                    
+                assistant_status = "no_answer" if is_no_answer(answer_text) else "success"
+
+                if assistant_status == "success":
                     sources = self._build_sources_from_retrieved(retrieved)
+                else:
+                    sources = []
+                    answer_text = answer_text  
+
             except Exception:
                 logger.exception(
                     "LLM generation failed trace_id=%s conversation_id=%s",
@@ -224,6 +233,7 @@ class ChatService:
             conversation_id=conversation_id,
             role="assistant",
             content=answer_text,
+            status=assistant_status,
             trace_id=tid,
         )
         self.msgs.create(db, assistant_msg)
@@ -236,7 +246,7 @@ class ChatService:
         # update trace
         tr.assistant_output_summary = (answer_text[:2000] if answer_text else None)
         tr.retrieved_sources = retrieved
-        tr.llm_prompt = prompt
+        # tr.llm_prompt = prompt
         tr.llm_response = {
             "text": llm_text,
             "response_id": getattr(llm_raw, "id", None),
@@ -315,6 +325,7 @@ class ChatService:
                     item["assistantMessage"] = {
                         "id": assistant_msg.id,
                         "content": assistant_msg.content,
+                        "status": assistant_msg.status,
                         "createdAt": assistant_msg.created_at,
                     }
                     item["traceId"] = assistant_msg.trace_id or user_msg.trace_id

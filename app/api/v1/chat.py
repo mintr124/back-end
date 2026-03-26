@@ -51,6 +51,7 @@ def post_message(conversation_id: str, payload: MessageCreateRequest, request: R
         assistantMessage={
             "id": assistant_msg.id,
             "content": assistant_msg.content,
+            "status": assistant_msg.status,
             "createdAt": assistant_msg.created_at,
         },
         traceId=request.state.trace_id,
