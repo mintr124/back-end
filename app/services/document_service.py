@@ -3,7 +3,8 @@ from pathlib import Path
 from fastapi import HTTPException
 from sqlalchemy import func
 from sqlalchemy.orm import Session
-
+from app.fga.adapter import fga_adapter
+from app.repositories.user_repository import UserRepository
 from app.core.config import settings
 from app.models.department import Department
 from app.models.document import Document
@@ -23,6 +24,12 @@ from app.services.audit_service import audit_service
 from app.services.job_service import job_service
 from app.services.permission_service import permission_service
 from app.services.storage_service import storage_service
+from app.models.chunk_embedding import ChunkEmbedding
+from app.models.policy_snapshot import DocumentPolicySnapshot
+from app.models.job import Job
+from app.models.job_step import JobStep
+import logging
+logger = logging.getLogger(__name__)
 
 
 class DocumentService:
@@ -32,6 +39,32 @@ class DocumentService:
         self.chunks = ChunkRepository()
         self.departments = DepartmentRepository()
         self.projects = ProjectRepository()
+        self.users = UserRepository()
+        
+    def _sync_fga(self, db: Session, doc: Document):
+        all_users  = self.users.list_active(db)
+        dept_users = self.users.list_by_dept(db, doc.department_id) if doc.department_id else []
+        proj_users = self.users.list_by_project(db, doc.project_id) if doc.project_id else []
+
+        dept_id_for_managers = doc.department_id
+        if doc.project_id and not dept_id_for_managers:
+            proj = self.projects.get_by_id(db, doc.project_id)
+            dept_id_for_managers = proj.department_id if proj else None
+
+        dept_managers = []
+        if dept_id_for_managers:
+            dept_managers = [
+                u for u in self.users.list_by_dept(db, dept_id_for_managers)
+                if u.role == "department_manager"
+            ]
+
+        fga_adapter.sync_document_tuples(
+            doc=doc,
+            all_users=all_users,
+            dept_users=dept_users,
+            project_users=proj_users,
+            dept_managers=dept_managers,
+        )
 
     def _resolve_department(self, db: Session, id: str) -> Department:
         dept = self.departments.get_by_id(db, id)
@@ -130,6 +163,9 @@ class DocumentService:
         )
         db.commit()
         db.refresh(doc)
+        old_tuples = fga_adapter.get_document_tuples(doc.id)
+        fga_adapter.delete_document_tuples(doc.id, old_tuples)
+        self._sync_fga(db, doc)
         return doc
 
     def update_document(self, db: Session, user: User, doc_id: str, payload: DocumentUpdateRequest, trace_id: str) -> Document:
@@ -195,6 +231,9 @@ class DocumentService:
         )
         db.commit()
         db.refresh(doc)
+        old_tuples = fga_adapter.get_document_tuples(doc.id)
+        fga_adapter.delete_document_tuples(doc.id, old_tuples)
+        self._sync_fga(db, doc)
         return doc
 
     def get_versions(self, db: Session, user: User, doc_id: str) -> list[DocumentVersion]:
@@ -357,6 +396,87 @@ class DocumentService:
         db.commit()
         db.refresh(job)
         return job
+    
+    def delete_document(self, db: Session, user: User, doc_id: str, trace_id: str) -> None:
+        doc = self.docs.get_by_id(db, doc_id)
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        # 1. Xóa FGA tuples
+        old_tuples = fga_adapter.get_document_tuples(doc_id)
+        fga_adapter.delete_document_tuples(doc_id, old_tuples)
+
+        # 2. Lấy tất cả version_id của doc
+        version_ids = [v.id for v in db.query(DocumentVersion.id).filter(
+            DocumentVersion.document_id == doc_id
+        ).all()]
+
+        if version_ids:
+            # 3. Lấy tất cả chunk_id
+            chunk_ids = [c.id for c in db.query(DocumentChunk.id).filter(
+                DocumentChunk.document_version_id.in_(version_ids)
+            ).all()]
+
+            if chunk_ids:
+                # 4. Xóa ChunkEmbedding
+                db.query(ChunkEmbedding).filter(
+                    ChunkEmbedding.chunk_id.in_(chunk_ids)
+                ).delete(synchronize_session=False)
+
+                # 5. Xóa DocumentChunk
+                db.query(DocumentChunk).filter(
+                    DocumentChunk.document_version_id.in_(version_ids)
+                ).delete(synchronize_session=False)
+
+            # 6. Xóa DocumentPolicySnapshot
+            db.query(DocumentPolicySnapshot).filter(
+                DocumentPolicySnapshot.document_version_id.in_(version_ids)
+            ).delete(synchronize_session=False)
+
+            # 7. Xóa JobStep và Job
+            job_ids = [j.id for j in db.query(Job.id).filter(
+                Job.document_id == doc_id
+            ).all()]
+            if job_ids:
+                from app.models.job_step import JobStep
+                db.query(JobStep).filter(
+                    JobStep.job_id.in_(job_ids)
+                ).delete(synchronize_session=False)
+                db.query(Job).filter(
+                    Job.id.in_(job_ids)
+                ).delete(synchronize_session=False)
+
+            # 8. Null current_version_id trước khi xóa versions
+            doc.current_version_id = None
+            db.flush()
+
+            # 9. Xóa DocumentVersion
+            db.query(DocumentVersion).filter(
+                DocumentVersion.document_id == doc_id
+            ).delete(synchronize_session=False)
+            
+            if chunk_ids:
+                try:
+                    from app.repositories.chroma_repository import ChromaRepository
+                    chroma = ChromaRepository()
+                    chroma.delete_by_ids(chunk_ids)
+                except Exception:
+                    logger.warning("Failed to delete chunks from Chroma for doc %s", doc_id)
+
+        # 10. Xóa Document
+        db.delete(doc)
+
+        audit_service.log_action(
+            db,
+            trace_id=trace_id,
+            user_id=user.id,
+            action="document.delete",
+            resource_type="document",
+            resource_id=doc_id,
+            decision="allow",
+            input_json={"document_id": doc_id},
+        )
+        db.commit()
 
 
 document_service = DocumentService()

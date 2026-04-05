@@ -16,6 +16,8 @@ from app.services.job_service import job_service
 from app.services.parser_service import parser_service
 from app.services.storage_service import storage_service
 from app.schemas.document import DocumentVersionRead
+import logging
+logger = logging.getLogger(__name__)
 
 
 class IngestPipelineService:
@@ -174,7 +176,18 @@ class IngestPipelineService:
             )
             version.embed_status = "completed"
             version.ingest_status = "succeeded"
-            doc.status = "ready"
+            creator = job.created_by
+            logger.info("DEBUG creator_id=%s creator=%s role=%s doc_status_before=%s",
+                job.created_by_user_id,
+                creator,
+                creator.role if creator else None,
+                doc.status,
+            )
+            if creator and creator.role in {"admin_auditor", "director"}:
+                doc.status = "ready"
+            elif doc.status not in {"ready", "approved"}:
+                doc.status = "review"
+            logger.info("DEBUG doc_status_after=%s", doc.status)
             doc.current_version_id = version.id
 
             audit_service.emit_event(

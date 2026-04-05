@@ -1,7 +1,7 @@
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from app.core.security import create_access_token, decode_access_token
+from app.core.security import create_access_token, decode_access_token, verify_password
 from app.models.user import User
 from app.repositories.user_repository import UserRepository
 from app.schemas.auth import LoginRequest
@@ -12,17 +12,22 @@ class AuthService:
         self.users = UserRepository()
 
     def login(self, db: Session, payload: LoginRequest) -> User:
-        user = None
-        if payload.email:
-            user = self.users.get_by_email(db, payload.email)
-        if user is None and payload.role: #TODO: delete this
-            user = self.users.get_first_by_role(db, payload.role)
-        if user is None: #TODO: finish function here
-            user = self.users.get_first_by_role(db, "employee") #TODO: delete this
-        if user is None:  
-            raise HTTPException(status_code=404, detail="Seeded user not found")
+        # Validate độ dài password
+        if len(payload.password) < 8:
+            raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+        user = self.users.get_by_email(db, payload.email)
+
+        if user is None:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+
         if user.status != "active":
-            raise HTTPException(status_code=403, detail="User is inactive") #TODO: delete this
+            raise HTTPException(status_code=403, detail="User is inactive")
+
+        # Verify password
+        if not user.password_hash or not verify_password(payload.password, user.password_hash):
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+
         return user
 
     def create_token(self, user: User) -> str:

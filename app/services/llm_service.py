@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+import json as jsonlib
 from typing import Optional, Tuple, Any, Dict, Iterable
 import logging
 
@@ -39,7 +41,7 @@ class LLMService:
     def is_configured(self) -> bool:
         if settings.llm_provider == "openai":
             return bool(settings.openai_api_key)
-        if settings.llm_provider == "ollama":
+        if settings.llm_provider in ("ollama", "olama"):
             return bool(settings.olama_url)
         return False
 
@@ -115,7 +117,6 @@ LỊCH SỬ HỘI THOẠI
 
 YÊU CẦU TRẢ LỜI
 - Chỉ dùng thông tin có trong ngữ cảnh, không đoán.
-- Nếu ngữ cảnh không đủ, trả lời: "Không tìm thấy thông tin đủ tin cậy trong tài liệu."
 - Nếu có thông tin trực tiếp, trả lời ngắn gọn, đúng trọng tâm.
 - Nếu câu hỏi hỏi về danh tính / năm sinh / ngày sinh / số điện thoại / mã định danh, chỉ trả lời đúng trường liên quan.
 - Không trích nguyên đoạn dài từ ngữ cảnh.
@@ -172,15 +173,17 @@ YÊU CẦU TRẢ LỜI
                 model = settings.openai_model or "gpt-4.1-mini"
                 instructions = self._build_instructions(system)
 
-                resp = client.responses.create(
+                resp = client.chat.completions.create(
                     model=model,
-                    instructions=instructions,
-                    input=prompt,
-                    max_output_tokens=max_tokens,
+                    messages=[
+                        {"role": "system", "content": instructions},
+                        {"role": "user", "content": prompt},
+                    ],
+                    max_tokens=max_tokens,
                     temperature=temperature,
                 )
 
-                text = getattr(resp, "output_text", "") or ""
+                text = resp.choices[0].message.content or ""
                 logger.info("LLM generate success source=openai model=%s", model)
                 return text, resp, "openai"
 
@@ -197,7 +200,8 @@ YÊU CẦU TRẢ LỜI
             if not settings.olama_url:
                 raise RuntimeError("Ollama URL not configured")
 
-            url = settings.olama_url.rstrip("/") + "/v1/generate"
+            # url = settings.olama_url.rstrip("/") + "/v1/generate"
+            url = settings.olama_url.rstrip("/") + "/api/generate"
             model = settings.olama_model
 
             final_prompt = prompt
@@ -207,27 +211,95 @@ YÊU CẦU TRẢ LỜI
             payload: Dict[str, Any] = {
                 "model": model,
                 "prompt": final_prompt,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-            }
+                "stream": True,  # ← dùng streaming
+                "options": {
+                    "num_predict": max_tokens,
+                    "temperature": temperature,
+                }
+}
 
             try:
                 with httpx.Client(timeout=settings.llm_timeout_seconds) as client:
-                    r = client.post(url, json=payload)
-                    r.raise_for_status()
-                    data = r.json()
+                    full_text = ""
+                    with client.stream("POST", url, json=payload) as resp:
+                        resp.raise_for_status()
+                        for line in resp.iter_lines():
+                            if not line.strip():
+                                continue
+                            try:
+                                chunk = jsonlib.loads(line)
+                                full_text += chunk.get("response", "")
+                                if chunk.get("done"):
+                                    break
+                            except Exception:
+                                continue
 
-                    text = data.get("output") or data.get("text") or ""
+                    import re
+                    full_text = re.sub(r"<think>.*?</think>", "", full_text, flags=re.DOTALL).strip()
+
                     source = "ollama" if provider == "ollama" else "fallback"
-
                     logger.info("LLM generate success source=%s model=%s", source, model)
-                    return text, data, source
+                    return full_text, {"response": full_text}, source
 
             except Exception:
                 logger.exception("LLM generate failed source=ollama")
                 raise
 
         raise RuntimeError("No LLM provider configured")
+    
+    def generate_stream(self, prompt: str, max_tokens: int = 256, temperature: float = 0.0):
+        provider = settings.llm_provider
+
+        # OpenAI streaming
+        if provider == "openai":
+            if OpenAI is None:
+                raise RuntimeError("openai package not installed")
+            client = OpenAI(
+                api_key=settings.openai_api_key,
+                base_url=settings.openai_api_base or None,
+            )
+            model = settings.openai_model or "gpt-4o-mini"
+            instructions = self._build_instructions(None)
+            with client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": instructions},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=True,
+            ) as stream:
+                for chunk in stream:
+                    token = chunk.choices[0].delta.content or ""
+                    if token:
+                        yield token
+            return
+
+        # Ollama streaming
+        url = settings.olama_url.rstrip("/") + "/api/generate"
+        model = settings.olama_model
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "stream": True,
+            "options": {"num_predict": max_tokens, "temperature": temperature},
+        }
+        with httpx.Client(timeout=settings.llm_timeout_seconds) as client:
+            with client.stream("POST", url, json=payload) as resp:
+                resp.raise_for_status()
+                for line in resp.iter_lines():
+                    if not line.strip():
+                        continue
+                    try:
+                        chunk = jsonlib.loads(line)
+                        token = chunk.get("response", "")
+                        if token:
+                            yield token
+                        if chunk.get("done"):
+                            break
+                    except Exception:
+                        continue
 
 
 llm_service = LLMService()

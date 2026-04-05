@@ -1,6 +1,6 @@
 from sqlalchemy.orm import Session
-
 from app.models.user import User
+from app.models.user_project import UserProject
 
 
 class UserRepository:
@@ -15,3 +15,25 @@ class UserRepository:
 
     def list_all(self, db: Session) -> list[User]:
         return db.query(User).order_by(User.created_at.asc()).all()
+
+    def list_active(self, db: Session) -> list[User]:
+        return db.query(User).filter(User.status == "active").all()
+
+    def list_by_dept(self, db: Session, dept_id: str) -> list[User]:
+        # Dùng trực tiếp department_id trên User, không cần join
+        return (
+            db.query(User)
+            .filter(
+                User.department_id == dept_id,
+                User.status == "active",
+            )
+            .all()
+        )
+
+    def list_by_project(self, db: Session, proj_id: str) -> list[User]:
+        return (
+            db.query(User)
+            .join(UserProject, UserProject.user_id == User.id)
+            .filter(UserProject.project_id == proj_id, User.status == "active")
+            .all()
+        )

@@ -5,6 +5,7 @@ import math
 import re
 from collections import Counter
 from typing import Any
+from app.fga.adapter import fga_adapter
 
 from app.repositories.chroma_repository import ChromaRepository
 from app.services.embedding_service import embedding_service
@@ -142,7 +143,7 @@ class RetrievalService:
         results.sort(key=lambda x: x["score"], reverse=True)
         return results
 
-    def retrieve(self, *, query: str, user=None, top_k: int = 3) -> list[dict]:
+    def retrieve(self, *, query: str, user=None, top_k: int = 3, mode: str = "hybrid") -> list[dict]:
         query = (query or "").strip()
         if not query:
             return []
@@ -150,24 +151,58 @@ class RetrievalService:
         if not embedding_service.is_configured():
             raise RuntimeError("Embedding service is not configured")
 
-        emb = embedding_service.embed(query)
+        # ── Bước 1: Lấy danh sách doc user được phép xem TRƯỚC ──────────────
+        allowed_doc_ids: list[str] | None = None
+        if user is not None:
+            allowed_doc_ids = fga_adapter.list_viewable_document_ids(user.id)
+            if not allowed_doc_ids:
+                return []  # không có doc nào được phép → trả về luôn
 
-        semantic_k = max(top_k * self.candidate_multiplier, top_k)
-        lexical_k = max(self.lexical_candidate_k, top_k * self.candidate_multiplier)
+        # ── Bước 2: Query Chroma với filter ─────────────────────────────────
+        use_filter = allowed_doc_ids is not None
 
-        semantic_raw = self.repo.query_by_embedding(embedding=emb, top_k=semantic_k)
-        lexical_raw = self.repo.query_by_keyword(query=query, top_k=lexical_k)
+        if mode == "keyword":
+            lexical_k = max(self.lexical_candidate_k, top_k * self.candidate_multiplier)
+            if use_filter:
+                lexical_raw = self.repo.query_by_keyword(
+                    query=query, top_k=lexical_k, document_ids=allowed_doc_ids
+                )
+            else:
+                lexical_raw = self.repo.query_by_keyword(query=query, top_k=lexical_k)
+            merged = self._merge_candidates({}, lexical_raw)
 
-        if (
-            (not semantic_raw or not semantic_raw.get("ids"))
-            and (not lexical_raw or not lexical_raw.get("ids"))
-        ):
-            logger.warning("Retrieval returned no candidates for query=%s", query)
+        elif mode == "semantic":
+            emb = embedding_service.embed(query)
+            semantic_k = max(top_k * self.candidate_multiplier, top_k)
+            if use_filter:
+                semantic_raw = self.repo.query_by_embedding(
+                    embedding=emb, top_k=semantic_k, document_ids=allowed_doc_ids
+                )
+            else:
+                semantic_raw = self.repo.query_by_embedding(embedding=emb, top_k=semantic_k)
+            merged = self._merge_candidates(semantic_raw, {})
+
+        else:  # hybrid
+            emb = embedding_service.embed(query)
+            semantic_k = max(top_k * self.candidate_multiplier, top_k)
+            lexical_k = max(self.lexical_candidate_k, top_k * self.candidate_multiplier)
+            if use_filter:
+                semantic_raw = self.repo.query_by_embedding(
+                    embedding=emb, top_k=semantic_k, document_ids=allowed_doc_ids
+                )
+                lexical_raw = self.repo.query_by_keyword(
+                    query=query, top_k=lexical_k, document_ids=allowed_doc_ids
+                )
+            else:
+                semantic_raw = self.repo.query_by_embedding(embedding=emb, top_k=semantic_k)
+                lexical_raw = self.repo.query_by_keyword(query=query, top_k=lexical_k)
+            merged = self._merge_candidates(semantic_raw, lexical_raw)
+
+        if not merged:
             return []
 
-        merged_candidates = self._merge_candidates(semantic_raw, lexical_raw)
-        ranked = self._rerank(query, merged_candidates)
+        # ── Bước 3: Rerank (không cần filter FGA nữa) ───────────────────────
+        ranked = self._rerank(query, merged)
         return ranked[:top_k]
-
 
 retrieval_service = RetrievalService()

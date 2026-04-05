@@ -13,7 +13,7 @@ class User(Base, TimestampMixin):
     name = Column(String(255), nullable=False)
     role = Column(String(64), nullable=False, index=True)
     clearance_level = Column(String(32), nullable=False, default="internal")
-    department_id = Column(String(36), ForeignKey("departments.id"), nullable=False, index=True)
+    department_id = Column(String(36), ForeignKey("departments.id"), nullable=True, index=True)
     status = Column(String(32), nullable=False, default="active")
-
+    password_hash = Column(String(255), nullable=True) 
     department = relationship("Department", back_populates="users")

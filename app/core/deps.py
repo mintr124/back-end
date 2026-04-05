@@ -1,4 +1,6 @@
-from fastapi import Depends, HTTPException
+import uuid                      
+from fastapi import Depends, HTTPException, Request   
+
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 
@@ -7,6 +9,10 @@ from app.db.session import get_db
 from app.models.user import User
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+
+
+def get_trace_id(request: Request) -> str:         
+    return getattr(request.state, "trace_id", uuid.uuid4().hex)
 
 
 def get_current_user(db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)) -> User:

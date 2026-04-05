@@ -1,5 +1,7 @@
 from fastapi import APIRouter, Depends, Request, HTTPException
 from sqlalchemy.orm import Session
+from fastapi.responses import StreamingResponse
+import json as jsonlib
 
 from app.core.deps import get_current_user, get_db
 from app.schemas.chat import (
@@ -115,3 +117,47 @@ def list_conversations_by_user(user_id: str, db: Session = Depends(get_db), curr
     repo = ConversationRepository()
     convs = repo.list_by_user(db, user_id)
     return [ConversationRead.model_validate(c) for c in (convs or [])]
+
+
+@router.post("/conversations/{conversation_id}/messages/stream")
+def post_message_stream(
+    conversation_id: str,
+    payload: MessageCreateRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    repo = ConversationRepository()
+    conv = repo.get(db, conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if conv.status != "open":
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    def generate():
+        for event in chat_service.post_message_stream(
+            db, current_user, conversation_id,
+            payload.content, payload.clientMessageId,
+            request.state.trace_id,
+        ):
+            yield f"data: {jsonlib.dumps(event)}\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+@router.post("/search")
+def search_documents(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.retrieval_service import retrieval_service
+    query = payload.get("query", "").strip()
+    mode = payload.get("mode", "hybrid")
+    top_k = min(int(payload.get("top_k", 10)), 20)
+    if not query:
+        return []
+    results = retrieval_service.retrieve(
+        query=query, user=current_user, top_k=top_k, mode=mode
+    )
+    return results

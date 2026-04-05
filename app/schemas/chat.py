@@ -24,6 +24,8 @@ class ConversationRead(BaseModel):
 class MessageCreateRequest(BaseModel):
     content: str
     clientMessageId: Optional[str] = None
+    project_ids: Optional[list[str]] = None    
+    department_ids: Optional[list[str]] = None  
 
 
 class AssistantMessage(BaseModel):
