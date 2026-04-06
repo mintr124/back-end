@@ -88,41 +88,43 @@ class ChromaRepository:
             metadatas=[flat_metadata],
         )
 
-    def query_by_embedding(self, *, embedding: list[float], top_k: int = 5) -> dict:
+    def query_by_embedding(
+        self, *, embedding: list[float], top_k: int = 5, document_ids: list[str]
+    ) -> dict:
+        if not document_ids:
+            return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
         collection = self._get_collection()
-
+        where = {"document_id": {"$in": document_ids}}
         return collection.query(
             query_embeddings=[embedding],
-            n_results=top_k,
+            n_results=min(top_k, len(document_ids) * 10),  # tránh vượt quá số chunk
+            where=where,
             include=["documents", "metadatas", "distances"],
         )
 
-    def query_by_keyword(self, *, query: str, top_k: int = 5) -> dict:
-        """
-        Full-corpus lexical candidate retrieval.
-
-        This scans the whole collection and ranks documents by simple token overlap.
-        Returned shape is aligned with collection.query() as much as possible.
-        """
+    def query_by_keyword(
+        self, *, query: str, top_k: int = 5, document_ids: list[str]
+    ) -> dict:
+        if not document_ids:
+            return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
         collection = self._get_collection()
         query = (query or "").strip()
         if not query:
             return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
 
-        q_tokens = [t for t in query.lower().split() if t]
-        if not q_tokens:
-            return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
-
-        # Fetch the whole corpus for lexical scoring
-        raw = collection.get(include=["documents", "metadatas"])
+        doc_id_set = set(document_ids)
+        raw = collection.get(
+            where={"document_id": {"$in": document_ids}},
+            include=["documents", "metadatas"],
+        )
 
         ids = raw.get("ids", []) or []
         docs = raw.get("documents", []) or []
         metadatas = raw.get("metadatas", []) or []
 
-        scored: list[tuple[float, int]] = []
-
+        q_tokens = [t for t in query.lower().split() if t]
         q_set = set(q_tokens)
+        scored: list[tuple[float, int]] = []
 
         for i, doc in enumerate(docs):
             if not doc:
@@ -130,12 +132,10 @@ class ChromaRepository:
             d_tokens = [t for t in str(doc).lower().split() if t]
             if not d_tokens:
                 continue
-
             d_set = set(d_tokens)
             overlap = len(q_set & d_set)
             if overlap <= 0:
                 continue
-
             precision = overlap / max(1, len(d_set))
             recall = overlap / max(1, len(q_set))
             f1 = (2 * precision * recall) / max(1e-9, (precision + recall))
@@ -148,5 +148,11 @@ class ChromaRepository:
             "ids": [[ids[i] for i in top_idx]],
             "documents": [[docs[i] for i in top_idx]],
             "metadatas": [[metadatas[i] for i in top_idx]],
-            "distances": [[1.0 - scored[j][0] for j in range(min(len(top_idx), len(scored)))]],
+            "distances": [[1.0 - scored[j][0] for j in range(len(top_idx))]],
         }
+        
+    def delete_by_ids(self, ids: list[str]) -> None:
+        if not ids:
+            return
+        collection = self._get_collection()
+        collection.delete(ids=ids)

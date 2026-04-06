@@ -19,6 +19,8 @@ from app.services.answer_service import answer_service
 from app.services.audit_service import audit_service
 from app.services.llm_service import llm_service
 from app.utils.status_answer import is_no_answer
+from app.core.config import settings
+
 
 logger = logging.getLogger(__name__)
 
@@ -97,27 +99,27 @@ class ChatService:
         return sources
 
     def _load_recent_history(self, db: Session, conversation_id: str, limit: int = 6) -> list[dict]:
-        """
-        Hãy chỉ lấy lượt chat gần nhất để tăng tính mạch lạc của câu trả lời.
-        Chỉ lấy nội dung của user/assistant, không nhồi toàn bộ lịch sử.
-        """
-        msgs = self.msgs.list_by_conversation(db, conversation_id, limit=limit)
-        history: list[dict] = []
+        # """
+        # Hãy chỉ lấy lượt chat gần nhất để tăng tính mạch lạc của câu trả lời.
+        # Chỉ lấy nội dung của user/assistant, không nhồi toàn bộ lịch sử.
+        # """
+        # msgs = self.msgs.list_by_conversation(db, conversation_id, limit=limit)
+        # history: list[dict] = []
 
-        for m in msgs[-limit:]:
-            if m.role not in {"user", "assistant"}:
-                continue
-            content = (m.content or "").strip()
-            if not content:
-                continue
-            history.append(
-                {
-                    "role": m.role,
-                    "content": content,
-                }
-            )
+        # for m in msgs[-limit:]:
+        #     if m.role not in {"user", "assistant"}:
+        #         continue
+        #     content = (m.content or "").strip()
+        #     if not content:
+        #         continue
+        #     history.append(
+        #         {
+        #             "role": m.role,
+        #             "content": content,
+        #         }
+        #     )
 
-        return history
+        return []
 
     def _persist_sources(self, db: Session, assistant_message_id: str, sources: list[dict]) -> None:
         for s in sources or []:
@@ -181,8 +183,13 @@ class ChatService:
         llm_raw: Any = None
         prompt: str | None = None
         sources: list[dict] = []
+        assistant_status: str = "fallback"
+        llm_text: str | None = None
+        
+        logger.info("LLM provider=%s, is_configured=%s", settings.llm_provider, llm_service.is_configured())
 
         if llm_service.is_configured():
+            
             try:
                 prompt = llm_service.build_prompt(
                     question=content,
@@ -219,6 +226,7 @@ class ChatService:
                 )
                 answer_text = None
                 llm_raw = None
+                assistant_status = "llm_error"
 
         # fallback to minimal generator if LLM not configured or failed
         if not answer_text:
@@ -226,6 +234,9 @@ class ChatService:
                 user_input=content,
                 retrieved=retrieved,
             )
+
+            assistant_status = "fallback"
+
             if not sources:
                 sources = self._build_sources_from_retrieved(retrieved)
 
@@ -246,7 +257,7 @@ class ChatService:
         # update trace
         tr.assistant_output_summary = (answer_text[:2000] if answer_text else None)
         tr.retrieved_sources = retrieved
-        # tr.llm_prompt = prompt
+        tr.llm_prompt = prompt
         tr.llm_response = {
             "text": llm_text,
             "response_id": getattr(llm_raw, "id", None),
@@ -336,6 +347,103 @@ class ChatService:
                 i += 1
 
         return out
+    
+    def post_message_stream(
+        self,
+        db: Session,
+        user,
+        conversation_id: str,
+        content: str,
+        client_message_id: str | None,
+        trace_id: str,
+    ):
+        """Generator — yield SSE events cho streaming response."""
+        tid = self._get_trace_id(trace_id)
+
+        # Lưu user message
+        user_msg = Message(
+            conversation_id=conversation_id,
+            role="user",
+            content=content,
+            client_message_id=client_message_id,
+            trace_id=tid,
+        )
+        tr = Trace(
+            trace_id=tid,
+            conversation_id=conversation_id,
+            message_id=user_msg.id,
+            user_id=user.id,
+            user_input=content,
+            status="running",
+        )
+        self.msgs.create(db, user_msg)
+        db.flush()
+        db.refresh(user_msg)
+
+        # Tạo assistant message placeholder
+        assistant_msg = Message(
+            conversation_id=conversation_id,
+            role="assistant",
+            content="",
+            status="streaming",
+            trace_id=tid,
+        )
+        self.msgs.create(db, assistant_msg)
+        db.flush()
+        db.refresh(assistant_msg)
+        db.commit()
+
+        yield {"type": "message_start", "messageId": assistant_msg.id, "userMessageId": user_msg.id}
+
+        # Retrieval
+        retrieved_raw = retrieval_service.retrieve(query=content, user=user, top_k=2)
+        retrieved = self._normalize_retrieved(retrieved_raw, limit=3)
+        history = self._load_recent_history(db, conversation_id, limit=4)
+
+        full_text = ""
+        
+        if not retrieved:
+            full_text = "Sorry, can't find the source of information. Please try rephrasing your question or ask about something else."
+            for token in full_text:
+                yield {"type": "token", "text": token}
+
+        elif llm_service.is_configured():
+            try:
+                prompt = llm_service.build_prompt(
+                    question=content,
+                    contexts=retrieved,
+                    chat_history=history,
+                )
+                logger.info("LLM stream prompt trace_id=%s:\n%s", tid, prompt)
+                # Stream từng token
+                for token in llm_service.generate_stream(prompt=prompt, max_tokens=1024):
+                    full_text += token
+                    yield {"type": "token", "text": token}
+
+                import re
+                full_text = re.sub(r"<think>.*?</think>", "", full_text, flags=re.DOTALL).strip()
+                logger.info("LLM stream result (full): %s", full_text)
+
+            except Exception:
+                logger.exception("LLM stream failed")
+                full_text = ""
+
+        if not full_text:
+            full_text, _ = answer_service.generate(user_input=content, retrieved=retrieved)
+
+        # Cập nhật DB
+        assistant_msg.content = full_text
+        assistant_msg.status = "success"
+        sources = self._build_sources_from_retrieved(retrieved)
+        self._persist_sources(db, assistant_msg.id, sources)
+        tr.assistant_output_summary = full_text[:2000] if full_text else None
+        tr.retrieved_sources = retrieved
+        tr.llm_response = {"text": full_text}
+        tr.status = "completed"
+        db.commit()
+        db.commit()
+
+        yield {"type": "done", "content": full_text, "sources": sources, "messageId": assistant_msg.id}
 
 
 chat_service = ChatService()

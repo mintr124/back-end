@@ -1,8 +1,12 @@
+from app.models.document import Document as DocumentModel
 from fastapi import APIRouter, Depends, File, UploadFile, Request, HTTPException
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_user, get_db
 from app.models.user import User
+from app.models.document_version import DocumentVersion
+from app.models.storage_object import StorageObject
 from app.schemas.document import (
     DocumentCreateRequest,
     DocumentRead,
@@ -17,6 +21,26 @@ from app.workers.ingest_tasks import process_ingest_job
 router = APIRouter()
 
 
+# ── Pending approvals (phải đặt TRƯỚC /{document_id}) ────────────────────────
+@router.get("/pending-approvals", response_model=list[DocumentRead])
+def list_pending_approvals(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role not in {"director", "admin_auditor", "department_manager"}:
+        raise HTTPException(status_code=403, detail="No permission")
+
+    statuses = ["uploaded", "review"]
+    query = db.query(DocumentModel).filter(DocumentModel.status.in_(statuses))
+
+    if current_user.role == "department_manager":
+        query = query.filter(DocumentModel.department_id == current_user.department_id)
+
+    docs = query.order_by(DocumentModel.updated_at.desc()).all()
+    return [DocumentRead.model_validate(d) for d in docs]
+
+
+# ── CRUD ──────────────────────────────────────────────────────────────────────
 @router.post("", response_model=DocumentRead)
 def create_document(
     payload: DocumentCreateRequest,
@@ -29,13 +53,20 @@ def create_document(
 
 
 @router.get("", response_model=list[DocumentRead])
-def list_documents(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def list_documents(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     docs = document_service.list_documents(db, current_user)
     return [DocumentRead.model_validate(d) for d in docs]
 
 
 @router.get("/{document_id}", response_model=DocumentRead)
-def get_document(document_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def get_document(
+    document_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     doc = document_service.get_document(db, current_user, document_id)
     return DocumentRead.model_validate(doc)
 
@@ -52,8 +83,13 @@ def update_document(
     return DocumentRead.model_validate(doc)
 
 
+# ── Versions ──────────────────────────────────────────────────────────────────
 @router.get("/{document_id}/versions", response_model=list[DocumentVersionRead])
-def get_versions(document_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def get_versions(
+    document_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     versions = document_service.get_versions(db, current_user, document_id)
     return [DocumentVersionRead.model_validate(v) for v in versions]
 
@@ -91,6 +127,75 @@ async def upload_version(
     )
 
 
+@router.get("/{document_id}/versions/{version_id}/download-url")
+def get_download_url(
+    document_id: str,
+    version_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.repositories.storage_repository import StorageRepository
+
+    document_service.get_document(db, current_user, document_id)
+
+    version = (
+        db.query(DocumentVersion)
+        .filter(
+            DocumentVersion.id == version_id,
+            DocumentVersion.document_id == document_id,
+        )
+        .first()
+    )
+    if not version or not version.source_object:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    src_obj = version.source_object
+    url = StorageRepository().get_presigned_url(src_obj.bucket, src_obj.object_key)
+
+    return {
+        "url": url,
+        "filename": src_obj.original_filename,
+        "content_type": src_obj.content_type,
+    }
+
+
+@router.get("/{document_id}/versions/{version_id}/file")
+def view_document_file(
+    document_id: str,
+    version_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.repositories.storage_repository import StorageRepository
+
+    document_service.get_document(db, current_user, document_id)
+
+    version = (
+        db.query(DocumentVersion)
+        .filter(
+            DocumentVersion.id == version_id,
+            DocumentVersion.document_id == document_id,
+        )
+        .first()
+    )
+    if not version or not version.source_object:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    src_obj = version.source_object
+    repo = StorageRepository()
+    data = repo.get_bytes(src_obj.bucket, src_obj.object_key)
+
+    return StreamingResponse(
+        iter([data]),
+        media_type=src_obj.content_type,
+        headers={
+            "Content-Disposition": f'inline; filename="{src_obj.original_filename}"',
+            "Content-Length": str(src_obj.size_bytes),
+        },
+    )
+
+
+# ── Ingest ────────────────────────────────────────────────────────────────────
 @router.post("/{document_id}/ingest", response_model=JobRead)
 def start_ingest(
     document_id: str,
@@ -111,3 +216,99 @@ def start_ingest(
     if job.status == "queued":
         process_ingest_job.delay(job.id)
     return JobRead.model_validate(job)
+
+
+# ── Approval workflow ─────────────────────────────────────────────────────────
+@router.post("/{document_id}/submit-review")
+def submit_for_review(
+    document_id: str,
+    body: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    doc = db.query(DocumentModel).filter(DocumentModel.id == document_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if doc.owner_user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only owner can submit for review")
+    if doc.status != "uploaded":
+        raise HTTPException(status_code=400, detail=f"Cannot submit document with status '{doc.status}'")
+
+    # admin_auditor và director không cần review → ready luôn
+    if current_user.role in {"admin_auditor", "director"}:
+        doc.status = "ready"
+        db.commit()
+        db.refresh(doc)
+        return DocumentRead.model_validate(doc)
+
+    reviewer_role = body.get("reviewer_role")
+    allowed = {"director", "admin_auditor", "department_manager"}
+    if current_user.role == "department_manager":
+        allowed = {"director", "admin_auditor"}
+    if reviewer_role not in allowed:
+        raise HTTPException(status_code=400, detail="Invalid reviewer role")
+
+    doc.status = "review"
+    doc.allowed_roles = list(set((doc.allowed_roles or []) + [reviewer_role]))
+    db.commit()
+    db.refresh(doc)
+    return DocumentRead.model_validate(doc)
+
+
+@router.post("/{document_id}/approve")
+def approve_document(
+    document_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    doc = db.query(DocumentModel).filter(DocumentModel.id == document_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if current_user.role not in {"director", "admin_auditor", "department_manager"}:
+        raise HTTPException(status_code=403, detail="No permission to approve")
+    if doc.status not in {"review", "uploaded"}:
+        raise HTTPException(status_code=400, detail=f"Cannot approve document with status '{doc.status}'")
+    doc.status = "ready"
+    db.commit()
+    db.refresh(doc)
+    return DocumentRead.model_validate(doc)
+
+
+@router.post("/{document_id}/reject")
+def reject_document(
+    document_id: str,
+    body: dict,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    doc = db.query(DocumentModel).filter(DocumentModel.id == document_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if current_user.role not in {"director", "admin_auditor", "department_manager"}:
+        raise HTTPException(status_code=403, detail="No permission to reject")
+    if doc.status not in {"review", "uploaded"}:
+        raise HTTPException(status_code=400, detail=f"Cannot reject document with status '{doc.status}'")
+    doc.status = "draft"
+    db.commit()
+    db.refresh(doc)
+    return DocumentRead.model_validate(doc)
+
+
+@router.delete("/{document_id}")
+def delete_document(
+    document_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role not in {"admin_auditor", "director"}:
+        raise HTTPException(status_code=403, detail="Only admin_auditor or director can delete documents")
+    
+    doc = db.query(DocumentModel).filter(DocumentModel.id == document_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    document_service.delete_document(db, current_user, document_id, request.state.trace_id)
+    return {"ok": True}

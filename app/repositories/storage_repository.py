@@ -87,3 +87,21 @@ class StorageRepository:
         finally:
             response.close()
             response.release_conn()
+            
+    def get_presigned_url(self, bucket: str, object_key: str, expires_minutes: int = 15) -> str:
+        from datetime import timedelta
+        import re
+
+        # Ký bằng internal endpoint (minio:9000) — container có thể kết nối được
+        url = self.client.presigned_get_object(
+            bucket_name=bucket,
+            object_name=object_key,
+            expires=timedelta(minutes=expires_minutes),
+        )
+
+        # Replace internal host → public host để browser truy cập được
+        # Signature vẫn hợp lệ vì MinIO không kiểm tra Host trong chữ ký
+        public_endpoint = settings.minio_public_endpoint  # "localhost:9000"
+        url = re.sub(r"https?://[^/]+", f"http://{public_endpoint}", url)
+
+        return url
