@@ -1,5 +1,4 @@
 from pathlib import Path
-
 from fastapi import HTTPException
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -28,6 +27,8 @@ from app.models.chunk_embedding import ChunkEmbedding
 from app.models.policy_snapshot import DocumentPolicySnapshot
 from app.models.job import Job
 from app.models.job_step import JobStep
+from app.services.chroma_service import chroma_service
+
 import logging
 logger = logging.getLogger(__name__)
 
@@ -119,8 +120,10 @@ class DocumentService:
         return doc
 
     def create_document(self, db: Session, user: User, payload: DocumentCreateRequest, trace_id: str) -> Document:
-        dept = self._resolve_department(db, payload.department_id)
-        ok, reason = permission_service.can_create_document(user, dept.id)
+        # Department là optional — None = doc chung công ty
+        dept = self._resolve_department(db, payload.department_id) if payload.department_id else None
+
+        ok, reason = permission_service.can_create_document(user, dept.id if dept else None)
         if not ok:
             audit_service.log_action(
                 db,
@@ -135,12 +138,12 @@ class DocumentService:
             db.commit()
             raise HTTPException(status_code=403, detail=reason)
 
-        proj = self._resolve_project(db, payload.project_id, dept.id) if payload.project_id else None
+        proj = self._resolve_project(db, payload.project_id, dept.id) if payload.project_id and dept else None
 
         doc = Document(
             title=payload.title,
             description=payload.description,
-            department_id=dept.id,
+            department_id=dept.id if dept else None,
             project_id=proj.id if proj else None,
             owner_user_id=user.id,
             document_type=payload.document_type,
@@ -168,7 +171,14 @@ class DocumentService:
         self._sync_fga(db, doc)
         return doc
 
-    def update_document(self, db: Session, user: User, doc_id: str, payload: DocumentUpdateRequest, trace_id: str) -> Document:
+    def update_document(
+        self,
+        db: Session,
+        user: User,
+        doc_id: str,
+        payload: DocumentUpdateRequest,
+        trace_id: str,
+    ) -> Document:
         doc = self.docs.get_by_id(db, doc_id)
         if not doc:
             raise HTTPException(status_code=404, detail="Document not found")
@@ -188,22 +198,33 @@ class DocumentService:
             db.commit()
             raise HTTPException(status_code=403, detail=reason)
 
-        if (payload.department_id or payload.project_id) and user.role not in {"director", "admin_auditor"}:
+        # Chỉ director/admin_auditor được move dept/project
+        fields_set = payload.model_fields_set
+        if ("department_id" in fields_set or "project_id" in fields_set) and user.role not in {"director", "admin_auditor"}:
             raise HTTPException(status_code=403, detail="Only director/admin_auditor can move department/project")
 
-        if payload.department_id:
-            dept = self._resolve_department(db, payload.department_id)
-            doc.department_id = dept.id
+        # ── department_id ─────────────────────────────────────────────────────────
+        if "department_id" in fields_set:
+            if payload.department_id:
+                dept = self._resolve_department(db, payload.department_id)
+                doc.department_id = dept.id
+                # Nếu đổi dept mà không truyền project_id → xóa project cũ
+                if "project_id" not in fields_set:
+                    doc.project_id = None
+            else:
+                # Truyền null → company-wide doc
+                doc.department_id = None
+                doc.project_id = None
+
+        # ── project_id ────────────────────────────────────────────────────────────
+        if "project_id" in fields_set:
             if payload.project_id:
-                proj = self._resolve_project(db, payload.project_id, dept.id)
+                proj = self._resolve_project(db, payload.project_id, doc.department_id)
                 doc.project_id = proj.id
             else:
                 doc.project_id = None
 
-        if payload.project_id and not payload.department_id:
-            proj = self._resolve_project(db, payload.project_id, doc.department_id)
-            doc.project_id = proj.id
-
+        # ── Các field khác ────────────────────────────────────────────────────────
         if payload.title is not None:
             doc.title = payload.title
         if payload.description is not None:
@@ -231,9 +252,28 @@ class DocumentService:
         )
         db.commit()
         db.refresh(doc)
+
+        # ── Re-sync FGA ───────────────────────────────────────────────────────────
         old_tuples = fga_adapter.get_document_tuples(doc.id)
         fga_adapter.delete_document_tuples(doc.id, old_tuples)
         self._sync_fga(db, doc)
+
+        # ── Cập nhật Chroma metadata nếu dept/project thay đổi ───────────────────
+        if "department_id" in fields_set or "project_id" in fields_set:
+            all_versions = self.versions.list_by_document(db, doc.id)
+            version_ids = [v.id for v in all_versions]
+            chunk_ids = [
+                c.id for c in db.query(DocumentChunk).filter(
+                    DocumentChunk.document_version_id.in_(version_ids)
+                ).all()
+            ] if version_ids else []
+
+            if chunk_ids:
+                chroma_service.update_document_metadata(chunk_ids, {
+                    "department_id": doc.department_id or "",
+                    "project_id": doc.project_id or "",
+                })
+
         return doc
 
     def get_versions(self, db: Session, user: User, doc_id: str) -> list[DocumentVersion]:
@@ -457,11 +497,10 @@ class DocumentService:
             
             if chunk_ids:
                 try:
-                    from app.repositories.chroma_repository import ChromaRepository
-                    chroma = ChromaRepository()
-                    chroma.delete_by_ids(chunk_ids)
-                except Exception:
-                    logger.warning("Failed to delete chunks from Chroma for doc %s", doc_id)
+                    from app.services.chroma_service import chroma_service
+                    chroma_service.delete_chunks(chunk_ids)
+                except Exception as e:
+                    logger.warning("Failed to delete chunks from Chroma for doc %s: %s", doc_id, e)
 
         # 10. Xóa Document
         db.delete(doc)

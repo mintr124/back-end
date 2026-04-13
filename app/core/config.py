@@ -15,8 +15,8 @@ class Settings(BaseSettings):
     access_token_exp_minutes: int = 1440; 
     
     openfga_url: str = "http://openfga:8080"; 
-    openfga_store_id: str = "01KMWDXEPTYKY23VHG1ZBNEQ7M"  
-    openfga_model_id: str = "01KMWDXERJBZ0GCF7V5CM43CRG"
+    openfga_store_id: str = "01KNGYDDJ052B55E56R9SSJY4W"  
+    openfga_model_id: str = "01KNGYDDKXYJF7C73FZKGHF7K2"
 
     minio_endpoint: str = "minio:9000"
     minio_access_key: str = "minioadmin"
@@ -28,6 +28,8 @@ class Settings(BaseSettings):
 
     chroma_path: str = "/data/chroma"
     chroma_collection: str = "document_chunks"
+    chroma_host: str = "chroma"       
+    chroma_port: int = 8000  
 
     max_upload_size_mb: int = 50
     default_policy_version: str = "v1"

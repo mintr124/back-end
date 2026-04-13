@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, DateTime
+from sqlalchemy import Column, String, DateTime, Text
 from app.db.base import Base, TimestampMixin
 from app.utils.ids import new_uuid
 
@@ -11,3 +11,7 @@ class Conversation(Base, TimestampMixin):
     title = Column(String(512), nullable=True)
     status = Column(String(32), nullable=False, default="open", index=True)
     last_message_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Hybrid memory fields
+    summary = Column(Text, nullable=True)                              
+    summary_updated_at = Column(DateTime(timezone=True), nullable=True) 

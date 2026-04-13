@@ -155,6 +155,7 @@ YÊU CẦU TRẢ LỜI
             max_tokens,
             temperature,
         )
+        logger.info("LLM PROMPT:\n%s", prompt)
 
         # 1) OpenAI
         if provider == "openai":
@@ -247,8 +248,13 @@ YÊU CẦU TRẢ LỜI
 
         raise RuntimeError("No LLM provider configured")
     
-    def generate_stream(self, prompt: str, max_tokens: int = 256, temperature: float = 0.0):
+    def generate_stream(self, prompt: str, max_tokens: int = 256, temperature: float = 0.0, system: Optional[str] = None,):
         provider = settings.llm_provider
+        logger.info(
+            "LLM generate_stream start provider=%s max_tokens=%s temperature=%s",
+            provider, max_tokens, temperature,
+        )
+        logger.info("LLM STREAM PROMPT:\n%s", prompt)
 
         # OpenAI streaming
         if provider == "openai":
@@ -259,7 +265,7 @@ YÊU CẦU TRẢ LỜI
                 base_url=settings.openai_api_base or None,
             )
             model = settings.openai_model or "gpt-4o-mini"
-            instructions = self._build_instructions(None)
+            instructions = system if system else self._build_instructions(None)
             with client.chat.completions.create(
                 model=model,
                 messages=[

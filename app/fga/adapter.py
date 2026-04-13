@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from uvicorn import logging
+import logging
+
 from app.fga.client import fga_client
 from app.models.document import Document
 from app.models.user import User
+
+logger = logging.getLogger(__name__)
 
 
 class FGAAdapter:
@@ -14,6 +17,7 @@ class FGAAdapter:
     Hierarchy: admin_auditor > director > department_manager > employee
 
     Access rules:
+    - owner: luôn xem được & sửa được tài liệu của mình
     - admin_auditor: xem/sửa mọi tài liệu
     - director: xem mọi tài liệu (không phân biệt dept/project)
     - Không thuộc dept/project + public: tất cả mọi người
@@ -32,7 +36,7 @@ class FGAAdapter:
                 {"user": f"user:{user_id}", "relation": "member", "object": f"department:{dept_id}"}
             ])
         except Exception:
-            pass  
+            pass
 
     def add_dept_manager(self, user_id: str, dept_id: str):
         try:
@@ -48,7 +52,7 @@ class FGAAdapter:
                 {"user": f"user:{user_id}", "relation": "member", "object": f"department:{dept_id}"}
             ])
         except Exception:
-            pass  
+            pass
 
     def remove_dept_manager(self, user_id: str, dept_id: str):
         try:
@@ -86,6 +90,7 @@ class FGAAdapter:
         fga_client.delete([
             {"user": f"department:{dept_id}", "relation": "department", "object": f"project:{proj_id}"}
         ])
+
     # ── document ──────────────────────────────────────────────────────────────
 
     def sync_document_tuples(
@@ -108,6 +113,14 @@ class FGAAdapter:
         def has_clearance(u: User) -> bool:
             return CLEARANCE_RANK.get(u.clearance_level or "public", 1) >= doc_rank
 
+        # ── Owner luôn có quyền xem & sửa tài liệu của mình ─────────────────
+        if doc.owner_user_id:
+            tuples.append({
+                "user": f"user:{doc.owner_user_id}",
+                "relation": "owner",
+                "object": doc_obj,
+            })
+
         # ── admin_auditor và director luôn có quyền ───────────────────────────
         for u in all_users:
             if u.role == "admin_auditor":
@@ -119,8 +132,11 @@ class FGAAdapter:
         if not doc.department_id and not doc.project_id:
             for u in all_users:
                 if u.role not in ("admin_auditor", "director") and has_clearance(u):
-                    tuples.append({"user": f"user:{u.id}", "relation": "public_viewer", "object": doc_obj})
-
+                    tuples.append({
+                        "user": f"user:{u.id}",
+                        "relation": "public_viewer",
+                        "object": doc_obj,
+                    })
         # ── Thuộc department, không có project ───────────────────────────────
         elif doc.department_id and not doc.project_id:
             for u in dept_users:
@@ -145,19 +161,17 @@ class FGAAdapter:
                         tuples.append({"user": f"user:{u.id}", "relation": "project_dept_manager", "object": doc_obj})
 
         if tuples:
-            import logging
-            logging.getLogger(__name__).info("FGA write tuples: %s", tuples)
+            logger.info("FGA write tuples: %s", tuples)
             fga_client.write(tuples)
-        
-        
+
     def delete_document_tuples(self, doc_id: str, tuples_to_delete: list[dict]):
         """Xóa toàn bộ tuples cũ của document trước khi sync lại."""
         if tuples_to_delete:
             fga_client.delete(tuples_to_delete)
-            
+
     def get_document_tuples(self, doc_id: str) -> list[dict]:
         return fga_client.read(object=f"document:{doc_id}")
-    
+
     def list_viewable_document_ids(self, user_id: str) -> list[str]:
         """Trả về list doc_id user được phép xem."""
         objects = fga_client.list_objects(
@@ -165,7 +179,6 @@ class FGAAdapter:
             relation="can_view",
             object_type="document",
         )
-        # objects dạng ["document:abc", "document:xyz"]
         return [o.split(":", 1)[1] for o in objects if o.startswith("document:")]
 
     # ── Check ─────────────────────────────────────────────────────────────────
@@ -183,7 +196,6 @@ class FGAAdapter:
             relation="can_edit",
             object=f"document:{doc_id}",
         )
-
 
 
 fga_adapter = FGAAdapter()

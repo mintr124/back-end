@@ -26,6 +26,7 @@ class MessageCreateRequest(BaseModel):
     clientMessageId: Optional[str] = None
     project_ids: Optional[list[str]] = None    
     department_ids: Optional[list[str]] = None  
+    mode: str = "rag"
 
 
 class AssistantMessage(BaseModel):

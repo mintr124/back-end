@@ -11,9 +11,9 @@ docker compose run --rm openfga migrate
 docker compose up -d
 
 # Run setup (one time only)
-python -m app.fga.setup
+$env:OPENFGA_URL="http://localhost:8080"; python -m app.fga.setup
 
-# Copy STORE_ID and MODEL_ID into .env and config.py (openfga_store_id and openfga_model_id)
+# Copy STORE_ID and MODEL_ID into .env and config.py (openfga_store_id and openfga_model_id), then restart the application.
 
 # To check store that created, browse: http://localhost:8080/stores
 # Result example: {"stores":[{"id":"01KMTFH0653Q23BT8R9BCA4GQN","name":"rag-enterprise","created_at":"2026-03-28T15:03:14.380041Z","updated_at":"2026-03-28T15:03:14.380041Z","deleted_at":null}],"continuation_token":""}

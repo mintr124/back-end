@@ -8,6 +8,7 @@ engine = create_engine(
     pool_pre_ping=True,
     pool_recycle=3600,
     future=True,
+    execution_options={"isolation_level": "READ COMMITTED"},  
 )
 
 SessionLocal = sessionmaker(

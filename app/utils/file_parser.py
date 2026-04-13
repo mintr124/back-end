@@ -4,7 +4,7 @@ from pathlib import Path
 
 from docx import Document as DocxDocument
 from PIL import Image
-from pypdf import PdfReader
+import fitz
 import pytesseract
 
 from app.utils.text_normalizer import normalize_text
@@ -25,9 +25,10 @@ def parse_file_bytes(raw_bytes: bytes, filename: str, mime_type: str) -> ParsedD
         pages = [(1, text)]
 
     elif ext == ".pdf" or mime_type == "application/pdf":
-        reader = PdfReader(BytesIO(raw_bytes))
-        for i, page in enumerate(reader.pages, start=1):
-            pages.append((i, page.extract_text() or ""))
+        doc = fitz.open(stream=BytesIO(raw_bytes), filetype="pdf")
+        for i, page in enumerate(doc, start=1):
+            pages.append((i, page.get_text("text") or ""))
+        doc.close()
 
     elif ext == ".docx" or mime_type in {
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
