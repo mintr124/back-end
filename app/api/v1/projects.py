@@ -19,7 +19,7 @@ def list_projects(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    return project_service.list_projects(db, department_id)
+    return project_service.list_projects(db, current_user, department_id)
 
 @router.post("", response_model=ProjectResponse, status_code=201)
 def create_project(

@@ -12,7 +12,7 @@ class Document(Base, TimestampMixin):
     title = Column(String(255), nullable=False, index=True)
     description = Column(Text, nullable=True)
 
-    department_id = Column(String(36), ForeignKey("departments.id"), nullable=False, index=True)
+    department_id = Column(String(36), ForeignKey("departments.id"), nullable=True, index=True)
     project_id = Column(String(36), ForeignKey("projects.id"), nullable=True, index=True)
     owner_user_id = Column(String(36), ForeignKey("users.id"), nullable=False, index=True)
 

@@ -48,6 +48,7 @@
     {
       "type": "document",
       "relations": {
+        "owner": { "this": {} },
         "admin_auditor": { "this": {} },
         "global_director": { "this": {} },
 
@@ -62,14 +63,12 @@
         "can_view": {
           "union": {
             "child": [
+              { "computedUserset": { "relation": "owner" } },
               { "computedUserset": { "relation": "admin_auditor" } },
               { "computedUserset": { "relation": "global_director" } },
-
               { "computedUserset": { "relation": "public_viewer" } },
-
               { "computedUserset": { "relation": "dept_member" } },
               { "computedUserset": { "relation": "dept_manager" } },
-
               { "computedUserset": { "relation": "project_member" } },
               { "computedUserset": { "relation": "project_dept_manager" } }
             ]
@@ -79,6 +78,7 @@
         "can_edit": {
           "union": {
             "child": [
+              { "computedUserset": { "relation": "owner" } },
               { "computedUserset": { "relation": "admin_auditor" } },
               { "computedUserset": { "relation": "global_director" } },
               { "computedUserset": { "relation": "dept_manager" } },
@@ -89,6 +89,7 @@
       },
       "metadata": {
         "relations": {
+          "owner": { "directly_related_user_types": [{ "type": "user" }] },
           "admin_auditor": {
             "directly_related_user_types": [{ "type": "user" }]
           },

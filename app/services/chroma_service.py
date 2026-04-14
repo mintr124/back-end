@@ -32,12 +32,22 @@ class ChromaService:
             embedding=embedding,
             metadata=metadata,
         )
+        
+    def delete_chunks(self, chunk_ids: list[str]) -> None:
+        if not chunk_ids:
+            return
+        from app.repositories.chroma_repository import ChromaRepository
+        repo = ChromaRepository()
+        repo.delete_by_ids(chunk_ids)
 
     def query_by_embedding(self, *, embedding: list[float], top_k: int = 5) -> dict:
         return self.repo.query_by_embedding(embedding=embedding, top_k=top_k)
 
     def query_by_keyword(self, *, query: str, top_k: int = 5) -> dict:
         return self.repo.query_by_keyword(query=query, top_k=top_k)
+    
+    def update_document_metadata(self, chunk_ids: list[str], metadata_updates: dict) -> None:
+        self.repo.update_document_metadata(chunk_ids, metadata_updates)
 
 
 chroma_service = ChromaService()

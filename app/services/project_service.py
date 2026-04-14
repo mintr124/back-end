@@ -28,10 +28,26 @@ class ProjectService:
             user_count=count or 0,
         )
 
-    def list_projects(self, db: Session, department_id=None) -> list[ProjectResponse]:
+    def list_projects(self, db: Session, user: User, department_id=None) -> list[ProjectResponse]:
         q = db.query(Project)
-        if department_id:
-            q = q.filter(Project.department_id == department_id)
+
+        if user.role in {"admin_auditor", "director"}:
+            # Xem tất cả
+            if department_id:
+                q = q.filter(Project.department_id == department_id)
+
+        elif user.role == "department_manager":
+            q = q.filter(Project.department_id == user.department_id)
+            if department_id:
+                q = q.filter(Project.department_id == department_id)
+
+        else:
+            q = q.join(UserProject, UserProject.project_id == Project.id).filter(
+                UserProject.user_id == user.id
+            )
+            if department_id:
+                q = q.filter(Project.department_id == department_id)
+
         return [self._to_response(db, p) for p in q.order_by(Project.name).all()]
 
     def create_project(self, db: Session, user: User, payload, trace_id: str) -> ProjectResponse:
