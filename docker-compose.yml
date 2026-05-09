@@ -79,6 +79,13 @@ services:
       PERSIST_DIRECTORY: /chroma/chroma
     restart: unless-stopped
 
+  chroma-ui:
+    image: fengzhichao/chromadb-admin:latest
+    container_name: rag-chroma-ui
+    ports:
+      - "3001:3001"
+    restart: unless-stopped
+
   api:
     build: .
     container_name: rag-api

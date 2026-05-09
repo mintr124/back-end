@@ -1,4 +1,4 @@
-from sqlalchemy import Column, ForeignKey, Integer, String, Text
+from sqlalchemy import Column, ForeignKey, Integer, JSON, String, Text
 from sqlalchemy.orm import relationship
 
 from app.db.base import Base, TimestampMixin
@@ -25,6 +25,8 @@ class DocumentVersion(Base, TimestampMixin):
     embed_status = Column(String(32), nullable=False, default="pending")
     error_message = Column(Text, nullable=True)
     rule_version = Column(String(32), nullable=False, default="v1")
+
+    chunk_config_json = Column(JSON, nullable=True)
 
     document = relationship("Document", back_populates="versions", foreign_keys=[document_id])
     source_object = relationship("StorageObject", foreign_keys=[source_object_id])

@@ -19,6 +19,7 @@ from app.repositories.document_repository import DocumentRepository
 from app.repositories.project_repository import ProjectRepository
 from app.repositories.version_repository import VersionRepository
 from app.schemas.document import DocumentCreateRequest, DocumentUpdateRequest
+from app.schemas.document import ChunkingConfig, DocumentCreateRequest, DocumentUpdateRequest
 from app.services.audit_service import audit_service
 from app.services.job_service import job_service
 from app.services.permission_service import permission_service
@@ -281,99 +282,111 @@ class DocumentService:
         return self.versions.list_by_document(db, doc.id)
 
     def create_version(
-        self,
-        db: Session,
-        user: User,
-        doc_id: str,
-        *,
-        raw_bytes: bytes,
-        filename: str,
-        content_type: str,
-        trace_id: str,
-    ) -> tuple[Document, DocumentVersion, object, bool]:
-        doc = self.docs.get_by_id(db, doc_id)
-        if not doc:
-            raise HTTPException(status_code=404, detail="Document not found")
-
-        ok, reason = permission_service.can_update_document(user, doc)
-        if not ok:
+            self,
+            db: Session,
+            user: User,
+            doc_id: str,
+            *,
+            raw_bytes: bytes,
+            filename: str,
+            content_type: str,
+            trace_id: str,
+            chunking_config: "ChunkingConfig | None" = None,   # ← THÊM
+        ) -> tuple[Document, DocumentVersion, object, bool]:
+            from app.schemas.document import ChunkingConfig  # guard circular
+    
+            doc = self.docs.get_by_id(db, doc_id)
+            if not doc:
+                raise HTTPException(status_code=404, detail="Document not found")
+    
+            ok, reason = permission_service.can_update_document(user, doc)
+            if not ok:
+                audit_service.log_action(
+                    db,
+                    trace_id=trace_id,
+                    user_id=user.id,
+                    action="document.version_upload",
+                    resource_type="document",
+                    resource_id=doc.id,
+                    decision="deny",
+                    input_json={"filename": filename, "content_type": content_type},
+                )
+                db.commit()
+                raise HTTPException(status_code=403, detail=reason)
+    
+            # Normalize chunking config
+            if chunking_config is None:
+                chunking_config = ChunkingConfig()   # mode="legacy", safe defaults
+    
+            last_no    = self.docs.get_max_version_no(db, doc.id)
+            version_no = last_no + 1
+    
+            checksum   = storage_service.checksum(raw_bytes)
+            object_key = f"documents/{doc.id}/versions/{version_no}/{Path(filename).name}"
+    
+            storage_obj = storage_service.upload_raw(
+                db,
+                data=raw_bytes,
+                object_key=object_key,
+                original_filename=Path(filename).name,
+                content_type=content_type,
+            )
+    
+            version = DocumentVersion(
+                document_id=doc.id,
+                version_no=version_no,
+                file_name=Path(filename).name,
+                mime_type=content_type,
+                checksum=checksum,
+                source_object_id=storage_obj.id,
+                ingest_status="queued",
+                parse_status="pending",
+                chunk_status="pending",
+                embed_status="pending",
+                rule_version=settings.default_policy_version,
+                chunk_config_json=chunking_config.to_json(),   # ← THÊM
+            )
+            self.versions.create(db, version)
+    
+            doc.current_version_id = version.id
+            doc.status = "uploaded"
+    
+            snapshot = DocumentPolicySnapshot(
+                document_version_id=version.id,
+                policy_version=settings.default_policy_version,
+                contract_json=self._policy_contract(doc),
+            )
+            db.add(snapshot)
+    
+            job, created = job_service.create_or_get_ingest_job(
+                db,
+                trace_id=trace_id,
+                document_id=doc.id,
+                version_id=version.id,
+                created_by_user_id=user.id,
+            )
+    
             audit_service.log_action(
                 db,
                 trace_id=trace_id,
                 user_id=user.id,
                 action="document.version_upload",
-                resource_type="document",
-                resource_id=doc.id,
-                decision="deny",
-                input_json={"filename": filename, "content_type": content_type},
+                resource_type="document_version",
+                resource_id=version.id,
+                decision="allow",
+                input_json={
+                    "filename":       filename,
+                    "content_type":   content_type,
+                    "chunking_config": chunking_config.to_json(),  # ← LOG
+                },
+                output_json={"job_id": job.id, "version_no": version_no},
             )
+    
             db.commit()
-            raise HTTPException(status_code=403, detail=reason)
-
-        last_no = self.docs.get_max_version_no(db, doc.id)
-        version_no = last_no + 1
-
-        checksum = storage_service.checksum(raw_bytes)
-        object_key = f"documents/{doc.id}/versions/{version_no}/{Path(filename).name}"
-
-        storage_obj = storage_service.upload_raw(
-            db,
-            data=raw_bytes,
-            object_key=object_key,
-            original_filename=Path(filename).name,
-            content_type=content_type,
-        )
-
-        version = DocumentVersion(
-            document_id=doc.id,
-            version_no=version_no,
-            file_name=Path(filename).name,
-            mime_type=content_type,
-            checksum=checksum,
-            source_object_id=storage_obj.id,
-            ingest_status="queued",
-            parse_status="pending",
-            chunk_status="pending",
-            embed_status="pending",
-            rule_version=settings.default_policy_version,
-        )
-        self.versions.create(db, version)
-
-        doc.current_version_id = version.id
-        doc.status = "uploaded"
-
-        snapshot = DocumentPolicySnapshot(
-            document_version_id=version.id,
-            policy_version=settings.default_policy_version,
-            contract_json=self._policy_contract(doc),
-        )
-        db.add(snapshot)
-
-        job, created = job_service.create_or_get_ingest_job(
-            db,
-            trace_id=trace_id,
-            document_id=doc.id,
-            version_id=version.id,
-            created_by_user_id=user.id,
-        )
-
-        audit_service.log_action(
-            db,
-            trace_id=trace_id,
-            user_id=user.id,
-            action="document.version_upload",
-            resource_type="document_version",
-            resource_id=version.id,
-            decision="allow",
-            input_json={"filename": filename, "content_type": content_type},
-            output_json={"job_id": job.id, "version_no": version_no},
-        )
-
-        db.commit()
-        db.refresh(doc)
-        db.refresh(version)
-        db.refresh(job)
-        return doc, version, job, created
+            db.refresh(doc)
+            db.refresh(version)
+            db.refresh(job)
+            return doc, version, job, created
 
     def start_ingest(
         self,

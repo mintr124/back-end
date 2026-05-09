@@ -25,7 +25,9 @@ from __future__ import annotations
 import logging
 import math
 from typing import Any
+import re
 
+from app.services.sensitivity_levels import SensitivityLevel, ROLE_MAX_SENSITIVITY, SENSITIVITY_PATTERNS
 from app.fga.adapter import fga_adapter
 from app.repositories.chroma_repository import ChromaRepository
 from app.services.embedding_service import embedding_service
@@ -87,9 +89,25 @@ class RetrievalService:
         def process(results: list[dict], source: str) -> None:
             for rank, item in enumerate(results):
                 cid = item["chunk_id"]
+
                 scores[cid] = scores.get(cid, 0.0) + self._rrf_score(rank)
+
                 if cid not in registry:
-                    registry[cid] = {**item, "sources": set()}
+                    registry[cid] = {
+                        "chunk_id": item["chunk_id"],
+                        "document_text": item["document_text"],
+                        "metadata": item["metadata"],
+                        "semantic_distance": None,
+                        "lexical_distance": None,
+                        "sources": set(),
+                    }
+
+                if source == "semantic":
+                    registry[cid]["semantic_distance"] = item.get("distance")
+
+                if source == "lexical":
+                    registry[cid]["lexical_distance"] = item.get("distance")
+
                 registry[cid]["sources"].add(source)
 
         process(semantic_results, "semantic")
@@ -99,9 +117,13 @@ class RetrievalService:
         for cid, item in registry.items():
             rrf = scores[cid]
             merged.append({
-                **item,
+                "chunk_id": item["chunk_id"],
+                "document_text": item["document_text"],
+                "metadata": item["metadata"],
+                "semantic_distance": item.get("semantic_distance"),
+                "lexical_distance": item.get("lexical_distance"),
                 "rrf_score": round(rrf, 6),
-                "sources":   sorted(item["sources"]),
+                "sources": sorted(item["sources"]),
             })
 
         merged.sort(key=lambda x: x["rrf_score"], reverse=True)
@@ -151,6 +173,94 @@ class RetrievalService:
         if len(conditions) == 1:
             return conditions[0]
         return None
+    
+    def _classify_chunk_sensitivity(self, chunk: dict) -> SensitivityLevel:
+        """
+        Classify độ nhạy của chunk dựa trên:
+        1. metadata.sensitivity (nếu đã được tag khi ingest)
+        2. Regex scan nội dung (fallback)
+        """
+        # Ưu tiên metadata nếu có
+        meta_sensitivity = chunk.get("metadata", {}).get("sensitivity")
+        if meta_sensitivity:
+            try:
+                return SensitivityLevel[meta_sensitivity.upper()]
+            except KeyError:
+                pass
+
+        # Fallback: scan nội dung
+        text = chunk.get("document_text", "")
+        for level in [SensitivityLevel.RESTRICTED,
+                    SensitivityLevel.CONFIDENTIAL,
+                    SensitivityLevel.INTERNAL]:
+            for pattern in SENSITIVITY_PATTERNS.get(level, []):
+                if re.search(pattern, text, re.IGNORECASE):
+                    return level
+
+        return SensitivityLevel.PUBLIC
+
+
+    def _apply_sensitivity_gate(
+        self,
+        chunks: list[dict],
+        user,
+    ) -> list[dict]:
+        """
+        Filter + redact chunks theo role của user.
+
+        admin_auditor → RESTRICTED: xem full, không redact
+        director      → CONFIDENTIAL: xem được, nhưng redact RESTRICTED fields
+        manager/employee → INTERNAL: không thấy CONFIDENTIAL/RESTRICTED
+        """
+        if user is None:
+            # Không có user context → chỉ trả PUBLIC
+            return [c for c in chunks
+                    if self._classify_chunk_sensitivity(c) == SensitivityLevel.PUBLIC]
+
+        user_role    = getattr(user, "role", "employee")
+        max_level    = ROLE_MAX_SENSITIVITY.get(user_role, SensitivityLevel.INTERNAL)
+        allowed: list[dict] = []
+
+        for chunk in chunks:
+            chunk_level = self._classify_chunk_sensitivity(chunk)
+
+            if chunk_level > max_level:
+                # Hoàn toàn không có quyền → drop chunk
+                logger.warning(
+                    "SENSITIVITY GATE: blocked chunk=%s level=%s user=%s role=%s",
+                    chunk.get("chunk_id"), chunk_level.name,
+                    getattr(user, "id", "?"), user_role,
+                )
+                continue
+
+            # director xem CONFIDENTIAL chunk nhưng redact RESTRICTED fields
+            if user_role == "director" and chunk_level == SensitivityLevel.CONFIDENTIAL:
+                chunk = self._redact_for_director(chunk)
+
+            allowed.append(chunk)
+
+        return allowed
+
+
+    def _redact_for_director(self, chunk: dict) -> dict:
+        """
+        Director được xem CONFIDENTIAL nhưng một số field
+        trong RESTRICTED patterns vẫn bị redact.
+        """
+        REDACT_PATTERNS = [
+            (r"\b\d{1,3}(?:[.,]\d{3})+\s*(?:VND|đồng)\b", "[SỐ TIỀN ĐÃ ẨN]"),
+            (r"\b(?:\+84|0)(?:3[2-9]|5[6-9]|7[0-9]|8[0-9]|9[0-9])[\s\-]?\d{3}[\s\-]?\d{3}\b",
+            "[SĐT ĐÃ ẨN]"),
+            (r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", "[EMAIL ĐÃ ẨN]"),
+            (r"\b\d{9}(?:\d{3})?\b", "[CCCD ĐÃ ẨN]"),
+        ]
+        new_chunk = dict(chunk)
+        text = new_chunk.get("document_text", "")
+        for pattern, replacement in REDACT_PATTERNS:
+            text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+        new_chunk["document_text"]    = text
+        new_chunk["_director_redacted"] = True
+        return new_chunk
 
     # ------------------------------------------------------------------
     # Main retrieve
@@ -212,12 +322,39 @@ class RetrievalService:
 
         # ── 3. Fuse ───────────────────────────────────────────────────
         if mode == "semantic":
-            fused = [{**item, "rrf_score": self._cosine_sim(item["distance"]), "sources": ["semantic"]}
-                     for item in semantic_list]
+            fused = []
+            for item in semantic_list:
+                semantic_score = self._cosine_sim(item.get("distance"))
+
+                fused.append({
+                    **item,
+                    "rrf_score": semantic_score,
+                    "semantic_distance": item.get("distance"),
+                    "keyword_score": None,
+                    "sources": ["semantic"],
+                })
+
             fused.sort(key=lambda x: x["rrf_score"], reverse=True)
         elif mode == "keyword":
-            fused = [{**item, "rrf_score": self._rrf_score(i), "sources": ["lexical"]}
-                     for i, item in enumerate(lexical_list)]
+            fused = []
+            for item in lexical_list:
+                d = item.get("distance")
+
+                # distance = 1 - f1 → f1 = 1 - distance
+                try:
+                    keyword_score = max(0.0, min(1.0, 1.0 - float(d)))
+                except Exception:
+                    keyword_score = 0.0
+
+                fused.append({
+                    **item,
+                    "rrf_score": keyword_score,   # dùng F1 làm score chính
+                    "lexical_distance": item.get("distance"),
+                    "semantic_score": None,
+                    "sources": ["lexical"],
+                })
+
+            fused.sort(key=lambda x: x["rrf_score"], reverse=True)
         else:
             fused = self._fuse(semantic_list, lexical_list)
 
@@ -227,22 +364,46 @@ class RetrievalService:
 
         # ── 4. Score threshold + annotate ─────────────────────────────
         results: list[dict] = []
+
         for item in fused:
-            score = item["rrf_score"]
+            semantic_score = None
+            keyword_score  = None
+
+            # --- extract semantic ---
+            if item.get("semantic_distance") is not None:
+                semantic_score = self._cosine_sim(item["semantic_distance"])
+
+            # --- extract keyword ---
+            if item.get("lexical_distance") is not None:
+                try:
+                    keyword_score = max(0.0, min(1.0, 1.0 - float(item["lexical_distance"])))
+                except Exception:
+                    keyword_score = 0.0
+
+            # --- combine score ---
+            if semantic_score is not None and keyword_score is not None:
+                score = 0.5 * semantic_score + 0.5 * keyword_score
+            elif semantic_score is not None:
+                score = semantic_score
+            elif keyword_score is not None:
+                score = keyword_score
+            else:
+                score = 0.0
+
             if score < self.minimum_score:
                 continue
 
-            # add semantic_score for transparency
-            sem_score = self._cosine_sim(item.get("distance"))
             results.append({
-                "chunk_id":      item["chunk_id"],
+                "chunk_id": item["chunk_id"],
                 "document_text": item["document_text"],
-                "metadata":      item["metadata"] or {},
-                "distance":      item.get("distance"),
-                "score":         round(score, 6),
-                "semantic_score": round(sem_score, 6),
-                "sources":       item.get("sources", []),
+                "metadata": item["metadata"] or {},
+                "score": round(score, 6),
+                "semantic_score": round(semantic_score, 6) if semantic_score is not None else None,
+                "keyword_score": round(keyword_score, 6) if keyword_score is not None else None,
+                "sources": item.get("sources", []),
             })
+            
+        results = self._apply_sensitivity_gate(results, user)
 
         return results[:top_k]
 

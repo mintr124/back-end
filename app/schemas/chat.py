@@ -27,6 +27,8 @@ class MessageCreateRequest(BaseModel):
     project_ids: Optional[list[str]] = None    
     department_ids: Optional[list[str]] = None  
     mode: str = "rag"
+    file_content: Optional[str] = None   
+    file_name: Optional[str] = None      
 
 
 class AssistantMessage(BaseModel):
