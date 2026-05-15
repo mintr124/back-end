@@ -1,5 +1,9 @@
+import json
+import urllib.parse
+
+
 from app.models.document import Document as DocumentModel
-from fastapi import APIRouter, Depends, File, UploadFile, Request, HTTPException
+from fastapi import APIRouter, Depends, File, Form, UploadFile, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -8,6 +12,7 @@ from app.models.user import User
 from app.models.document_version import DocumentVersion
 from app.models.storage_object import StorageObject
 from app.schemas.document import (
+    ChunkingConfig,
     DocumentCreateRequest,
     DocumentRead,
     DocumentUpdateRequest,
@@ -21,7 +26,7 @@ from app.workers.ingest_tasks import process_ingest_job
 router = APIRouter()
 
 
-# ── Pending approvals (phải đặt TRƯỚC /{document_id}) ────────────────────────
+# ── Pending approvals ─────────────────────────────────────────────────────────
 @router.get("/pending-approvals", response_model=list[DocumentRead])
 def list_pending_approvals(
     db: Session = Depends(get_db),
@@ -101,10 +106,26 @@ async def upload_version(
     request: Request = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    # ── Chunking config (form fields, tất cả optional) ────────────────────
+    chunk_mode: str = Form(default="legacy"),
+    chunk_max_tokens: int = Form(default=512),
+    chunk_overlap_tokens: int = Form(default=80),
+    chunk_ocr: bool = Form(default=False),
 ):
     raw_bytes = await file.read()
     if len(raw_bytes) > 50 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="File too large")
+
+    # Validate và build chunking config
+    try:
+        chunking_config = ChunkingConfig(
+            mode=chunk_mode,
+            max_tokens=chunk_max_tokens,
+            overlap_tokens=chunk_overlap_tokens,
+            ocr=chunk_ocr,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid chunking config: {exc}")
 
     doc, version, job, queued = document_service.create_version(
         db,
@@ -114,6 +135,7 @@ async def upload_version(
         filename=file.filename or "upload.bin",
         content_type=file.content_type or "application/octet-stream",
         trace_id=request.state.trace_id,
+        chunking_config=chunking_config,
     )
 
     if queued:
@@ -167,6 +189,7 @@ def view_document_file(
     current_user: User = Depends(get_current_user),
 ):
     from app.repositories.storage_repository import StorageRepository
+    import io
 
     document_service.get_document(db, current_user, document_id)
 
@@ -185,13 +208,20 @@ def view_document_file(
     repo = StorageRepository()
     data = repo.get_bytes(src_obj.bucket, src_obj.object_key)
 
+    filename = src_obj.original_filename
+    content_type = src_obj.content_type
+    file_stream = io.BytesIO(data)
+
+    encoded_name = urllib.parse.quote(filename)
     return StreamingResponse(
-        iter([data]),
-        media_type=src_obj.content_type,
+        file_stream,
+        media_type=content_type,
         headers={
-            "Content-Disposition": f'inline; filename="{src_obj.original_filename}"',
-            "Content-Length": str(src_obj.size_bytes),
-        },
+            "Content-Disposition": f"inline; filename*=UTF-8''{encoded_name}",
+            "Access-Control-Allow-Origin": "*",             
+            "Access-Control-Allow-Credentials": "true",       
+            "Access-Control-Expose-Headers": "Content-Disposition", 
+        }
     )
 
 
@@ -234,7 +264,6 @@ def submit_for_review(
     if doc.status != "uploaded":
         raise HTTPException(status_code=400, detail=f"Cannot submit document with status '{doc.status}'")
 
-    # admin_auditor và director không cần review → ready luôn
     if current_user.role in {"admin_auditor", "director"}:
         doc.status = "ready"
         db.commit()
@@ -305,10 +334,10 @@ def delete_document(
 ):
     if current_user.role not in {"admin_auditor", "director"}:
         raise HTTPException(status_code=403, detail="Only admin_auditor or director can delete documents")
-    
+
     doc = db.query(DocumentModel).filter(DocumentModel.id == document_id).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
-    
+
     document_service.delete_document(db, current_user, document_id, request.state.trace_id)
     return {"ok": True}

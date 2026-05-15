@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional, TYPE_CHECKING
+from typing import Literal, Optional, TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -14,6 +14,31 @@ try:
 except Exception:
     JobRead = None
 
+
+# ── Chunking config ───────────────────────────────────────────────────────────
+
+class ChunkingConfig(BaseModel):
+    """
+    Tham số chunking được gửi khi upload version.
+    Mặc định dùng chunker nội bộ (legacy).
+    Khi mode = hierarchical/hybrid thì dùng Docling.
+    """
+    mode: Literal["legacy", "hierarchical", "hybrid"] = "legacy"
+    max_tokens: int = Field(default=512, ge=64, le=4096)
+    overlap_tokens: int = Field(default=80, ge=0, le=512)
+    ocr: bool = False
+
+    def to_json(self) -> dict:
+        return self.model_dump()
+
+    @classmethod
+    def from_json(cls, data: dict | None) -> "ChunkingConfig":
+        if not data:
+            return cls()
+        return cls(**data)
+
+
+# ── Document CRUD ─────────────────────────────────────────────────────────────
 
 class DocumentCreateRequest(BaseModel):
     title: str
@@ -57,7 +82,6 @@ class DocumentRead(BaseModel):
     document_type: str
     sensitivity_level: str
     data_type: str
-    allowed_roles: list[str]
     allowed_roles: Optional[list[str]] = None
     status: str
     current_version_id: Optional[str] = None
@@ -84,6 +108,7 @@ class DocumentVersionRead(BaseModel):
     embed_status: str
     error_message: Optional[str] = None
     rule_version: str
+    chunk_config_json: Optional[dict] = None
     created_at: datetime
     updated_at: datetime
 

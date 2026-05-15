@@ -37,6 +37,15 @@ configure_logging()
 
 app = FastAPI(title="rag-role-enterprise-api", version="1.0.0")
 
+
+@app.middleware("http")
+async def trace_middleware(request: Request, call_next):
+    request.state.trace_id = request.headers.get("X-Trace-Id", uuid.uuid4().hex)
+    response = await call_next(request)
+    response.headers["X-Trace-Id"] = request.state.trace_id
+    return response
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -48,15 +57,6 @@ app.add_middleware(
 )
 
 register_exception_handlers(app)
-
-
-@app.middleware("http")
-async def trace_middleware(request: Request, call_next):
-    request.state.trace_id = request.headers.get("X-Trace-Id", uuid.uuid4().hex)
-    response = await call_next(request)
-    response.headers["X-Trace-Id"] = request.state.trace_id
-    return response
-
 
 def get_trace_id(request: Request) -> str:
     return getattr(request.state, "trace_id", uuid.uuid4().hex)

@@ -1,12 +1,10 @@
 """
-ingest_pipeline_service.py  –  v2
+ingest_pipeline_service.py  –  v3
 ===================================
-Key improvements vs v1:
-  1. Batch embedding  – all chunks embedded in one (or a few) API calls
-     instead of N sequential calls  → 10-30x faster ingest
-  2. Uses chunk["embed_text"]  (heading-prefixed text) for embedding
-     but stores chunk["chunk_text"]  (clean text) in DB and Chroma documents
-  3. Passes section_heading and position_ratio to Chroma metadata
+Thay đổi so với v2:
+  - Đọc chunk_config_json từ DocumentVersion để lấy ChunkConfig
+  - Truyền config vào chunker_service.chunk(parsed, config=cfg)
+  - Mọi thứ khác giữ nguyên
 """
 from __future__ import annotations
 
@@ -21,8 +19,9 @@ from app.models.chunk_embedding import ChunkEmbedding
 from app.models.document import Document
 from app.models.document_chunk import DocumentChunk
 from app.models.document_version import DocumentVersion
+from app.schemas.document import ChunkingConfig
 from app.services.audit_service import audit_service
-from app.services.chunker_service import chunker_service
+from app.services.chunker_service import ChunkConfig, chunker_service
 from app.services.chroma_service import chroma_service
 from app.services.embedding_service import embedding_service
 from app.services.job_service import job_service
@@ -61,6 +60,21 @@ class IngestPipelineService:
             version.chunk_status  = "pending"
             version.embed_status  = "pending"
             db.commit()
+
+            # ── Đọc chunking config từ version ────────────────────────
+            # version.chunk_config_json được lưu lúc upload
+            # Nếu None (version cũ) → dùng legacy defaults
+            chunking_cfg = ChunkConfig(
+                **ChunkingConfig.from_json(version.chunk_config_json).model_dump(
+                    exclude={"embed_model"}  # ChunkingConfig không có field này
+                ),
+                embed_model="sentence-transformers/all-MiniLM-L6-v2",
+            )
+            logger.info(
+                "Ingest job=%s mode=%s max_tokens=%d overlap=%d ocr=%s",
+                job_id, chunking_cfg.mode, chunking_cfg.max_tokens,
+                chunking_cfg.overlap_tokens, chunking_cfg.ocr,
+            )
 
             # ── clean re-run ──────────────────────────────────────────
             db.query(DocumentChunk).filter(
@@ -120,10 +134,13 @@ class IngestPipelineService:
 
             # ── chunk ─────────────────────────────────────────────────
             chunk_step = job_service.add_step(
-                db, job_id=job.id, step_name="chunk", detail_json={}
+                db, job_id=job.id, step_name="chunk",
+                detail_json={"mode": chunking_cfg.mode},
             )
-            t0     = time.perf_counter()
-            chunks = chunker_service.chunk(parsed)   # list[dict]
+            t0 = time.perf_counter()
+
+            # ← THAY ĐỔI DUY NHẤT: truyền config vào
+            chunks = chunker_service.chunk(parsed, config=chunking_cfg)
 
             chunk_models: list[DocumentChunk] = []
             for c in chunks:
@@ -145,6 +162,7 @@ class IngestPipelineService:
                 db, chunk_step,
                 detail_json={
                     "chunk_count": len(chunk_models),
+                    "mode":        chunking_cfg.mode,
                     "latency_ms":  int((time.perf_counter() - t0) * 1000),
                 },
             )
@@ -158,8 +176,6 @@ class IngestPipelineService:
             )
             t0 = time.perf_counter()
 
-            # Use embed_text (heading-prefixed) for richer embeddings;
-            # store chunk_text (clean) in Chroma documents field.
             embed_texts = [c.get("embed_text") or c["chunk_text"] for c in chunks]
             vectors     = embedding_service.embed_many(embed_texts)
 
@@ -179,14 +195,14 @@ class IngestPipelineService:
                     "page_start":          chunk_model.page_start,
                     "page_end":            chunk_model.page_end,
                     "chunk_hash":          chunk_model.chunk_hash,
-                    # New fields from v2 chunker
                     "section_heading":     meta_json.get("section_heading", ""),
                     "section_index":       meta_json.get("section_index", 0),
                     "position_ratio":      meta_json.get("position_ratio", 0.0),
+                    "chunker_mode":        meta_json.get("chunker_mode", "legacy"),
                 }
                 chroma_service.upsert_chunk(
                     chunk_id=chunk_model.id,
-                    document_text=chunk_dict["chunk_text"],   # clean text
+                    document_text=chunk_dict["chunk_text"],
                     embedding=vector,
                     metadata=metadata,
                 )
@@ -236,6 +252,7 @@ class IngestPipelineService:
                     "document_version_id": version.id,
                     "chunk_count":         len(chunk_models),
                     "collection":          settings.chroma_collection,
+                    "chunker_mode":        chunking_cfg.mode,
                 },
             )
             audit_service.log_action(
@@ -250,6 +267,7 @@ class IngestPipelineService:
                 output_json={
                     "chunk_count":     len(chunk_models),
                     "embedding_model": embedding_service.model_name,
+                    "chunker_mode":    chunking_cfg.mode,
                 },
                 latency_ms=int((time.perf_counter() - start_total) * 1000),
             )
