@@ -6,38 +6,39 @@ from app.models.user import User
 from app.models.trace import Trace
 from app.models.job import Job as JobModel
 from app.models.document import Document
+from sqlalchemy.orm import Session
+from app.services.user_service import user_service as _user_service
 
 router = APIRouter()
 
-#TODO: do after for refresh phase
 
-def require_admin(user: User):
-    if user.role not in {"director", "admin_auditor"}:
-        raise HTTPException(status_code=403, detail="Director or admin_auditor privileges required")
-    return True
+def require_admin(user: User, db: Session):
+    user_resp = _user_service.build_user_response(db, user)
+    if not user_resp.is_corp_member:
+        raise HTTPException(status_code=403, detail="Corp-level admin required")
 
 
 @router.post("/rules/reload")
-def reload_rules(current_user: User = Depends(get_current_user)):
-    require_admin(current_user)
+def reload_rules(db: Session = Depends(get_db),  current_user: User = Depends(get_current_user)):
+    require_admin(current_user, db)
     return {"status": "ok", "message": "rules reloaded"}
 
 
 @router.post("/fga/sync")
-def sync_fga(current_user: User = Depends(get_current_user)):
-    require_admin(current_user)
+def sync_fga(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    require_admin(current_user, db)
     return {"status": "ok", "message": "fga sync completed"}
 
 
 @router.post("/reindex")
-def reindex(current_user: User = Depends(get_current_user)):
-    require_admin(current_user)
+def reindex(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    require_admin(current_user, db)
     return {"status": "ok", "message": "reindex queued"}
 
 
 @router.post("/override-metadata")
-def override_metadata(current_user: User = Depends(get_current_user)):
-    require_admin(current_user)
+def override_metadata(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    require_admin(current_user, db)
     return {"status": "ok", "message": "override accepted"}
 
 
@@ -46,7 +47,7 @@ def list_traces(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    require_admin(current_user)
+    require_admin(current_user, db)
     traces = db.query(Trace).order_by(Trace.created_at.desc()).limit(200).all()
     result = []
     for t in traces:
@@ -72,7 +73,7 @@ def list_jobs(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    require_admin(current_user)
+    require_admin(current_user, db)
     jobs = db.query(JobModel).order_by(JobModel.created_at.desc()).limit(200).all()
     result = []
     for j in jobs:
@@ -102,7 +103,7 @@ def retry_job(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    require_admin(current_user)
+    require_admin(current_user, db)
     job = db.query(JobModel).filter(JobModel.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -121,7 +122,7 @@ def cancel_job(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    require_admin(current_user)
+    require_admin(current_user, db)
     job = db.query(JobModel).filter(JobModel.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")

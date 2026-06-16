@@ -23,7 +23,7 @@ class ChunkingConfig(BaseModel):
     Mặc định dùng chunker nội bộ (legacy).
     Khi mode = hierarchical/hybrid thì dùng Docling.
     """
-    mode: Literal["legacy", "hierarchical", "hybrid"] = "legacy"
+    mode: Literal["legacy", "hierarchical", "hybrid", "llm_structured"] = "llm_structured"
     max_tokens: int = Field(default=512, ge=64, le=4096)
     overlap_tokens: int = Field(default=80, ge=0, le=512)
     ocr: bool = False
@@ -43,30 +43,19 @@ class ChunkingConfig(BaseModel):
 class DocumentCreateRequest(BaseModel):
     title: str
     description: Optional[str] = None
-    department_id: Optional[str] = None
-    project_id: Optional[str] = None
+    oui_ids: list[str] = []           # multi OUI
+    sensitivity: int = 2              # 1-5
     document_type: str = "general"
-    sensitivity_level: str = "internal"
     data_type: str = "text"
-    allowed_roles: list[str] = Field(
-        default_factory=lambda: [
-            "department_manager",
-            "director",
-            "admin_auditor",
-        ]
-    )
     tags: Optional[list[str]] = None
 
 
 class DocumentUpdateRequest(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
-    department_id: Optional[str] = None
-    project_id: Optional[str] = None
+    oui_ids: Optional[list[str]] = None
+    sensitivity: Optional[int] = None
     document_type: Optional[str] = None
-    sensitivity_level: Optional[str] = None
-    data_type: Optional[str] = None
-    allowed_roles: Optional[list[str]] = None
     tags: Optional[list[str]] = None
 
 
@@ -76,18 +65,25 @@ class DocumentRead(BaseModel):
     id: str
     title: str
     description: Optional[str] = None
-    department_id: Optional[str] = None
-    project_id: Optional[str] = None
+    oui_ids: list[str] = []        # ← computed từ doc.ouis
     owner_user_id: str
     document_type: str
-    sensitivity_level: str
+    sensitivity: int               # 1-5
     data_type: str
-    allowed_roles: Optional[list[str]] = None
+    tags: list[str] = []
     status: str
     current_version_id: Optional[str] = None
     version_count: int = 0
     created_at: datetime
     updated_at: datetime
+
+    @classmethod
+    def model_validate(cls, obj, **kwargs):
+        data = super().model_validate(obj, **kwargs)
+        # Populate oui_ids từ relationship
+        if hasattr(obj, "ouis"):
+            data.oui_ids = [o.id for o in (obj.ouis or [])]
+        return data
 
 
 class DocumentVersionRead(BaseModel):

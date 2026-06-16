@@ -565,11 +565,11 @@ class GuardService:
                         nhưng giữ PERSON_NAME (cần để đọc hiểu context)
         - everyone else → mask toàn bộ PII
         """
-        user_role = getattr(user, "role", "employee") if user else "employee"
+        is_corp = getattr(user, "is_corp_member", False) if user else False
+        max_clearance = getattr(user, "max_clearance", 1) if user else 1
 
-        # admin_auditor xem full, skip scan luôn
-        if user_role == "admin_auditor":
-            logger.info("Guard2 SKIP: admin_auditor sees raw chunks")
+        if is_corp and max_clearance >= 5:
+            logger.info("Guard2 SKIP: corp_member clearance=5 sees raw chunks")
             return [{**chunk, "_pii_redacted": False} for chunk in chunks]
 
         # Với director: chỉ mask một số entity type nhất định
@@ -589,8 +589,7 @@ class GuardService:
                 cleaned.append(new_chunk)
                 continue
 
-            if user_role == "director":
-                # Chỉ redact những entity type nhạy cảm, giữ PERSON_NAME
+            if is_corp and max_clearance >= 4:
                 filtered_entities = [
                     e for e in scan.entities
                     if e.entity_type in DIRECTOR_MASK_TYPES
@@ -619,13 +618,13 @@ class GuardService:
     # ------------------------------------------------------------------
 
     def scan_response(self, text: str, user=None) -> PIIScanResult:
-        user_role = getattr(user, "role", "employee") if user else "employee"
+        is_corp = getattr(user, "is_corp_member", False) if user else False
+        max_clearance = getattr(user, "max_clearance", 1) if user else 1
+        skip_redact = (is_corp and max_clearance >= 5)
 
         if not text or not text.strip():
             return PIIScanResult(has_pii=False, has_secret=False, redacted_text=text)
 
-        # admin_auditor: chạy scan để audit log, nhưng không redact
-        skip_redact = (user_role == "admin_auditor")
 
         # ── Guard 3a ──────────────────────────────────────────────────
         all_entities: list[PIIEntity] = []
@@ -714,4 +713,4 @@ class GuardService:
 
 
 # Singleton  –  set enable_judge=False trong dev để giảm latency
-guard_service = GuardService(enable_judge=True)
+guard_service = GuardService(enable_judge=False)

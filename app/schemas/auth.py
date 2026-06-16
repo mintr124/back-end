@@ -1,7 +1,5 @@
-from typing import Optional
-
-from pydantic import BaseModel, ConfigDict, Field
-from app.schemas.user import UserRead
+from pydantic import BaseModel
+from app.schemas.user import UserResponse
 
 
 class LoginRequest(BaseModel):
@@ -12,4 +10,4 @@ class LoginRequest(BaseModel):
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
-    user: UserRead
+    user: UserResponse      

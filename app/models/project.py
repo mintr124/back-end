@@ -13,4 +13,3 @@ class Project(Base, TimestampMixin):
     department_id = Column(String(36), ForeignKey("departments.id"), nullable=False, index=True)
 
     department = relationship("Department", back_populates="projects")
-    documents = relationship("Document", back_populates="project")

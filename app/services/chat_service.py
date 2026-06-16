@@ -43,6 +43,8 @@ from app.services.guard_service import guard_service        # ← NEW
 from app.utils.status_answer import is_no_answer
 from app.core.config import settings
 
+GUARDS_ENABLED = False
+
 logger = logging.getLogger(__name__)
 
 CHATBOT_SYSTEM_PROMPT = """
@@ -246,22 +248,16 @@ class ChatService:
         db.flush()
 
         # ── [GUARD 1] Intent classification ───────────────────────────
-        intent = guard_service.check_intent(content)
-        logger.info(
-            "Guard1 result: class=%s action=%s risk=%s",
-            intent.class_, intent.action, intent.risk,
-        )
-
-        if intent.blocked:
-            block_text = _block_message(intent.class_)
-            return self._make_blocked_assistant_message(
-                db, conversation_id, user_msg, block_text, tr, tid, user,
-            )
-
-        # Dùng rewrite nếu có
-        effective_query = intent.rewrite if intent.should_rewrite else content
-        if intent.should_rewrite:
-            logger.info("Guard1 REWRITE: '%s' → '%s'", content[:80], effective_query[:80])
+        if GUARDS_ENABLED:
+            intent = guard_service.check_intent(content)
+            if intent.blocked:
+                block_text = _block_message(intent.class_)
+                return self._make_blocked_assistant_message(
+                    db, conversation_id, user_msg, block_text, tr, tid, user,
+                )
+            effective_query = intent.rewrite if intent.should_rewrite else content
+        else:
+            effective_query = content
 
         # ── Retrieval ─────────────────────────────────────────────────
         retrieved_raw = retrieval_service.retrieve(query=effective_query, user=user, top_k=5)
@@ -269,7 +265,8 @@ class ChatService:
 
         # ── [GUARD 2] PII scan trên retrieved chunks ───────────────────
         logger.info("USER ROLE: %s USER ID: %s", getattr(user, "role", None), getattr(user, "id", None))
-        retrieved = guard_service.scan_chunks(retrieved, user=user)
+        if GUARDS_ENABLED:
+            retrieved = guard_service.scan_chunks(retrieved, user=user)
 
         history = self._load_history(db, conversation_id, effective_query)
 
@@ -310,8 +307,8 @@ class ChatService:
                 sources = self._build_sources_from_retrieved(retrieved)
 
         # ── [GUARD 3] PII + Secret scan trên LLM response ─────────────
-        if answer_text:
-            post_scan = guard_service.scan_response(answer_text, user=user)  # ← thêm user=user
+        if GUARDS_ENABLED and answer_text:
+            post_scan = guard_service.scan_response(answer_text, user=user) 
 
             if post_scan.judge and post_scan.judge.should_block:
                 logger.warning("Guard3b BLOCK: reason=%s trace_id=%s", post_scan.judge.reason, tid)
@@ -434,9 +431,9 @@ class ChatService:
         content: str,
         client_message_id: str | None,
         trace_id: str,
-        project_ids:    list[str] | None = None,
-        department_ids: list[str] | None = None,
+        oui_ids: list[str] | None = None,
         mode: str = "rag",
+        chat_source="rag",
         file_content: str | None = None,
         file_name: str | None = None,
     ):
@@ -467,55 +464,52 @@ class ChatService:
         db.refresh(user_msg)
 
         # ── [GUARD 1] Intent classification (stream) ───────────────────
-        intent = guard_service.check_intent(content)
-        logger.info(
-            "Guard1 stream: class=%s action=%s risk=%s",
-            intent.class_, intent.action, intent.risk,
-        )
+        if GUARDS_ENABLED:
+            intent = guard_service.check_intent(content)
 
-        if intent.blocked:
-            # Tạo assistant message blocked ngay, không cần tạo streaming message trước
-            block_text = _block_message(intent.class_)
+            if intent.blocked:
+                # Tạo assistant message blocked ngay, không cần tạo streaming message trước
+                block_text = _block_message(intent.class_)
 
-            assistant_msg = Message(
-                conversation_id=conversation_id,
-                role="assistant",
-                content=block_text,
-                status="blocked",
-                trace_id=tid,
-            )
-            self.msgs.create(db, assistant_msg)
-            db.flush()
-            db.refresh(assistant_msg)
+                assistant_msg = Message(
+                    conversation_id=conversation_id,
+                    role="assistant",
+                    content=block_text,
+                    status="blocked",
+                    trace_id=tid,
+                )
+                self.msgs.create(db, assistant_msg)
+                db.flush()
+                db.refresh(assistant_msg)
 
-            tr.assistant_output_summary = block_text
-            tr.status = "blocked"
+                tr.assistant_output_summary = block_text
+                tr.status = "blocked"
 
-            audit_service.log_action(
-                db, trace_id=tid, user_id=user.id,
-                action="chat.message.blocked", resource_type="conversation",
-                resource_id=conversation_id, decision="deny",
-                input_json={"message": content},
-                output_json={"reason": block_text},
-            )
-            db.commit()
+                audit_service.log_action(
+                    db, trace_id=tid, user_id=user.id,
+                    action="chat.message.blocked", resource_type="conversation",
+                    resource_id=conversation_id, decision="deny",
+                    input_json={"message": content},
+                    output_json={"reason": block_text},
+                )
+                db.commit()
 
-            # Emit stream events rồi done
-            yield {"type": "message_start", "messageId": assistant_msg.id, "userMessageId": user_msg.id}
-            yield {"type": "token", "text": block_text}
-            yield {"type": "done", "content": block_text, "sources": [], "messageId": assistant_msg.id, "blocked": True, "blockClass": intent.class_}
-            return
+                # Emit stream events rồi done
+                yield {"type": "message_start", "messageId": assistant_msg.id, "userMessageId": user_msg.id}
+                yield {"type": "token", "text": block_text}
+                yield {"type": "done", "content": block_text, "sources": [], "messageId": assistant_msg.id, "blocked": True, "blockClass": intent.class_}
+                return
 
-        # Dùng rewrite nếu có
-        PRIVILEGED_ROLES = {"admin_auditor", "director"}
-        user_role = getattr(user, "role", "employee")
-        effective_query = content  # default: dùng query gốc
-
-        if intent.should_rewrite and user_role not in PRIVILEGED_ROLES:
-            effective_query = intent.rewrite
-            logger.info("Guard1 REWRITE stream: '%s' → '%s'", content[:80], effective_query[:80])
-        elif intent.should_rewrite and user_role in PRIVILEGED_ROLES:
-            logger.info("Guard1 REWRITE SKIPPED (privileged role=%s): '%s'", user_role, content[:80])
+            # Dùng rewrite nếu có
+            is_corp = getattr(user, "is_corp_member", False)
+            max_clearance = getattr(user, "max_clearance", 1)
+            is_privileged = is_corp and max_clearance >= 4
+            effective_query = content
+            if intent.should_rewrite and not is_privileged:
+                effective_query = intent.rewrite
+            
+        else:
+            effective_query = content
 
         # Tạo assistant message placeholder cho stream
         assistant_msg = Message(
@@ -580,8 +574,8 @@ class ChatService:
                 query=effective_query,
                 user=user,
                 top_k=5,
-                project_ids=project_ids,
-                department_ids=department_ids,
+                oui_ids=oui_ids,    
+                chat_mode=chat_source,
             )
             logger.info("STREAM RETRIEVED COUNT: %d", len(retrieved_raw))
 
@@ -590,7 +584,8 @@ class ChatService:
             # ── [GUARD 2] PII scan chunks ──────────────────────────────
             logger.info("Guard2 stream: user_role=%s user_id=%s",
             getattr(user, "role", None), getattr(user, "id", None))
-            retrieved = guard_service.scan_chunks(retrieved, user=user)
+            if GUARDS_ENABLED:
+                retrieved = guard_service.scan_chunks(retrieved, user=user)
 
             history = self._load_history(db, conversation_id, effective_query)
 
@@ -625,7 +620,7 @@ class ChatService:
             sources = self._build_sources_from_retrieved(retrieved)
 
         # ── [GUARD 3] PII + Secret scan trên response (stream) ─────────
-        if full_text:
+        if GUARDS_ENABLED and full_text:
             post_scan = guard_service.scan_response(full_text, user=user)
 
             if post_scan.judge and post_scan.judge.should_block:

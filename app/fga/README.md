@@ -10,10 +10,13 @@ docker compose run --rm openfga migrate
 # Start all
 docker compose up -d
 
-# Run setup (one time only)
+# Create store for OpenFGA
 $env:OPENFGA_URL="http://localhost:8080"; python -m app.fga.setup
+# Copy STORE_ID into .env and config.py (openfga_store_id).
 
-# Copy STORE_ID and MODEL_ID into .env and config.py (openfga_store_id and openfga_model_id), then restart the application.
+# Create model for OpenFGA
+docker exec -it rag-api python -c "import json, pathlib, sys; sys.path.insert(0, '.'); from app.fga.client import fga_client; model = json.loads((pathlib.Path('app/fga/model.json')).read_text()); model_id = fga_client.write_model(model); print(f'OPENFGA_MODEL_ID={model_id}')"
+# Copy MODEL_ID into .env and config.py (openfga_model_id).
 
 # To check store that created, browse: http://localhost:8080/stores
 # Result example: {"stores":[{"id":"01KMTFH0653Q23BT8R9BCA4GQN","name":"rag-enterprise","created_at":"2026-03-28T15:03:14.380041Z","updated_at":"2026-03-28T15:03:14.380041Z","deleted_at":null}],"continuation_token":""}

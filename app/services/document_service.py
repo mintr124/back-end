@@ -1,34 +1,29 @@
 from pathlib import Path
 from fastapi import HTTPException
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 from app.fga.adapter import fga_adapter
-from app.repositories.user_repository import UserRepository
 from app.core.config import settings
-from app.models.department import Department
-from app.models.document import Document
+from app.models.document import Document, document_oui
 from app.models.document_chunk import DocumentChunk
 from app.models.document_version import DocumentVersion
 from app.models.policy_snapshot import DocumentPolicySnapshot
-from app.models.project import Project
+from app.models.org_unit_instance import OrgUnitInstance
 from app.models.storage_object import StorageObject
 from app.models.user import User
 from app.repositories.chunk_repository import ChunkRepository
-from app.repositories.department_repository import DepartmentRepository
 from app.repositories.document_repository import DocumentRepository
-from app.repositories.project_repository import ProjectRepository
 from app.repositories.version_repository import VersionRepository
-from app.schemas.document import DocumentCreateRequest, DocumentUpdateRequest
 from app.schemas.document import ChunkingConfig, DocumentCreateRequest, DocumentUpdateRequest
 from app.services.audit_service import audit_service
 from app.services.job_service import job_service
-from app.services.permission_service import permission_service
 from app.services.storage_service import storage_service
 from app.models.chunk_embedding import ChunkEmbedding
-from app.models.policy_snapshot import DocumentPolicySnapshot
 from app.models.job import Job
 from app.models.job_step import JobStep
 from app.services.chroma_service import chroma_service
+from app.services.user_service import user_service as _user_service
+from app.services.oui_tree_service import oui_tree_service
+
 
 import logging
 logger = logging.getLogger(__name__)
@@ -39,242 +34,175 @@ class DocumentService:
         self.docs = DocumentRepository()
         self.versions = VersionRepository()
         self.chunks = ChunkRepository()
-        self.departments = DepartmentRepository()
-        self.projects = ProjectRepository()
-        self.users = UserRepository()
-        
-    def _sync_fga(self, db: Session, doc: Document):
-        all_users  = self.users.list_active(db)
-        dept_users = self.users.list_by_dept(db, doc.department_id) if doc.department_id else []
-        proj_users = self.users.list_by_project(db, doc.project_id) if doc.project_id else []
 
-        dept_id_for_managers = doc.department_id
-        if doc.project_id and not dept_id_for_managers:
-            proj = self.projects.get_by_id(db, doc.project_id)
-            dept_id_for_managers = proj.department_id if proj else None
+    # ── Permission helpers ────────────────────────────────────────────────────
 
-        dept_managers = []
-        if dept_id_for_managers:
-            dept_managers = [
-                u for u in self.users.list_by_dept(db, dept_id_for_managers)
-                if u.role == "department_manager"
-            ]
+    def _is_corp_member(self, db: Session, user: User) -> bool:
+        resp = _user_service.build_user_response(db, user)
+        return resp.is_corp_member
 
-        fga_adapter.sync_document_tuples(
-            doc=doc,
-            all_users=all_users,
-            dept_users=dept_users,
-            project_users=proj_users,
-            dept_managers=dept_managers,
-        )
+    def _user_clearance(self, db: Session, user: User) -> int:
+        resp = _user_service.build_user_response(db, user)
+        return resp.max_clearance
 
-    def _resolve_department(self, db: Session, id: str) -> Department:
-        dept = self.departments.get_by_id(db, id)
-        if not dept:
-            raise HTTPException(status_code=404, detail=f"Department not found: {id}")
-        return dept
+    def _can_view(self, db: Session, user: User, doc: Document) -> tuple[bool, str]:
+        """User xem được doc nếu FGA cho phép."""
+        if doc.owner_user_id == user.id:
+            return True, ""
+        if fga_adapter.can_view(user.id, doc.id):
+            return True, ""
+        return False, "No permission to view this document"
 
-    def _resolve_project(self, db: Session, project_id: str, department_id: str) -> Project:
-        proj = self.projects.get_by_id(db, project_id)
-        if proj and proj.department_id != department_id:
-            raise HTTPException(status_code=400, detail="Project does not belong to selected department")
-        if not proj:
-            proj = self.projects.create(db, project_id, department_id)
-        return proj
+    def _can_edit(self, db: Session, user: User, doc: Document) -> tuple[bool, str]:
+        if doc.owner_user_id == user.id:
+            return True, ""
+        if fga_adapter.can_edit(user.id, doc.id):
+            return True, ""
+        return False, "No permission to edit this document"
+
+    # ── FGA sync ──────────────────────────────────────────────────────────────
+
+    def _sync_fga(self, db: Session, doc: Document) -> None:
+        old = fga_adapter.get_document_tuples(doc.id)
+        fga_adapter.delete_document_tuples(doc.id, old)
+        fga_adapter.sync_document_tuples(db, doc)
+
+    # ── Policy contract ───────────────────────────────────────────────────────
 
     def _policy_contract(self, doc: Document) -> dict:
-        if doc.sensitivity_level in {"restricted", "top_secret"}:
+        if doc.sensitivity >= 4:
             max_detail = "department"
             numeric_granularity = "aggregated"
-        elif doc.sensitivity_level == "confidential":
+        elif doc.sensitivity == 3:
             max_detail = "project"
             numeric_granularity = "aggregated"
         else:
             max_detail = "full"
             numeric_granularity = "full"
-
         return {
             "max_detail": max_detail,
             "numeric_granularity": numeric_granularity,
-            "allowed_entities": ["department", "project"],
-            "violation_action": "mask",
-            "allowed_roles": doc.allowed_roles,
             "policy_version": settings.default_policy_version,
-        } #TODO: change to policy-as-code, now is hard code
+        }
+
+    # ── CRUD ──────────────────────────────────────────────────────────────────
 
     def list_documents(self, db: Session, user: User) -> list[Document]:
-        docs = self.docs.list_all(db)
-        visible = []
-        for doc in docs:
-            ok, _ = permission_service.can_view_document(user, doc)
-            if ok:
-                visible.append(doc)
-        return visible
+        """Trả về docs mà user có quyền xem qua FGA."""
+        viewable_ids = fga_adapter.list_viewable_document_ids(user.id)
+        if not viewable_ids:
+            # Owner luôn xem được doc của mình
+            return db.query(Document).filter(Document.owner_user_id == user.id).all()
+        from sqlalchemy import or_
+        return db.query(Document).filter(
+            or_(
+                Document.id.in_(viewable_ids),
+                Document.owner_user_id == user.id,
+            )
+        ).all()
 
     def get_document(self, db: Session, user: User, doc_id: str) -> Document:
         doc = self.docs.get_by_id(db, doc_id)
         if not doc:
             raise HTTPException(status_code=404, detail="Document not found")
-        ok, reason = permission_service.can_view_document(user, doc)
+        ok, reason = self._can_view(db, user, doc)
         if not ok:
             raise HTTPException(status_code=403, detail=reason)
         return doc
 
-    def create_document(self, db: Session, user: User, payload: DocumentCreateRequest, trace_id: str) -> Document:
-        # Department là optional — None = doc chung công ty
-        dept = self._resolve_department(db, payload.department_id) if payload.department_id else None
+    def create_document(
+        self, db: Session, user: User, payload: DocumentCreateRequest, trace_id: str
+    ) -> Document:
+        # Validate OUIs
+        ouis = []
+        user_oui_ids = {p.oui_id for p in user.oui_positions}
+        is_corp = self._is_corp_member(db, user)
 
-        ok, reason = permission_service.can_create_document(user, dept.id if dept else None)
-        if not ok:
-            audit_service.log_action(
-                db,
-                trace_id=trace_id,
-                user_id=user.id,
-                action="document.create",
-                resource_type="document",
-                resource_id=None,
-                decision="deny",
-                input_json=payload.model_dump(mode="json"),
-            )
-            db.commit()
-            raise HTTPException(status_code=403, detail=reason)
+        for oui_id in payload.oui_ids:
+            oui = db.get(OrgUnitInstance, oui_id)
+            if not oui:
+                raise HTTPException(status_code=404, detail=f"OUI not found: {oui_id}")
 
-        proj = self._resolve_project(db, payload.project_id, dept.id) if payload.project_id and dept else None
+            if not is_corp:
+                # User phải thuộc oui_id hoặc một ancestor của nó
+                ancestors = set(oui_tree_service.get_ancestors(db, oui_id))
+                if not (user_oui_ids & ({oui_id} | ancestors)):
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"No permission to assign document to OUI: {oui.name}",
+                    )
+
+            ouis.append(oui)
 
         doc = Document(
             title=payload.title,
             description=payload.description,
-            department_id=dept.id if dept else None,
-            project_id=proj.id if proj else None,
             owner_user_id=user.id,
             document_type=payload.document_type,
-            sensitivity_level=payload.sensitivity_level,
+            sensitivity=payload.sensitivity,
             data_type=payload.data_type,
-            allowed_roles=payload.allowed_roles,
+            tags=payload.tags or [],
             status="draft",
         )
+        doc.ouis = ouis
         self.docs.create(db, doc)
 
         audit_service.log_action(
-            db,
-            trace_id=trace_id,
-            user_id=user.id,
-            action="document.create",
-            resource_type="document",
-            resource_id=doc.id,
-            decision="allow",
+            db, trace_id=trace_id, user_id=user.id,
+            action="document.create", resource_type="document",
+            resource_id=doc.id, decision="allow",
             input_json=payload.model_dump(mode="json"),
         )
         db.commit()
         db.refresh(doc)
-        old_tuples = fga_adapter.get_document_tuples(doc.id)
-        fga_adapter.delete_document_tuples(doc.id, old_tuples)
         self._sync_fga(db, doc)
         return doc
 
     def update_document(
-        self,
-        db: Session,
-        user: User,
-        doc_id: str,
-        payload: DocumentUpdateRequest,
-        trace_id: str,
+        self, db: Session, user: User, doc_id: str,
+        payload: DocumentUpdateRequest, trace_id: str,
     ) -> Document:
         doc = self.docs.get_by_id(db, doc_id)
         if not doc:
             raise HTTPException(status_code=404, detail="Document not found")
 
-        ok, reason = permission_service.can_update_document(user, doc)
+        ok, reason = self._can_edit(db, user, doc)
         if not ok:
-            audit_service.log_action(
-                db,
-                trace_id=trace_id,
-                user_id=user.id,
-                action="document.update",
-                resource_type="document",
-                resource_id=doc.id,
-                decision="deny",
-                input_json=payload.model_dump(mode="json"),
-            )
-            db.commit()
             raise HTTPException(status_code=403, detail=reason)
 
-        # Chỉ director/admin_auditor được move dept/project
         fields_set = payload.model_fields_set
-        if ("department_id" in fields_set or "project_id" in fields_set) and user.role not in {"director", "admin_auditor"}:
-            raise HTTPException(status_code=403, detail="Only director/admin_auditor can move department/project")
 
-        # ── department_id ─────────────────────────────────────────────────────────
-        if "department_id" in fields_set:
-            if payload.department_id:
-                dept = self._resolve_department(db, payload.department_id)
-                doc.department_id = dept.id
-                # Nếu đổi dept mà không truyền project_id → xóa project cũ
-                if "project_id" not in fields_set:
-                    doc.project_id = None
-            else:
-                # Truyền null → company-wide doc
-                doc.department_id = None
-                doc.project_id = None
+        if "oui_ids" in fields_set and payload.oui_ids is not None:
+            ouis = []
+            for oui_id in payload.oui_ids:
+                oui = db.get(OrgUnitInstance, oui_id)
+                if not oui:
+                    raise HTTPException(status_code=404, detail=f"OUI not found: {oui_id}")
+                ouis.append(oui)
+            doc.ouis = ouis
 
-        # ── project_id ────────────────────────────────────────────────────────────
-        if "project_id" in fields_set:
-            if payload.project_id:
-                proj = self._resolve_project(db, payload.project_id, doc.department_id)
-                doc.project_id = proj.id
-            else:
-                doc.project_id = None
-
-        # ── Các field khác ────────────────────────────────────────────────────────
         if payload.title is not None:
             doc.title = payload.title
         if payload.description is not None:
             doc.description = payload.description
         if payload.document_type is not None:
             doc.document_type = payload.document_type
-        if payload.sensitivity_level is not None:
-            doc.sensitivity_level = payload.sensitivity_level
-        if payload.data_type is not None:
-            doc.data_type = payload.data_type
-        if payload.allowed_roles is not None:
-            doc.allowed_roles = payload.allowed_roles
+        if payload.sensitivity is not None:
+            doc.sensitivity = payload.sensitivity
+        if payload.tags is not None:
+            doc.tags = payload.tags
 
         self.docs.save(db, doc)
 
         audit_service.log_action(
-            db,
-            trace_id=trace_id,
-            user_id=user.id,
-            action="document.update",
-            resource_type="document",
-            resource_id=doc.id,
-            decision="allow",
+            db, trace_id=trace_id, user_id=user.id,
+            action="document.update", resource_type="document",
+            resource_id=doc.id, decision="allow",
             input_json=payload.model_dump(mode="json"),
         )
         db.commit()
         db.refresh(doc)
-
-        # ── Re-sync FGA ───────────────────────────────────────────────────────────
-        old_tuples = fga_adapter.get_document_tuples(doc.id)
-        fga_adapter.delete_document_tuples(doc.id, old_tuples)
         self._sync_fga(db, doc)
-
-        # ── Cập nhật Chroma metadata nếu dept/project thay đổi ───────────────────
-        if "department_id" in fields_set or "project_id" in fields_set:
-            all_versions = self.versions.list_by_document(db, doc.id)
-            version_ids = [v.id for v in all_versions]
-            chunk_ids = [
-                c.id for c in db.query(DocumentChunk).filter(
-                    DocumentChunk.document_version_id.in_(version_ids)
-                ).all()
-            ] if version_ids else []
-
-            if chunk_ids:
-                chroma_service.update_document_metadata(chunk_ids, {
-                    "department_id": doc.department_id or "",
-                    "project_id": doc.project_id or "",
-                })
-
         return doc
 
     def get_versions(self, db: Session, user: User, doc_id: str) -> list[DocumentVersion]:
@@ -282,250 +210,156 @@ class DocumentService:
         return self.versions.list_by_document(db, doc.id)
 
     def create_version(
-            self,
-            db: Session,
-            user: User,
-            doc_id: str,
-            *,
-            raw_bytes: bytes,
-            filename: str,
-            content_type: str,
-            trace_id: str,
-            chunking_config: "ChunkingConfig | None" = None,   # ← THÊM
-        ) -> tuple[Document, DocumentVersion, object, bool]:
-            from app.schemas.document import ChunkingConfig  # guard circular
-    
-            doc = self.docs.get_by_id(db, doc_id)
-            if not doc:
-                raise HTTPException(status_code=404, detail="Document not found")
-    
-            ok, reason = permission_service.can_update_document(user, doc)
-            if not ok:
-                audit_service.log_action(
-                    db,
-                    trace_id=trace_id,
-                    user_id=user.id,
-                    action="document.version_upload",
-                    resource_type="document",
-                    resource_id=doc.id,
-                    decision="deny",
-                    input_json={"filename": filename, "content_type": content_type},
-                )
-                db.commit()
-                raise HTTPException(status_code=403, detail=reason)
-    
-            # Normalize chunking config
-            if chunking_config is None:
-                chunking_config = ChunkingConfig()   # mode="legacy", safe defaults
-    
-            last_no    = self.docs.get_max_version_no(db, doc.id)
-            version_no = last_no + 1
-    
-            checksum   = storage_service.checksum(raw_bytes)
-            object_key = f"documents/{doc.id}/versions/{version_no}/{Path(filename).name}"
-    
-            storage_obj = storage_service.upload_raw(
-                db,
-                data=raw_bytes,
-                object_key=object_key,
-                original_filename=Path(filename).name,
-                content_type=content_type,
-            )
-    
-            version = DocumentVersion(
-                document_id=doc.id,
-                version_no=version_no,
-                file_name=Path(filename).name,
-                mime_type=content_type,
-                checksum=checksum,
-                source_object_id=storage_obj.id,
-                ingest_status="queued",
-                parse_status="pending",
-                chunk_status="pending",
-                embed_status="pending",
-                rule_version=settings.default_policy_version,
-                chunk_config_json=chunking_config.to_json(),   # ← THÊM
-            )
-            self.versions.create(db, version)
-    
-            doc.current_version_id = version.id
-            doc.status = "uploaded"
-    
-            snapshot = DocumentPolicySnapshot(
-                document_version_id=version.id,
-                policy_version=settings.default_policy_version,
-                contract_json=self._policy_contract(doc),
-            )
-            db.add(snapshot)
-    
-            job, created = job_service.create_or_get_ingest_job(
-                db,
-                trace_id=trace_id,
-                document_id=doc.id,
-                version_id=version.id,
-                created_by_user_id=user.id,
-            )
-    
-            audit_service.log_action(
-                db,
-                trace_id=trace_id,
-                user_id=user.id,
-                action="document.version_upload",
-                resource_type="document_version",
-                resource_id=version.id,
-                decision="allow",
-                input_json={
-                    "filename":       filename,
-                    "content_type":   content_type,
-                    "chunking_config": chunking_config.to_json(),  # ← LOG
-                },
-                output_json={"job_id": job.id, "version_no": version_no},
-            )
-    
-            db.commit()
-            db.refresh(doc)
-            db.refresh(version)
-            db.refresh(job)
-            return doc, version, job, created
+        self, db: Session, user: User, doc_id: str, *,
+        raw_bytes: bytes, filename: str, content_type: str,
+        trace_id: str, chunking_config: "ChunkingConfig | None" = None,
+    ) -> tuple[Document, DocumentVersion, object, bool]:
+        doc = self.docs.get_by_id(db, doc_id)
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        ok, reason = self._can_edit(db, user, doc)
+        if not ok:
+            raise HTTPException(status_code=403, detail=reason)
+
+        if chunking_config is None:
+            chunking_config = ChunkingConfig()
+
+        last_no = self.docs.get_max_version_no(db, doc.id)
+        version_no = last_no + 1
+        checksum = storage_service.checksum(raw_bytes)
+        object_key = f"documents/{doc.id}/versions/{version_no}/{Path(filename).name}"
+
+        storage_obj = storage_service.upload_raw(
+            db, data=raw_bytes, object_key=object_key,
+            original_filename=Path(filename).name, content_type=content_type,
+        )
+
+        version = DocumentVersion(
+            document_id=doc.id,
+            version_no=version_no,
+            file_name=Path(filename).name,
+            mime_type=content_type,
+            checksum=checksum,
+            source_object_id=storage_obj.id,
+            ingest_status="queued",
+            parse_status="pending",
+            chunk_status="pending",
+            embed_status="pending",
+            rule_version=settings.default_policy_version,
+            chunk_config_json=chunking_config.to_json(),
+        )
+        self.versions.create(db, version)
+
+        doc.current_version_id = version.id
+        doc.status = "uploaded"
+
+        snapshot = DocumentPolicySnapshot(
+            document_version_id=version.id,
+            policy_version=settings.default_policy_version,
+            contract_json=self._policy_contract(doc),
+        )
+        db.add(snapshot)
+
+        job, created = job_service.create_or_get_ingest_job(
+            db, trace_id=trace_id, document_id=doc.id,
+            version_id=version.id, created_by_user_id=user.id,
+        )
+
+        audit_service.log_action(
+            db, trace_id=trace_id, user_id=user.id,
+            action="document.version_upload", resource_type="document_version",
+            resource_id=version.id, decision="allow",
+            input_json={"filename": filename, "chunking_config": chunking_config.to_json()},
+            output_json={"job_id": job.id, "version_no": version_no},
+        )
+
+        db.commit()
+        db.refresh(doc)
+        db.refresh(version)
+        db.refresh(job)
+        return doc, version, job, created
 
     def start_ingest(
-        self,
-        db: Session,
-        user: User,
-        doc_id: str,
-        *,
-        version_id: str | None,
-        force_new: bool,
-        trace_id: str,
+        self, db: Session, user: User, doc_id: str, *,
+        version_id: str | None, force_new: bool, trace_id: str,
     ):
         doc = self.docs.get_by_id(db, doc_id)
         if not doc:
             raise HTTPException(status_code=404, detail="Document not found")
 
-        ok, reason = permission_service.can_update_document(user, doc)
+        ok, reason = self._can_edit(db, user, doc)
         if not ok:
-            audit_service.log_action(
-                db,
-                trace_id=trace_id,
-                user_id=user.id,
-                action="document.ingest_start",
-                resource_type="document",
-                resource_id=doc.id,
-                decision="deny",
-                input_json={"version_id": version_id, "force_new": force_new},
-            )
-            db.commit()
             raise HTTPException(status_code=403, detail=reason)
 
         if version_id:
             version = self.versions.get_by_id(db, version_id)
             if not version or version.document_id != doc.id:
-                raise HTTPException(status_code=404, detail="Version not found for document")
+                raise HTTPException(status_code=404, detail="Version not found")
         else:
             version = doc.current_version
             if not version:
-                raise HTTPException(status_code=400, detail="Document has no current version")
+                raise HTTPException(status_code=400, detail="No current version")
 
         job, created = job_service.create_or_get_ingest_job(
-            db,
-            trace_id=trace_id,
-            document_id=doc.id,
-            version_id=version.id,
-            created_by_user_id=user.id,
-            force_new=force_new,
+            db, trace_id=trace_id, document_id=doc.id,
+            version_id=version.id, created_by_user_id=user.id, force_new=force_new,
         )
 
-        audit_service.log_action(
-            db,
-            trace_id=trace_id,
-            user_id=user.id,
-            action="document.ingest_start",
-            resource_type="job",
-            resource_id=job.id,
-            decision="allow",
-            input_json={"version_id": version.id, "force_new": force_new},
-            output_json={"created": created},
-        )
         db.commit()
         db.refresh(job)
         return job
-    
+
     def delete_document(self, db: Session, user: User, doc_id: str, trace_id: str) -> None:
         doc = self.docs.get_by_id(db, doc_id)
         if not doc:
             raise HTTPException(status_code=404, detail="Document not found")
 
-        # 1. Xóa FGA tuples
+        # Chỉ corp member hoặc owner mới xóa được
+        if doc.owner_user_id != user.id and not self._is_corp_member(db, user):
+            raise HTTPException(status_code=403, detail="No permission to delete")
+
         old_tuples = fga_adapter.get_document_tuples(doc_id)
         fga_adapter.delete_document_tuples(doc_id, old_tuples)
 
-        # 2. Lấy tất cả version_id của doc
-        version_ids = [v.id for v in db.query(DocumentVersion.id).filter(
-            DocumentVersion.document_id == doc_id
-        ).all()]
+        version_ids = [v.id for v in db.query(DocumentVersion).filter(
+            DocumentVersion.document_id == doc_id).all()]
 
         if version_ids:
-            # 3. Lấy tất cả chunk_id
-            chunk_ids = [c.id for c in db.query(DocumentChunk.id).filter(
-                DocumentChunk.document_version_id.in_(version_ids)
-            ).all()]
+            chunk_ids = [c.id for c in db.query(DocumentChunk).filter(
+                DocumentChunk.document_version_id.in_(version_ids)).all()]
 
             if chunk_ids:
-                # 4. Xóa ChunkEmbedding
                 db.query(ChunkEmbedding).filter(
-                    ChunkEmbedding.chunk_id.in_(chunk_ids)
-                ).delete(synchronize_session=False)
-
-                # 5. Xóa DocumentChunk
+                    ChunkEmbedding.chunk_id.in_(chunk_ids)).delete(synchronize_session=False)
                 db.query(DocumentChunk).filter(
-                    DocumentChunk.document_version_id.in_(version_ids)
-                ).delete(synchronize_session=False)
+                    DocumentChunk.document_version_id.in_(version_ids)).delete(synchronize_session=False)
 
-            # 6. Xóa DocumentPolicySnapshot
             db.query(DocumentPolicySnapshot).filter(
-                DocumentPolicySnapshot.document_version_id.in_(version_ids)
-            ).delete(synchronize_session=False)
+                DocumentPolicySnapshot.document_version_id.in_(version_ids)).delete(synchronize_session=False)
 
-            # 7. Xóa JobStep và Job
-            job_ids = [j.id for j in db.query(Job.id).filter(
-                Job.document_id == doc_id
-            ).all()]
+            job_ids = [j.id for j in db.query(Job).filter(Job.document_id == doc_id).all()]
             if job_ids:
-                from app.models.job_step import JobStep
-                db.query(JobStep).filter(
-                    JobStep.job_id.in_(job_ids)
-                ).delete(synchronize_session=False)
-                db.query(Job).filter(
-                    Job.id.in_(job_ids)
-                ).delete(synchronize_session=False)
+                db.query(JobStep).filter(JobStep.job_id.in_(job_ids)).delete(synchronize_session=False)
+                db.query(Job).filter(Job.id.in_(job_ids)).delete(synchronize_session=False)
 
-            # 8. Null current_version_id trước khi xóa versions
             doc.current_version_id = None
             db.flush()
 
-            # 9. Xóa DocumentVersion
             db.query(DocumentVersion).filter(
-                DocumentVersion.document_id == doc_id
-            ).delete(synchronize_session=False)
-            
+                DocumentVersion.document_id == doc_id).delete(synchronize_session=False)
+
             if chunk_ids:
                 try:
-                    from app.services.chroma_service import chroma_service
                     chroma_service.delete_chunks(chunk_ids)
                 except Exception as e:
-                    logger.warning("Failed to delete chunks from Chroma for doc %s: %s", doc_id, e)
+                    logger.warning("Failed to delete Chroma chunks: %s", e)
 
-        # 10. Xóa Document
         db.delete(doc)
-
         audit_service.log_action(
-            db,
-            trace_id=trace_id,
-            user_id=user.id,
-            action="document.delete",
-            resource_type="document",
-            resource_id=doc_id,
-            decision="allow",
+            db, trace_id=trace_id, user_id=user.id,
+            action="document.delete", resource_type="document",
+            resource_id=doc_id, decision="allow",
             input_json={"document_id": doc_id},
         )
         db.commit()

@@ -15,11 +15,41 @@ import os
 import threading
 from typing import Any
 
+from numpy import empty
+
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "FALSE")
 
 import chromadb  # noqa: E402
 
 from app.core.config import settings
+
+import unicodedata
+
+try:
+    from pyvi import ViTokenizer
+except ImportError:
+    ViTokenizer = None
+
+_VN_STOPWORDS = {
+    "là", "của", "và", "có", "được", "này", "đó", "các", "cho", "với",
+    "tại", "về", "như", "từ", "trong", "khi", "để", "theo", "những",
+    "một", "đã", "sẽ", "thì", "mà", "hay", "hoặc", "nên", "vì", "do",
+    "bị", "bởi", "ra", "vào", "lên", "xuống", "đang", "rất", "cũng",
+    "không", "còn", "nữa", "nào", "gì", "ai", "sao", "bao", "nhiêu",
+}
+
+def _strip_accents(text: str) -> str:
+    text = text.replace("đ", "d").replace("Đ", "D")
+    nfd = unicodedata.normalize("NFD", text)
+    return "".join(c for c in nfd if unicodedata.category(c) != "Mn")
+
+def _segment_vi(text: str) -> list[str]:
+    text = (text or "").strip().lower()
+    if not text:
+        return []
+    if ViTokenizer is not None:
+        return [t.replace("_", " ") for t in ViTokenizer.tokenize(text).split()]
+    return text.split()
 
 
 class ChromaRepository:
@@ -176,12 +206,12 @@ class ChromaRepository:
         if not query:
             return empty
 
-        tokens = [t for t in query.lower().split() if len(t) > 1]
+        tokens = [t for t in _segment_vi(query) if len(t) > 1]
         if not tokens:
             return empty
 
-        # pick the rarest-looking token as primary filter (longest = most specific)
-        primary_token = max(tokens, key=len)
+        meaningful = [t for t in tokens if t not in _VN_STOPWORDS] or tokens
+        primary_token = max(meaningful, key=len)
 
         # fetch only matching documents – much cheaper than full scan
         get_kwargs: dict[str, Any] = dict(
@@ -205,18 +235,30 @@ class ChromaRepository:
         metadatas = raw.get("metadatas", []) or []
 
         if not ids:
+            fallback_kwargs: dict[str, Any] = dict(include=["documents", "metadatas"])
+            if where:
+                fallback_kwargs["where"] = where
+            try:
+                raw = collection.get(**fallback_kwargs)
+            except Exception:
+                return empty
+            ids       = raw.get("ids",       []) or []
+            docs      = raw.get("documents", []) or []
+            metadatas = raw.get("metadatas", []) or []
+
+        if not ids:
             return empty
 
-        q_set = set(tokens)
+        q_set = {_strip_accents(t) for t in tokens}
         scored: list[tuple[float, int]] = []
 
         for i, doc in enumerate(docs):
             if not doc:
                 continue
-            d_tokens = [t for t in str(doc).lower().split() if len(t) > 1]
+            d_tokens = [t for t in _segment_vi(str(doc)) if len(t) > 1]
             if not d_tokens:
                 continue
-            d_set = set(d_tokens)
+            d_set = {_strip_accents(t) for t in d_tokens}
             overlap = len(q_set & d_set)
             if overlap == 0:
                 continue

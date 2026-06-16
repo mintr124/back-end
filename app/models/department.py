@@ -11,6 +11,5 @@ class Department(Base, TimestampMixin):
     id = Column(String(36), primary_key=True, default=new_uuid)
     name = Column(String(255), nullable=False)
 
-    users = relationship("User", back_populates="department")
     projects = relationship("Project", back_populates="department")
-    documents = relationship("Document", back_populates="department")
+    # documents = relationship("Document", back_populates="department")

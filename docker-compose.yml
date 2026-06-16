@@ -39,7 +39,7 @@ services:
   openfga:
     image: openfga/openfga:latest
     container_name: rag-openfga
-    command: run --playground-enabled
+    command: run --playground-enabled --authn-method=none
     ports:
       - "8080:8080"
       - "8081:8081"
@@ -51,7 +51,19 @@ services:
       OPENFGA_PLAYGROUND_ENABLED: "true"
     depends_on:
       - postgres-fga
+      - openfga-migrate
     restart: unless-stopped
+
+  openfga-migrate:
+    image: openfga/openfga:latest
+    container_name: rag-openfga-migrate
+    command: migrate
+    environment:
+      OPENFGA_DATASTORE_ENGINE: postgres
+      OPENFGA_DATASTORE_URI: postgres://fga:fga@postgres-fga:5432/fga
+    depends_on:
+      - postgres-fga
+    restart: "no"
 
   minio:
     image: minio/minio:latest
