@@ -300,6 +300,7 @@ Nhiệm vụ:
 1. Đọc toàn bộ tài liệu để xác định các entity chính (tên người, tên tổ chức, mã số, mã hợp đồng...)
 2. Chia thành các chunk độc lập theo nhóm thông tin logic (section/bảng/đoạn)
 3. Mỗi chunk phải self-contained: đọc riêng vẫn hiểu được, không cần context bên ngoài
+4. Không được bỏ sót bất cứ thông tin nào trong tài liệu, mọi thông tin đều phải nằm trong ít nhất 1 chunk
 
 Quy tắc đặt section_heading:
 - Luôn gắn entity chính vào heading, kể cả khi chunk đó không nhắc lại tên

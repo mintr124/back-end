@@ -1,23 +1,10 @@
-from enum import IntEnum
+# Sensitivity scale: 1=public, 2=internal, 3=confidential, 4=restricted, 5=top_secret
 
-class SensitivityLevel(IntEnum):
-    PUBLIC       = 0   # ai cũng xem được
-    INTERNAL     = 1   # nhân viên nội bộ
-    CONFIDENTIAL = 2   # director trở lên (redact một phần)
-    RESTRICTED   = 3   # admin_auditor only (full access)
+MIN_SENSITIVITY = 1
+MAX_SENSITIVITY = 5
 
-# Role → mức tối đa được xem
-ROLE_MAX_SENSITIVITY = {
-    "admin_auditor": SensitivityLevel.RESTRICTED,
-    "director":      SensitivityLevel.CONFIDENTIAL,
-    "manager":       SensitivityLevel.INTERNAL,
-    "employee":      SensitivityLevel.INTERNAL,
-    "guest":         SensitivityLevel.PUBLIC,
-}
-
-# Patterns để classify chunk khi retrieve
 SENSITIVITY_PATTERNS = {
-    SensitivityLevel.RESTRICTED: [
+    4: [  # restricted
         r"hồ\s+sơ\s+nhân\s+viên",
         r"TMG-EMP-\d+",
         r"mức\s+lương\s+cơ\s+bản",
@@ -27,12 +14,12 @@ SENSITIVITY_PATTERNS = {
         r"người\s+liên\s+hệ\s+khẩn\s+cấp",
         r"bảng\s+lương",
         r"thông\s+tin\s+tài\s+khoản\s+ngân\s+hàng",
-        r"\d{1,3}(?:[.,]\d{3})+\s*(?:VND|đồng)",   # số tiền cụ thể
+        r"\d{1,3}(?:[.,]\d{3})+\s*(?:VND|đồng)",
         r"số\s+cccd",
         r"địa\s+chỉ\s+thường\s+trú",
         r"chỗ\s+ở\s+hiện\s+tại",
     ],
-    SensitivityLevel.CONFIDENTIAL: [
+    3: [  # confidential
         r"doanh\s+thu\s+nội\s+bộ",
         r"ngân\s+sách\s+(?:bộ\s+phận|phòng|dự\s+án)",
         r"kế\s+hoạch\s+kinh\s+doanh",
@@ -42,7 +29,7 @@ SENSITIVITY_PATTERNS = {
         r"cắt\s+giảm\s+nhân\s+sự",
         r"danh\s+sách\s+(?:khách\s+hàng|đối\s+tác)",
     ],
-    SensitivityLevel.INTERNAL: [
+    2: [  # internal
         r"nội\s+quy\s+(?:công\s+ty|lao\s+động)",
         r"quy\s+trình\s+nội\s+bộ",
         r"biên\s+bản\s+họp",

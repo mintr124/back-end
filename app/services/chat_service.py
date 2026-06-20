@@ -603,7 +603,7 @@ class ChatService:
                     )
                     logger.info("LLM stream prompt trace_id=%s", tid)
 
-                    for token in llm_service.generate_stream(prompt=prompt, max_tokens=1024):
+                    for token in llm_service.generate_stream(prompt=prompt, max_tokens=2048):
                         full_text += token
                         yield {"type": "token", "text": token}
 

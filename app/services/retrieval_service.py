@@ -27,7 +27,7 @@ import math
 from typing import Any
 import re
 
-from app.services.sensitivity_levels import SensitivityLevel, ROLE_MAX_SENSITIVITY, SENSITIVITY_PATTERNS
+from app.services.sensitivity_levels import SENSITIVITY_PATTERNS, MIN_SENSITIVITY, MAX_SENSITIVITY
 from app.fga.adapter import fga_adapter
 from app.repositories.chroma_repository import ChromaRepository
 from app.services.embedding_service import embedding_service
@@ -37,7 +37,6 @@ logger = logging.getLogger(__name__)
 # RRF constant – higher k → smoother ranking (less sensitive to top ranks)
 _RRF_K = 60
 GMAIL_CHROMA_COLLECTION = "gmail_chunks"
-
 
 class RetrievalService:
     def __init__(
@@ -183,30 +182,25 @@ class RetrievalService:
                 filtered.append(chunk)
         return filtered
     
-    def _classify_chunk_sensitivity(self, chunk: dict) -> SensitivityLevel:
-        """
-        Classify độ nhạy của chunk dựa trên:
-        1. metadata.sensitivity (nếu đã được tag khi ingest)
-        2. Regex scan nội dung (fallback)
-        """
-        # Ưu tiên metadata nếu có
-        meta_sensitivity = chunk.get("metadata", {}).get("sensitivity")
-        if meta_sensitivity:
+    def _classify_chunk_sensitivity(self, chunk: dict) -> int:
+        """Trả về sensitivity int 1-5."""
+        meta = chunk.get("metadata", {}).get("sensitivity")
+        if meta is not None:
             try:
-                return SensitivityLevel[meta_sensitivity.upper()]
-            except KeyError:
+                v = int(meta)
+                if MIN_SENSITIVITY <= v <= MAX_SENSITIVITY:
+                    return v
+            except (ValueError, TypeError):
                 pass
 
-        # Fallback: scan nội dung
+        # Fallback: regex scan nội dung
         text = chunk.get("document_text", "")
-        for level in [SensitivityLevel.RESTRICTED,
-                    SensitivityLevel.CONFIDENTIAL,
-                    SensitivityLevel.INTERNAL]:
+        for level in [5, 4, 3, 2]:  # scan từ cao xuống thấp
             for pattern in SENSITIVITY_PATTERNS.get(level, []):
                 if re.search(pattern, text, re.IGNORECASE):
                     return level
 
-        return SensitivityLevel.PUBLIC
+        return 1  # default PUBLIC
 
 
     # Trong _apply_sensitivity_gate, thay toàn bộ hàm:
@@ -326,12 +320,50 @@ class RetrievalService:
                 embedding=emb, top_k=self.semantic_candidates, where=where,
             )
             semantic_list = self._parse_chroma(raw)
+            
+            logger.warning("========== TOP SEMANTIC ==========")
+
+            for idx, r in enumerate(semantic_list[:5], start=1):
+                md = r.get("metadata", {})
+
+                logger.warning(
+                    "[SEM %d] distance=%.6f heading=%s chunk=%s",
+                    idx,
+                    float(r.get("distance") or 999),
+                    md.get("section_heading"),
+                    r.get("chunk_id"),
+                )
+
+                logger.warning(
+                    "[SEM %d TEXT] %s",
+                    idx,
+                    (r.get("document_text") or "")[:300],
+                )
 
         if mode in ("keyword", "hybrid"):
             raw = self.repo.query_by_keyword(
                 query=query, top_k=self.lexical_candidates, where=where,
             )
             lexical_list = self._parse_chroma(raw)
+            
+            logger.warning("========== TOP LEXICAL ==========")
+
+            for idx, r in enumerate(lexical_list[:5], start=1):
+                md = r.get("metadata", {})
+
+                logger.warning(
+                    "[LEX %d] distance=%.6f heading=%s chunk=%s",
+                    idx,
+                    float(r.get("distance") or 999),
+                    md.get("section_heading"),
+                    r.get("chunk_id"),
+                )
+
+                logger.warning(
+                    "[LEX %d TEXT] %s",
+                    idx,
+                    (r.get("document_text") or "")[:300],
+                )
 
         if not semantic_list and not lexical_list:
             return []
@@ -343,6 +375,19 @@ class RetrievalService:
             sorted([{**i, "rrf_score": max(0.0, 1.0 - float(i.get("distance") or 1.0)), "sources": ["lexical"]}
                     for i in lexical_list], key=lambda x: x["rrf_score"], reverse=True)
         )
+        
+        logger.warning("========== TOP FUSED ==========")
+
+        for idx, r in enumerate(fused[:10], start=1):
+            md = r.get("metadata", {})
+
+            logger.warning(
+                "[FUSED %d] rrf=%.6f heading=%s sources=%s",
+                idx,
+                r.get("rrf_score"),
+                md.get("section_heading"),
+                r.get("sources"),
+            )
 
         max_rrf = fused[0]["rrf_score"] if fused else 0.0
 
@@ -368,58 +413,42 @@ class RetrievalService:
         return results[:top_k]
 
 
-    def _retrieve_from_collection(
-        self,
-        *,
-        query: str,
-        user=None,
-        top_k: int = 5,
-        collection_name: str = "gmail_chunks",
-        extra_where: dict | None = None,
-    ) -> list[dict]:
-        """Retrieve từ một Chroma collection tùy chỉnh (gmail_chunks)."""
-        import chromadb
-        from app.core.config import settings
+    def _get_user_clearance(self, user) -> int:
+        """Lấy clearance cao nhất từ tất cả positions của user. Trả về int 1-5."""
+        if user is None:
+            return 1
 
-        client = chromadb.HttpClient(host=settings.chroma_host, port=settings.chroma_port)
-        collection = client.get_or_create_collection(
-            name=collection_name, metadata={"hnsw:space": "cosine"}
-        )
-        
-        count = collection.count()
-        logger.info("Gmail collection '%s' count=%d extra_where=%s", collection_name, count, extra_where)
+        oui_positions = getattr(user, "oui_positions", None) or []
+        max_clearance = 1
 
-        emb = embedding_service.embed(query)
+        for oui_pos in oui_positions:
+            position = getattr(oui_pos, "position", None)
+            if position is None:
+                continue
+            c = getattr(position, "clearance", 1)
+            if c > max_clearance:
+                max_clearance = c
 
-        kwargs: dict = dict(
-            query_embeddings=[emb],
-            n_results=top_k,
-            include=["documents", "metadatas", "distances"],
-        )
-        if extra_where:
-            kwargs["where"] = extra_where
+        return max_clearance
 
-        try:
-            raw = collection.query(**kwargs)
-        except Exception as e:
-            logger.warning("Gmail collection query failed: %s", e)
-            return []
 
-        parsed = self._parse_chroma(raw)
-        results = []
-        for item in parsed:
-            score = self._cosine_sim(item.get("distance"))
-            results.append({
-                "chunk_id": item["chunk_id"],
-                "document_text": item["document_text"],
-                "metadata": {**(item["metadata"] or {}), "source": "gmail"},
-                "score": round(score, 6),
-                "semantic_score": round(score, 6),
-                "keyword_score": None,
-                "sources": ["semantic"],
-            })
+    def _apply_sensitivity_gate(self, chunks: list[dict], user) -> list[dict]:
+        user_clearance = self._get_user_clearance(user)
+        allowed = []
 
-        return results
+        for chunk in chunks:
+            chunk_sensitivity = self._classify_chunk_sensitivity(chunk)
+            if chunk_sensitivity > user_clearance:
+                logger.warning(
+                    "SENSITIVITY GATE: blocked chunk=%s sensitivity=%d user=%s clearance=%d",
+                    chunk.get("chunk_id"), chunk_sensitivity,
+                    getattr(user, "id", "?"), user_clearance,
+                )
+                continue
+            allowed.append(chunk)
+
+        return allowed
+    
 
 
 retrieval_service = RetrievalService(

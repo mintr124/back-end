@@ -188,7 +188,7 @@ class IngestPipelineService:
                     "document_title":      doc.title,
                     "oui_ids":             ",".join(sorted([o.id for o in (doc.ouis or [])])),
                     "document_type":       doc.document_type,
-                    "sensitivity":         str(doc.sensitivity),
+                    "sensitivity":      doc.sensitivity,
                     "data_type":           doc.data_type,
                     "chunk_index":         chunk_model.chunk_index,
                     "page_start":          chunk_model.page_start,
