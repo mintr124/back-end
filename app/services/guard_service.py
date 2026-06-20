@@ -644,8 +644,8 @@ class GuardService:
         has_secret    = len(all_keywords) > 0
 
         if has_pii or has_secret:
-            logger.info("Guard3a: role=%s has_pii=%s entities=%s hard=%s soft=%s",
-                        user_role, has_pii, [e.entity_type for e in all_entities],
+            logger.info("Guard3a: has_pii=%s entities=%s hard=%s soft=%s",
+                        has_pii, [e.entity_type for e in all_entities],
                         hard_keywords[:3], soft_keywords[:3])
 
         # ── Guard 3b: LLM judge ───────────────────────────────────────

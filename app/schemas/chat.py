@@ -58,7 +58,6 @@ class MessagePostResponse(BaseModel):
 
 class UserMessageRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
-
     role: str
     content: Optional[str]
     timestamp: Optional[datetime]

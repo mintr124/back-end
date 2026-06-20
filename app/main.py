@@ -15,7 +15,6 @@ from app.api.v1.admin import router as admin_router
 from app.api.v1.chat import router as chat_router
 from app.api.v1.users import router as users_router
 from app.api.v1.gmail import router as gmail_router
-from app.api.v1.roles import router as roles_router
 from app.api.v1.org_units import router as org_units_router
 from app.core.exceptions import register_exception_handlers
 from app.db.init_db import init_db
@@ -102,7 +101,6 @@ app.include_router(jobs_router, prefix="/jobs", tags=["jobs"])
 app.include_router(admin_router, prefix="/admin", tags=["admin"])
 app.include_router(chat_router, prefix="", tags=["chat"])
 app.include_router(users_router, prefix="", tags=["users"])
-app.include_router(roles_router, prefix="", tags=["roles"])
 app.include_router(admin_router, prefix="/audit", tags=["audit"])
 app.include_router(org_units_router, prefix="", tags=["org-units"])
 app.include_router(gmail_router, prefix="", tags=["gmail"])
