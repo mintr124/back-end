@@ -1,46 +1,32 @@
 {
   "schema_version": "1.1",
   "type_definitions": [
-    {
-      "type": "user",
-      "relations": {}
-    },
+    { "type": "user", "relations": {} },
 
     {
-      "type": "department",
+      "type": "oui",
       "relations": {
         "member": { "this": {} },
-        "manager": { "this": {} }
-      },
-      "metadata": {
-        "relations": {
-          "member": { "directly_related_user_types": [{ "type": "user" }] },
-          "manager": { "directly_related_user_types": [{ "type": "user" }] }
-        }
-      }
-    },
-
-    {
-      "type": "project",
-      "relations": {
-        "member": { "this": {} },
-        "director": { "this": {} },
-        "department": { "this": {} },
-        "dept_manager": {
-          "tupleToUserset": {
-            "tupleset": { "relation": "department" },
-            "computedUserset": { "relation": "manager" }
+        "parent_oui": { "this": {} },
+        "ancestor_member": {
+          "union": {
+            "child": [
+              { "computedUserset": { "relation": "member" } },
+              {
+                "tupleToUserset": {
+                  "tupleset": { "relation": "parent_oui" },
+                  "computedUserset": { "relation": "ancestor_member" }
+                }
+              }
+            ]
           }
         }
       },
       "metadata": {
         "relations": {
           "member": { "directly_related_user_types": [{ "type": "user" }] },
-          "director": { "directly_related_user_types": [{ "type": "user" }] },
-          "department": {
-            "directly_related_user_types": [{ "type": "department" }]
-          },
-          "dept_manager": { "directly_related_user_types": [] }
+          "parent_oui": { "directly_related_user_types": [{ "type": "oui" }] },
+          "ancestor_member": { "directly_related_user_types": [] }
         }
       }
     },
@@ -49,28 +35,17 @@
       "type": "document",
       "relations": {
         "owner": { "this": {} },
-        "admin_auditor": { "this": {} },
-        "global_director": { "this": {} },
 
-        "public_viewer": { "this": {} },
+        "oui_member": { "this": {} },
 
-        "dept_member": { "this": {} },
-        "dept_manager": { "this": {} },
-
-        "project_member": { "this": {} },
-        "project_dept_manager": { "this": {} },
+        "ancestor_viewer": { "this": {} },
 
         "can_view": {
           "union": {
             "child": [
               { "computedUserset": { "relation": "owner" } },
-              { "computedUserset": { "relation": "admin_auditor" } },
-              { "computedUserset": { "relation": "global_director" } },
-              { "computedUserset": { "relation": "public_viewer" } },
-              { "computedUserset": { "relation": "dept_member" } },
-              { "computedUserset": { "relation": "dept_manager" } },
-              { "computedUserset": { "relation": "project_member" } },
-              { "computedUserset": { "relation": "project_dept_manager" } }
+              { "computedUserset": { "relation": "oui_member" } },
+              { "computedUserset": { "relation": "ancestor_viewer" } }
             ]
           }
         },
@@ -79,10 +54,7 @@
           "union": {
             "child": [
               { "computedUserset": { "relation": "owner" } },
-              { "computedUserset": { "relation": "admin_auditor" } },
-              { "computedUserset": { "relation": "global_director" } },
-              { "computedUserset": { "relation": "dept_manager" } },
-              { "computedUserset": { "relation": "project_dept_manager" } }
+              { "computedUserset": { "relation": "ancestor_viewer" } }
             ]
           }
         }
@@ -90,25 +62,8 @@
       "metadata": {
         "relations": {
           "owner": { "directly_related_user_types": [{ "type": "user" }] },
-          "admin_auditor": {
-            "directly_related_user_types": [{ "type": "user" }]
-          },
-          "global_director": {
-            "directly_related_user_types": [{ "type": "user" }]
-          },
-          "public_viewer": {
-            "directly_related_user_types": [{ "type": "user" }]
-          },
-          "dept_member": {
-            "directly_related_user_types": [{ "type": "user" }]
-          },
-          "dept_manager": {
-            "directly_related_user_types": [{ "type": "user" }]
-          },
-          "project_member": {
-            "directly_related_user_types": [{ "type": "user" }]
-          },
-          "project_dept_manager": {
+          "oui_member": { "directly_related_user_types": [{ "type": "user" }] },
+          "ancestor_viewer": {
             "directly_related_user_types": [{ "type": "user" }]
           },
           "can_view": { "directly_related_user_types": [] },

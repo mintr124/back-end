@@ -181,16 +181,15 @@ class IngestPipelineService:
 
             for chunk_model, chunk_dict, vector in zip(chunk_models, chunks, vectors):
                 meta_json = chunk_dict.get("metadata_json") or {}
-                metadata  = {
+                # Dòng ~184, thay đoạn metadata:
+                metadata = {
                     "document_id":         doc.id,
                     "document_version_id": version.id,
-                    "department_id":       doc.department_id,
                     "document_title":      doc.title,
-                    "project_id":          doc.project_id,
+                    "oui_ids":             ",".join(sorted([o.id for o in (doc.ouis or [])])),
                     "document_type":       doc.document_type,
-                    "sensitivity_level":   doc.sensitivity_level,
+                    "sensitivity":         str(doc.sensitivity),
                     "data_type":           doc.data_type,
-                    "allowed_roles":       ",".join(doc.allowed_roles or []),
                     "chunk_index":         chunk_model.chunk_index,
                     "page_start":          chunk_model.page_start,
                     "page_end":            chunk_model.page_end,
@@ -229,16 +228,19 @@ class IngestPipelineService:
             version.ingest_status = "succeeded"
 
             creator = job.created_by
-            logger.info(
-                "DEBUG creator_id=%s creator=%s role=%s doc_status_before=%s",
-                job.created_by_user_id, creator,
-                creator.role if creator else None, doc.status,
-            )
-            if creator and creator.role in {"admin_auditor", "director"}:
-                doc.status = "ready"
-            elif doc.status not in {"ready", "approved"}:
-                doc.status = "review"
-            logger.info("DEBUG doc_status_after=%s", doc.status)
+            from app.services.user_service import user_service as _user_service
+            if creator:
+                from app.services.user_service import user_service as _user_service
+                from app.db.session import SessionLocal
+                with SessionLocal() as tmp_db:
+                    creator_resp = _user_service.build_user_response(tmp_db, creator)
+                    if creator_resp.is_corp_member:
+                        doc.status = "approved"
+                    elif doc.status not in {"approved", "ready"}:
+                        doc.status = "review"
+            else:
+                if doc.status not in {"approved", "ready"}:
+                    doc.status = "review"
 
             doc.current_version_id = version.id
 

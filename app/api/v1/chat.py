@@ -139,11 +139,11 @@ def post_message_stream(
             db, current_user, conversation_id,
             payload.content, payload.clientMessageId,
             request.state.trace_id,
-            project_ids=payload.project_ids,        
-            department_ids=payload.department_ids, 
+            oui_ids=payload.oui_ids,
             mode=payload.mode,
-            file_content=payload.file_content,   
-            file_name=payload.file_name,         
+            chat_source=payload.chat_source,
+            file_content=payload.file_content,
+            file_name=payload.file_name,
         ):
             yield f"data: {jsonlib.dumps(event)}\n\n"
 

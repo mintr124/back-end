@@ -22,6 +22,7 @@ Output schema (mỗi dict):
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -34,6 +35,7 @@ except ImportError:
     tiktoken = None
 
 from app.utils.file_parser import ParsedDocument
+from app.services.llm_service import llm_service
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ChunkConfig:
-    mode: str = "legacy"            # "legacy" | "hierarchical" | "hybrid"
+    mode: str = "legacy"            
     max_tokens: int = 512
     overlap_tokens: int = 80
     min_chunk_tokens: int = 60
@@ -64,6 +66,8 @@ _HEADING_RE = re.compile(
         ^\s*(?:chương|phần|mục|section|chapter)\s+[\dIVXivx]+[\.:]\s*.+
         |
         ^\s*(?:Điều|điều)\s+\d+[\.\:]\s*.+
+        |
+        ^\s*\d+[\.\)]\s+[A-ZÀÁÂÃÈÉÊÌÍÒÓÔÕÙÚĂĐĨŨƠƯ].{3,80}$
         |
         ^\s*[A-ZÀÁÂÃÈÉÊÌÍÒÓÔÕÙÚĂĐĨŨƠƯ]{4,}(?:\s+[A-ZÀÁÂÃÈÉÊÌÍÒÓÔÕÙÚĂĐĨŨƠƯ]+)*\s*$
     )
@@ -285,6 +289,148 @@ def _chunk_with_docling(
         })
 
     return results
+
+# ---------------------------------------------------------------------------
+# LLM-based chunker
+# ---------------------------------------------------------------------------
+
+_LLM_CHUNK_PROMPT = """Bạn là hệ thống chunking tài liệu cho RAG.
+
+Nhiệm vụ:
+1. Đọc toàn bộ tài liệu để xác định các entity chính (tên người, tên tổ chức, mã số, mã hợp đồng...)
+2. Chia thành các chunk độc lập theo nhóm thông tin logic (section/bảng/đoạn)
+3. Mỗi chunk phải self-contained: đọc riêng vẫn hiểu được, không cần context bên ngoài
+
+Quy tắc đặt section_heading:
+- Luôn gắn entity chính vào heading, kể cả khi chunk đó không nhắc lại tên
+- Format: "[Tên entity chính của chunk] - [Loại thông tin]"
+- Ví dụ: "Nguyễn Hoàng Minh - Thông tin cá nhân", "Nguyễn Hoàng Minh - Lịch sử công tác", "Hợp đồng HĐ-2024-001 - Điều khoản thanh toán"
+- Nếu chunk không có entity rõ ràng, dùng tên section gốc
+
+Quy tắc chunk:
+- Nên có các mục đề ở trong chunk_text thay vì chỉ có text của mục đề đó, ví dụ: 2. Thông tin cá nhân\n- Họ tên: Nguyễn Hoàng Minh ... thì chunk_text nên bao gồm cả "2. Thông tin cá nhân" chứ không chỉ "- Họ tên: Nguyễn Hoàng Minh ..."
+- Không bỏ sót thông tin nào
+- Không merge các section không liên quan vào cùng chunk
+- Không split 1 bảng/nhóm field liên quan thành nhiều chunk
+- Giữ nguyên giá trị gốc, không paraphrase
+
+Trả về JSON với đúng format sau, không giải thích thêm:
+{{"chunks": [{{"section_heading": "...", "chunk_text": "..."}}]}}
+
+TÀI LIỆU:
+{text}"""
+
+# Token limit để tránh vượt context window
+_LLM_CHUNK_MAX_INPUT_CHARS = 12000
+
+
+def _chunk_with_llm(parsed: ParsedDocument, cfg: ChunkConfig) -> list[dict]:
+    logger.info("_chunk_with_llm ENTER")
+
+    if not llm_service.is_configured():
+        raise RuntimeError("LLM service chưa được cấu hình")
+
+    text = parsed.full_text[:_LLM_CHUNK_MAX_INPUT_CHARS]
+    prompt = _LLM_CHUNK_PROMPT.format(text=text)
+    logger.info("LLM chunker input prompt len=%d preview=%r", len(prompt), prompt[:1000])
+    
+    try:
+        raw, _, source = llm_service.generate(
+            prompt=prompt,
+            system="Bạn là hệ thống xử lý văn bản. Chỉ trả về JSON thuần túy, không giải thích, không markdown.",
+            max_tokens=4096,
+            temperature=0.0,
+            fallback_to_ollama=True,
+        )
+        logger.info("LLM chunker response source=%s len=%d raw_preview=%r", source, len(raw), raw[:200])
+    except Exception as exc:
+        logger.error("LLM chunker generate EXCEPTION type=%s msg=%s", type(exc).__name__, exc)
+        raise RuntimeError(f"LLM chunker generate failed: {exc}") from exc
+
+    raw = raw.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+
+    logger.info("LLM chunker raw response: %r", raw[:1000])
+    try:
+        data = json.loads(raw)
+        if isinstance(data, str):
+            data = json.loads(data)
+        logger.info("LLM chunker parsed data type=%s keys=%s preview=%r",
+                    type(data).__name__,
+                    list(data.keys()) if isinstance(data, dict) else "N/A",
+                    str(data)[:300])
+    except Exception as exc:
+        logger.error("LLM chunker JSON parse FAILED: %s | raw=%r", exc, raw[:500])
+        raise RuntimeError(f"LLM chunker JSON parse failed: {exc}") from exc
+
+    items: list[dict] = data if isinstance(data, list) else data.get("chunks", [])
+    if not items:
+        raise RuntimeError("LLM chunker trả về 0 chunks")
+
+    total_pages = max(1, len(parsed.pages))
+    results: list[dict] = []
+
+    for idx, item in enumerate(items):
+        chunk_text = (item.get("chunk_text") or "").strip()
+        heading    = (item.get("section_heading") or "").strip()
+        if not chunk_text:
+            continue
+
+        token_count = _estimate_tokens(chunk_text)
+
+        if token_count > cfg.max_tokens * 2:
+            logger.warning("LLM chunk idx=%d quá lớn (%d tokens), hard split", idx, token_count)
+            sub_chunks = _LegacyChunker(cfg)._hard_split(chunk_text)
+            for sub_text in sub_chunks:
+                results.append(_make_chunk_dict(
+                    idx=len(results),
+                    chunk_text=sub_text,
+                    heading=heading,
+                    total_pages=total_pages,
+                    total_chunks=len(items),
+                    mode="llm_structured",
+                ))
+            continue
+
+        results.append(_make_chunk_dict(
+            idx=len(results),
+            chunk_text=chunk_text,
+            heading=heading,
+            total_pages=total_pages,
+            total_chunks=len(items),
+            mode="llm_structured",
+        ))
+
+    return results
+
+
+def _make_chunk_dict(
+    *,
+    idx: int,
+    chunk_text: str,
+    heading: str,
+    total_pages: int,
+    total_chunks: int,
+    mode: str,
+) -> dict:
+    embed_text = f"{heading}\n\n{chunk_text}" if heading else chunk_text
+    return {
+        "chunk_index":   idx,
+        "chunk_text":    chunk_text,
+        "embed_text":    embed_text,
+        "page_start":    1,
+        "page_end":      total_pages,
+        "token_count":   _estimate_tokens(chunk_text),
+        "chunk_hash":    _sha256(chunk_text),
+        "metadata_json": {
+            "section_index":     idx,
+            "section_heading":   heading,
+            "position_ratio":    round(idx / max(1, total_chunks), 4),
+            "local_chunk_index": 0,
+            "chunker_mode":      mode,
+        },
+    }
 
 
 def _merge_same_section(raw_chunks: list[Any], max_tokens: int) -> list[dict]:
@@ -543,12 +689,8 @@ class ChunkerService:
         self.cfg = config or ChunkConfig()
 
     def chunk(self, parsed: ParsedDocument, config: ChunkConfig | None = None) -> list[dict]:
-        """
-        chunk() nhận optional config để override per-request.
-        ingest_pipeline_service gọi:
-            chunker_service.chunk(parsed, config=ChunkConfig.from_json(version.chunk_config_json))
-        """
         cfg = config or self.cfg
+        logger.info("ChunkerService.chunk called with mode=%s", cfg.mode)  # ← thêm dòng này
 
         if cfg.mode in ("hierarchical", "hybrid"):
             logger.info("Chunking với Docling mode=%s max_tokens=%d", cfg.mode, cfg.max_tokens)
@@ -560,6 +702,21 @@ class ChunkerService:
                     cfg.mode, exc,
                 )
                 # Fallback về legacy nếu Docling lỗi
+                fallback_cfg = ChunkConfig(
+                    mode="legacy",
+                    max_tokens=cfg.max_tokens,
+                    overlap_tokens=cfg.overlap_tokens,
+                    min_chunk_tokens=60,
+                )
+                return _LegacyChunker(fallback_cfg).chunk(parsed)
+            
+        if cfg.mode == "llm_structured":
+            logger.info("Chunking với LLM structured mode max_tokens=%d", cfg.max_tokens)
+            try:
+                return _chunk_with_llm(parsed, cfg)
+            except Exception as exc:
+                logger.error("LLM chunking thất bại type=%s: %s", 
+                             type(exc).__name__, exc, exc_info=True)
                 fallback_cfg = ChunkConfig(
                     mode="legacy",
                     max_tokens=cfg.max_tokens,

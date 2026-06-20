@@ -1,171 +1,97 @@
 from __future__ import annotations
-
 import logging
+from sqlalchemy.orm import Session
 
 from app.fga.client import fga_client
 from app.models.document import Document
-from app.models.user import User
+from app.models.user_oui_position import UserOuiPosition
+from app.services.oui_tree_service import oui_tree_service
 
 logger = logging.getLogger(__name__)
 
 
 class FGAAdapter:
     """
-    Mọi thay đổi quan hệ user↔dept, user↔project, document tạo mới
-    đều gọi adapter này để sync tuples vào OpenFGA.
-
-    Hierarchy: admin_auditor > director > department_manager > employee
+    Sync tuples vào OpenFGA theo model OU/OUI/Position mới.
 
     Access rules:
-    - owner: luôn xem được & sửa được tài liệu của mình
-    - admin_auditor: xem/sửa mọi tài liệu
-    - director: xem mọi tài liệu (không phân biệt dept/project)
-    - Không thuộc dept/project + public: tất cả mọi người
-    - Không thuộc dept/project + non-public: admin_auditor + director
-    - Trong dept + public: tất cả trong dept
-    - Trong dept + non-public: dept_manager trong dept + admin_auditor + director
-    - Trong project + public: tất cả trong project
-    - Trong project + non-public: dept_manager của dept chứa project + admin_auditor + director
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  Doc thuộc OUI-X                                                │
+    │  • User thuộc OUI-X:       có thể xem NẾU position.clearance  │
+    │                             ≥ doc.sensitivity                   │
+    │  • User thuộc ancestor:    luôn xem được (không check clearance)│
+    │  • User thuộc descendant:  chỉ xem nếu doc.sensitivity = 1    │
+    │                             (public) — check ở Python          │
+    └─────────────────────────────────────────────────────────────────┘
+
+    FGA chỉ quản lý structural access (thuộc OUI nào, ancestor nào).
+    Clearance check thực hiện ở Python trong _sync_fga trước khi write tuple.
     """
 
-    # ── department ────────────────────────────────────────────────────────────
+    # ── OUI membership ────────────────────────────────────────────────────────
 
-    def add_dept_member(self, user_id: str, dept_id: str):
-        try:
-            fga_client.write([
-                {"user": f"user:{user_id}", "relation": "member", "object": f"department:{dept_id}"}
-            ])
-        except Exception:
-            pass
-
-    def add_dept_manager(self, user_id: str, dept_id: str):
-        try:
-            fga_client.write([
-                {"user": f"user:{user_id}", "relation": "manager", "object": f"department:{dept_id}"}
-            ])
-        except Exception:
-            pass
-
-    def remove_dept_member(self, user_id: str, dept_id: str):
-        try:
-            fga_client.delete([
-                {"user": f"user:{user_id}", "relation": "member", "object": f"department:{dept_id}"}
-            ])
-        except Exception:
-            pass
-
-    def remove_dept_manager(self, user_id: str, dept_id: str):
-        try:
-            fga_client.delete([
-                {"user": f"user:{user_id}", "relation": "manager", "object": f"department:{dept_id}"}
-            ])
-        except Exception:
-            pass
-
-    # ── project ───────────────────────────────────────────────────────────────
-
-    def add_project_member(self, user_id: str, proj_id: str):
+    def add_oui_member(self, user_id: str, oui_id: str) -> None:
         fga_client.write([
-            {"user": f"user:{user_id}", "relation": "member", "object": f"project:{proj_id}"}
+            {"user": f"user:{user_id}", "relation": "member", "object": f"oui:{oui_id}"}
         ])
 
-    def add_project_director(self, user_id: str, proj_id: str):
-        fga_client.write([
-            {"user": f"user:{user_id}", "relation": "director", "object": f"project:{proj_id}"}
-        ])
-
-    def link_project_dept(self, proj_id: str, dept_id: str):
-        """Liên kết project với department — để dept_manager tự động có quyền."""
-        fga_client.write([
-            {"user": f"department:{dept_id}", "relation": "department", "object": f"project:{proj_id}"}
-        ])
-
-    def remove_project_member(self, user_id: str, proj_id: str):
+    def remove_oui_member(self, user_id: str, oui_id: str) -> None:
         fga_client.delete([
-            {"user": f"user:{user_id}", "relation": "member", "object": f"project:{proj_id}"}
+            {"user": f"user:{user_id}", "relation": "member", "object": f"oui:{oui_id}"}
         ])
 
-    def unlink_project_dept(self, proj_id: str, dept_id: str):
-        """Xóa liên kết project-department cũ khi đổi department."""
+    def link_oui_parent(self, oui_id: str, parent_oui_id: str) -> None:
+        """Liên kết OUI với OUI cha — để ancestor_member tự động inherit."""
+        fga_client.write([
+            {"user": f"oui:{parent_oui_id}", "relation": "parent_oui", "object": f"oui:{oui_id}"}
+        ])
+
+    def unlink_oui_parent(self, oui_id: str, parent_oui_id: str) -> None:
         fga_client.delete([
-            {"user": f"department:{dept_id}", "relation": "department", "object": f"project:{proj_id}"}
+            {"user": f"oui:{parent_oui_id}", "relation": "parent_oui", "object": f"oui:{oui_id}"}
         ])
 
-    # ── document ──────────────────────────────────────────────────────────────
+    # ── Document sync ─────────────────────────────────────────────────────────
 
-    def sync_document_tuples(
-        self,
-        doc: Document,
-        all_users: list[User],
-        dept_users: list[User],
-        project_users: list[User],
-        dept_managers: list[User],
-    ):
-        tuples = []
+    def sync_document_tuples(self, db: Session, doc: Document) -> None:
+        from app.models.user_oui_position import UserOuiPosition
+
+        tuples: list[dict] = []
         doc_obj = f"document:{doc.id}"
 
-        CLEARANCE_RANK = {
-            "public": 1, "internal": 2, "confidential": 3,
-            "restricted": 4, "top_secret": 5,
-        }
-        doc_rank = CLEARANCE_RANK.get(doc.sensitivity_level or "public", 1)
-
-        def has_clearance(u: User) -> bool:
-            return CLEARANCE_RANK.get(u.clearance_level or "public", 1) >= doc_rank
-
-        # ── Owner luôn có quyền xem & sửa tài liệu của mình ─────────────────
+        # 1. Owner
         if doc.owner_user_id:
-            tuples.append({
-                "user": f"user:{doc.owner_user_id}",
-                "relation": "owner",
-                "object": doc_obj,
-            })
+            tuples.append({"user": f"user:{doc.owner_user_id}", "relation": "owner", "object": doc_obj})
 
-        # ── admin_auditor và director luôn có quyền ───────────────────────────
-        for u in all_users:
-            if u.role == "admin_auditor":
-                tuples.append({"user": f"user:{u.id}", "relation": "admin_auditor", "object": doc_obj})
-            elif u.role == "director":
-                tuples.append({"user": f"user:{u.id}", "relation": "global_director", "object": doc_obj})
+        # 2-4. Loop qua từng OUI doc thuộc về
+        for oui in doc.ouis:
+            # Ancestors → ancestor_viewer
+            ancestor_ids = oui_tree_service.get_ancestors(db, oui.id)
+            for anc_id in ancestor_ids:
+                for m in db.query(UserOuiPosition).filter(UserOuiPosition.oui_id == anc_id).all():
+                    t = {"user": f"user:{m.user_id}", "relation": "ancestor_viewer", "object": doc_obj}
+                    if t not in tuples:
+                        tuples.append(t)
 
-        # ── Không thuộc dept / project ────────────────────────────────────────
-        if not doc.department_id and not doc.project_id:
-            for u in all_users:
-                if u.role not in ("admin_auditor", "director") and has_clearance(u):
-                    tuples.append({
-                        "user": f"user:{u.id}",
-                        "relation": "public_viewer",
-                        "object": doc_obj,
-                    })
-        # ── Thuộc department, không có project ───────────────────────────────
-        elif doc.department_id and not doc.project_id:
-            for u in dept_users:
-                if u.role not in ("admin_auditor", "director") and has_clearance(u):
-                    if u.role == "department_manager":
-                        tuples.append({"user": f"user:{u.id}", "relation": "dept_manager", "object": doc_obj})
-                    else:
-                        tuples.append({"user": f"user:{u.id}", "relation": "dept_member", "object": doc_obj})
+            # Direct members → oui_member nếu clearance đủ
+            for m in db.query(UserOuiPosition).filter(UserOuiPosition.oui_id == oui.id).all():
+                if m.position and m.position.clearance >= doc.sensitivity:
+                    t = {"user": f"user:{m.user_id}", "relation": "oui_member", "object": doc_obj}
+                    if t not in tuples:
+                        tuples.append(t)
 
-        # ── Thuộc project ─────────────────────────────────────────────────────
-        elif doc.project_id:
-            for u in project_users:
-                if u.role not in ("admin_auditor", "director") and has_clearance(u):
-                    if u.role == "department_manager":
-                        tuples.append({"user": f"user:{u.id}", "relation": "project_dept_manager", "object": doc_obj})
-                    else:
-                        tuples.append({"user": f"user:{u.id}", "relation": "project_member", "object": doc_obj})
-            # dept_manager của dept chứa project (có thể không trong project_users)
-            for u in dept_managers:
-                if u.role == "department_manager" and has_clearance(u):
-                    if not any(t["user"] == f"user:{u.id}" and t["object"] == doc_obj for t in tuples):
-                        tuples.append({"user": f"user:{u.id}", "relation": "project_dept_manager", "object": doc_obj})
+            # Descendants → chỉ khi public (sensitivity = 1)
+            if doc.sensitivity == 1:
+                for desc_id in oui_tree_service.get_descendants(db, oui.id):
+                    for m in db.query(UserOuiPosition).filter(UserOuiPosition.oui_id == desc_id).all():
+                        t = {"user": f"user:{m.user_id}", "relation": "oui_member", "object": doc_obj}
+                        if t not in tuples:
+                            tuples.append(t)
 
         if tuples:
-            logger.info("FGA write tuples: %s", tuples)
             fga_client.write(tuples)
 
-    def delete_document_tuples(self, doc_id: str, tuples_to_delete: list[dict]):
-        """Xóa toàn bộ tuples cũ của document trước khi sync lại."""
+    def delete_document_tuples(self, doc_id: str, tuples_to_delete: list[dict]) -> None:
         if tuples_to_delete:
             fga_client.delete(tuples_to_delete)
 
@@ -173,7 +99,6 @@ class FGAAdapter:
         return fga_client.read(object=f"document:{doc_id}")
 
     def list_viewable_document_ids(self, user_id: str) -> list[str]:
-        """Trả về list doc_id user được phép xem."""
         objects = fga_client.list_objects(
             user=f"user:{user_id}",
             relation="can_view",

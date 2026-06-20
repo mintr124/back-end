@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 # RRF constant – higher k → smoother ranking (less sensitive to top ranks)
 _RRF_K = 60
+GMAIL_CHROMA_COLLECTION = "gmail_chunks"
 
 
 class RetrievalService:
@@ -156,23 +157,31 @@ class RetrievalService:
     def _build_where(
         self,
         allowed_doc_ids: list[str] | None,
-        project_ids:     list[str] | None,
-        department_ids:  list[str] | None,
+        oui_ids: list[str] | None,
     ) -> dict | None:
-        conditions = []
-
         if allowed_doc_ids:
-            conditions.append({"document_id": {"$in": allowed_doc_ids}})
-        if project_ids:
-            conditions.append({"project_id": {"$in": project_ids}})
-        if department_ids:
-            conditions.append({"department_id": {"$in": department_ids}})
-
-        if len(conditions) > 1:
-            return {"$and": conditions}
-        if len(conditions) == 1:
-            return conditions[0]
+            return {"document_id": {"$in": allowed_doc_ids}}
         return None
+    
+    def _post_filter_oui(
+        self,
+        results: list[dict],
+        oui_ids: list[str] | None,
+    ) -> list[dict]:
+        """Filter sau khi retrieve: giữ chunk nếu document thuộc ít nhất 1 oui_id yêu cầu."""
+        if not oui_ids:
+            return results
+        oui_set = set(oui_ids)
+        filtered = []
+        for chunk in results:
+            # oui_id metadata là "abc,def,ghi"
+            chunk_ouis = set(
+                (chunk.get("metadata", {}).get("oui_id") or "").split(",")
+            )
+            chunk_ouis.discard("")
+            if chunk_ouis & oui_set:  # intersection
+                filtered.append(chunk)
+        return filtered
     
     def _classify_chunk_sensitivity(self, chunk: dict) -> SensitivityLevel:
         """
@@ -200,43 +209,26 @@ class RetrievalService:
         return SensitivityLevel.PUBLIC
 
 
-    def _apply_sensitivity_gate(
-        self,
-        chunks: list[dict],
-        user,
-    ) -> list[dict]:
-        """
-        Filter + redact chunks theo role của user.
-
-        admin_auditor → RESTRICTED: xem full, không redact
-        director      → CONFIDENTIAL: xem được, nhưng redact RESTRICTED fields
-        manager/employee → INTERNAL: không thấy CONFIDENTIAL/RESTRICTED
-        """
+    # Trong _apply_sensitivity_gate, thay toàn bộ hàm:
+    def _apply_sensitivity_gate(self, chunks: list[dict], user) -> list[dict]:
         if user is None:
-            # Không có user context → chỉ trả PUBLIC
             return [c for c in chunks
                     if self._classify_chunk_sensitivity(c) == SensitivityLevel.PUBLIC]
 
-        user_role    = getattr(user, "role", "employee")
-        max_level    = ROLE_MAX_SENSITIVITY.get(user_role, SensitivityLevel.INTERNAL)
+        max_clearance = getattr(user, "max_clearance", 1)
+        # clearance 1-5 map sang SensitivityLevel 1-5 trực tiếp
+        max_level = SensitivityLevel(max_clearance)
         allowed: list[dict] = []
 
         for chunk in chunks:
             chunk_level = self._classify_chunk_sensitivity(chunk)
-
             if chunk_level > max_level:
-                # Hoàn toàn không có quyền → drop chunk
                 logger.warning(
-                    "SENSITIVITY GATE: blocked chunk=%s level=%s user=%s role=%s",
+                    "SENSITIVITY GATE: blocked chunk=%s level=%s user=%s clearance=%d",
                     chunk.get("chunk_id"), chunk_level.name,
-                    getattr(user, "id", "?"), user_role,
+                    getattr(user, "id", "?"), max_clearance,
                 )
                 continue
-
-            # director xem CONFIDENTIAL chunk nhưng redact RESTRICTED fields
-            if user_role == "director" and chunk_level == SensitivityLevel.CONFIDENTIAL:
-                chunk = self._redact_for_director(chunk)
-
             allowed.append(chunk)
 
         return allowed
@@ -273,8 +265,8 @@ class RetrievalService:
         user=None,
         top_k: int = 5,
         mode: str = "hybrid",
-        project_ids:    list[str] | None = None,
-        department_ids: list[str] | None = None,
+        oui_ids: list[str] | None = None,
+        chat_mode: str = "rag",
     ) -> list[dict]:
         query = (query or "").strip()
         if not query:
@@ -283,129 +275,151 @@ class RetrievalService:
         if not embedding_service.is_configured():
             raise RuntimeError("Embedding service is not configured")
 
-        # ── 1. Permission gate ────────────────────────────────────────
+        # Lấy user_id sớm để tránh DetachedInstanceError
+        user_id = str(user.id) if user else None
+
+        if chat_mode == "gmail":
+            return self._retrieve_from_collection(
+                query=query, user=user, top_k=top_k,
+                collection_name=GMAIL_CHROMA_COLLECTION,
+                extra_where={"user_id": {"$eq": user_id}} if user_id else None,  # ← $eq operator
+            )
+        elif chat_mode == "all":
+            rag_results = self._retrieve_main(query=query, user=user, top_k=top_k, oui_ids=oui_ids)
+            gmail_results = self._retrieve_from_collection(
+                query=query, user=user, top_k=top_k,
+                collection_name=GMAIL_CHROMA_COLLECTION,
+                extra_where={"user_id": {"$eq": user_id}} if user_id else None,  # ← $eq operator
+            )
+            merged = rag_results + gmail_results
+            merged.sort(key=lambda x: x.get("score", 0), reverse=True)
+            return merged[:top_k]
+        else:
+            return self._retrieve_main(
+                query=query, user=user, top_k=top_k, mode=mode, oui_ids=oui_ids
+            )
+
+    def _retrieve_main(
+        self,
+        *,
+        query: str,
+        user=None,
+        top_k: int = 5,
+        mode: str = "hybrid",
+        oui_ids: list[str] | None = None,
+    ) -> list[dict]:
+        """Retrieve từ collection chính (document_chunks)."""
         allowed_doc_ids: list[str] | None = None
         if user is not None:
             allowed_doc_ids = fga_adapter.list_viewable_document_ids(user.id)
             if not allowed_doc_ids:
                 return []
 
-        where = self._build_where(allowed_doc_ids, project_ids, department_ids)
+        where = self._build_where(allowed_doc_ids, oui_ids)
 
-        # ── 2. Fetch candidates ───────────────────────────────────────
         semantic_list: list[dict] = []
-        lexical_list:  list[dict] = []
+        lexical_list: list[dict] = []
 
         if mode in ("semantic", "hybrid"):
             emb = embedding_service.embed(query)
             raw = self.repo.query_by_embedding(
-                embedding=emb,
-                top_k=self.semantic_candidates,
-                where=where,
+                embedding=emb, top_k=self.semantic_candidates, where=where,
             )
             semantic_list = self._parse_chroma(raw)
-            logger.info("SEMANTIC: %d results, distances=%s",
-                len(semantic_list), [round(r.get("distance",0),4) for r in semantic_list])
 
         if mode in ("keyword", "hybrid"):
             raw = self.repo.query_by_keyword(
-                query=query,
-                top_k=self.lexical_candidates,
-                where=where,
+                query=query, top_k=self.lexical_candidates, where=where,
             )
             lexical_list = self._parse_chroma(raw)
-            logger.info("LEXICAL: %d results", len(lexical_list))
 
         if not semantic_list and not lexical_list:
-            logger.warning("NO CANDIDATES FOUND - where=%s", where)
             return []
 
-        # ── 3. Fuse ───────────────────────────────────────────────────
-        if mode == "semantic":
-            fused = []
-            for item in semantic_list:
-                semantic_score = self._cosine_sim(item.get("distance"))
+        fused = self._fuse(semantic_list, lexical_list) if mode == "hybrid" else (
+            sorted([{**i, "rrf_score": self._cosine_sim(i.get("distance")), "sources": ["semantic"]}
+                    for i in semantic_list], key=lambda x: x["rrf_score"], reverse=True)
+            if mode == "semantic" else
+            sorted([{**i, "rrf_score": max(0.0, 1.0 - float(i.get("distance") or 1.0)), "sources": ["lexical"]}
+                    for i in lexical_list], key=lambda x: x["rrf_score"], reverse=True)
+        )
 
-                fused.append({
-                    **item,
-                    "rrf_score": semantic_score,
-                    "semantic_distance": item.get("distance"),
-                    "keyword_score": None,
-                    "sources": ["semantic"],
-                })
+        max_rrf = fused[0]["rrf_score"] if fused else 0.0
 
-            fused.sort(key=lambda x: x["rrf_score"], reverse=True)
-        elif mode == "keyword":
-            fused = []
-            for item in lexical_list:
-                d = item.get("distance")
-
-                # distance = 1 - f1 → f1 = 1 - distance
-                try:
-                    keyword_score = max(0.0, min(1.0, 1.0 - float(d)))
-                except Exception:
-                    keyword_score = 0.0
-
-                fused.append({
-                    **item,
-                    "rrf_score": keyword_score,   # dùng F1 làm score chính
-                    "lexical_distance": item.get("distance"),
-                    "semantic_score": None,
-                    "sources": ["lexical"],
-                })
-
-            fused.sort(key=lambda x: x["rrf_score"], reverse=True)
-        else:
-            fused = self._fuse(semantic_list, lexical_list)
-
-        logger.info("FUSED: %d items, top scores=%s",
-            len(fused), [round(f.get("rrf_score",0),4) for f in fused[:5]])
-        logger.info("MINIMUM_SCORE=%.2f", self.minimum_score)
-
-        # ── 4. Score threshold + annotate ─────────────────────────────
-        results: list[dict] = []
-
+        results = []
         for item in fused:
-            semantic_score = None
-            keyword_score  = None
-
-            # --- extract semantic ---
-            if item.get("semantic_distance") is not None:
-                semantic_score = self._cosine_sim(item["semantic_distance"])
-
-            # --- extract keyword ---
-            if item.get("lexical_distance") is not None:
-                try:
-                    keyword_score = max(0.0, min(1.0, 1.0 - float(item["lexical_distance"])))
-                except Exception:
-                    keyword_score = 0.0
-
-            # --- combine score ---
-            if semantic_score is not None and keyword_score is not None:
-                score = 0.5 * semantic_score + 0.5 * keyword_score
-            elif semantic_score is not None:
-                score = semantic_score
-            elif keyword_score is not None:
-                score = keyword_score
-            else:
-                score = 0.0
-
+            sem = self._cosine_sim(item.get("semantic_distance")) if item.get("semantic_distance") is not None else None
+            kw = max(0.0, min(1.0, 1.0 - float(item["lexical_distance"]))) if item.get("lexical_distance") is not None else None
+            score = round(item["rrf_score"] / max_rrf, 6) if max_rrf else 0.0
             if score < self.minimum_score:
                 continue
-
             results.append({
                 "chunk_id": item["chunk_id"],
                 "document_text": item["document_text"],
                 "metadata": item["metadata"] or {},
                 "score": round(score, 6),
-                "semantic_score": round(semantic_score, 6) if semantic_score is not None else None,
-                "keyword_score": round(keyword_score, 6) if keyword_score is not None else None,
+                "semantic_score": round(sem, 6) if sem is not None else None,
+                "keyword_score": round(kw, 6) if kw is not None else None,
                 "sources": item.get("sources", []),
             })
-            
-        results = self._apply_sensitivity_gate(results, user)
 
+        results = self._apply_sensitivity_gate(results, user)
+        results = self._post_filter_oui(results, oui_ids)
         return results[:top_k]
+
+
+    def _retrieve_from_collection(
+        self,
+        *,
+        query: str,
+        user=None,
+        top_k: int = 5,
+        collection_name: str = "gmail_chunks",
+        extra_where: dict | None = None,
+    ) -> list[dict]:
+        """Retrieve từ một Chroma collection tùy chỉnh (gmail_chunks)."""
+        import chromadb
+        from app.core.config import settings
+
+        client = chromadb.HttpClient(host=settings.chroma_host, port=settings.chroma_port)
+        collection = client.get_or_create_collection(
+            name=collection_name, metadata={"hnsw:space": "cosine"}
+        )
+        
+        count = collection.count()
+        logger.info("Gmail collection '%s' count=%d extra_where=%s", collection_name, count, extra_where)
+
+        emb = embedding_service.embed(query)
+
+        kwargs: dict = dict(
+            query_embeddings=[emb],
+            n_results=top_k,
+            include=["documents", "metadatas", "distances"],
+        )
+        if extra_where:
+            kwargs["where"] = extra_where
+
+        try:
+            raw = collection.query(**kwargs)
+        except Exception as e:
+            logger.warning("Gmail collection query failed: %s", e)
+            return []
+
+        parsed = self._parse_chroma(raw)
+        results = []
+        for item in parsed:
+            score = self._cosine_sim(item.get("distance"))
+            results.append({
+                "chunk_id": item["chunk_id"],
+                "document_text": item["document_text"],
+                "metadata": {**(item["metadata"] or {}), "source": "gmail"},
+                "score": round(score, 6),
+                "semantic_score": round(score, 6),
+                "keyword_score": None,
+                "sources": ["semantic"],
+            })
+
+        return results
 
 
 retrieval_service = RetrievalService(
