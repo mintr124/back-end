@@ -34,7 +34,7 @@ try:
 except ImportError:
     tiktoken = None
 
-from app.utils.file_parser import ParsedDocument
+from app.utils.file_parser import ParsedDocument, _strip_headers_footers
 from app.services.llm_service import llm_service
 
 logger = logging.getLogger(__name__)
@@ -294,35 +294,58 @@ def _chunk_with_docling(
 # LLM-based chunker
 # ---------------------------------------------------------------------------
 
-_LLM_CHUNK_PROMPT = """Bạn là hệ thống chunking tài liệu cho RAG.
+_LLM_CHUNK_PROMPT = """Bạn là hệ thống chunking tài liệu cho RAG doanh nghiệp.
 
-Nhiệm vụ:
-1. Đọc toàn bộ tài liệu để xác định các entity chính (tên người, tên tổ chức, mã số, mã hợp đồng...)
-2. Chia thành các chunk độc lập theo nhóm thông tin logic (section/bảng/đoạn)
-3. Mỗi chunk phải self-contained: đọc riêng vẫn hiểu được, không cần context bên ngoài
-4. Không được bỏ sót bất cứ thông tin nào trong tài liệu, mọi thông tin đều phải nằm trong ít nhất 1 chunk
+QUY TẮC TỐI QUAN TRỌNG (vi phạm = thất bại nhiệm vụ):
+Mọi đoạn văn, mọi điều khoản, mọi dòng trong TÀI LIỆU dưới đây đều BẮT BUỘC
+phải xuất hiện trong ít nhất 1 chunk. Việc bỏ sót bất kỳ điều/chương/mục nào,
+dù chỉ 1 đoạn, đều là lỗi nghiêm trọng không được phép xảy ra.
+
+QUY TRÌNH BẮT BUỘC (làm theo đúng thứ tự, không bỏ bước):
+Bước 1 — Liệt kê TRƯỚC: Đọc toàn bộ tài liệu, liệt kê danh sách TẤT CẢ các
+  đề mục cấp lớn nhất bạn thấy (ví dụ: Chương 1, Chương 2, ... Chương N,
+  hoặc Phần 1, Mục 1...). Đây là checklist bạn phải hoàn thành ở Bước 3.
+Bước 2 — Xác định entity: Tìm các entity chính (tên người, tổ chức, mã số,
+  mã hợp đồng...) để gắn vào section_heading.
+Bước 3 — Chunk theo checklist: Với MỖI đề mục đã liệt kê ở Bước 1, tạo ra
+  ít nhất 1 chunk tương ứng. Không được tự ý gộp 2 đề mục khác nhau hoặc
+  bỏ qua đề mục nào trong checklist.
+Bước 4 — Tự kiểm tra: Trước khi trả kết quả, đối chiếu lại: số lượng đề mục
+  trong checklist Bước 1 có khớp với số đề mục đã xuất hiện trong các chunk
+  ở Bước 3 không? Nếu thiếu, PHẢI bổ sung chunk còn thiếu trước khi trả JSON.
 
 Quy tắc đặt section_heading:
 - Luôn gắn entity chính vào heading, kể cả khi chunk đó không nhắc lại tên
 - Format: "[Tên entity chính của chunk] - [Loại thông tin]"
-- Ví dụ: "Nguyễn Hoàng Minh - Thông tin cá nhân", "Nguyễn Hoàng Minh - Lịch sử công tác", "Hợp đồng HĐ-2024-001 - Điều khoản thanh toán"
-- Nếu chunk không có entity rõ ràng, dùng tên section gốc
+- Ví dụ: "Nguyễn Hoàng Minh - Thông tin cá nhân", "Hợp đồng HĐ-2024-001 - Điều khoản thanh toán"
+- Nếu chunk không có entity rõ ràng, dùng tên đề mục gốc (ví dụ "Chương 5 - Điều chỉnh vận hành vốn")
 
 Quy tắc chunk:
-- Nên có các mục đề ở trong chunk_text thay vì chỉ có text của mục đề đó, ví dụ: 2. Thông tin cá nhân\n- Họ tên: Nguyễn Hoàng Minh ... thì chunk_text nên bao gồm cả "2. Thông tin cá nhân" chứ không chỉ "- Họ tên: Nguyễn Hoàng Minh ..."
-- Không bỏ sót thông tin nào
-- Không merge các section không liên quan vào cùng chunk
+- Chunk phải self-contained: đọc riêng vẫn hiểu được, không cần context bên ngoài
+- Giữ nguyên mục đề trong chunk_text (ví dụ "2. Thông tin cá nhân\\n- Họ tên: ..."
+  chứ không chỉ phần nội dung sau mục đề)
 - Không split 1 bảng/nhóm field liên quan thành nhiều chunk
-- Giữ nguyên giá trị gốc, không paraphrase
+- Giữ nguyên giá trị gốc, không paraphrase, không tóm tắt, không rút gọn
 
-Trả về JSON với đúng format sau, không giải thích thêm:
-{{"chunks": [{{"section_heading": "...", "chunk_text": "..."}}]}}
+ĐỊNH DẠNG TRẢ VỀ — JSON, không giải thích thêm, đúng cấu trúc sau:
+{{
+  "outline_checklist": ["Chương 1 - ...", "Chương 2 - ...", "..."],
+  "chunks": [
+    {{"section_heading": "...", "chunk_text": "..."}}
+  ]
+}}
+
+Trường "outline_checklist" PHẢI chứa đầy đủ danh sách đề mục từ Bước 1.
+Trường "chunks" PHẢI cover hết toàn bộ "outline_checklist" — không thiếu mục nào.
+
+NHẮC LẠI QUY TẮC QUAN TRỌNG NHẤT: tuyệt đối không bỏ sót bất kỳ đề mục nào
+trong outline_checklist khi tạo chunks. Đây là tiêu chí đánh giá duy nhất.
 
 TÀI LIỆU:
 {text}"""
 
 # Token limit để tránh vượt context window
-_LLM_CHUNK_MAX_INPUT_CHARS = 12000
+_LLM_CHUNK_MAX_INPUT_CHARS = 50000
 
 
 def _chunk_with_llm(parsed: ParsedDocument, cfg: ChunkConfig) -> list[dict]:
@@ -330,18 +353,21 @@ def _chunk_with_llm(parsed: ParsedDocument, cfg: ChunkConfig) -> list[dict]:
 
     if not llm_service.is_configured():
         raise RuntimeError("LLM service chưa được cấu hình")
+    
+    cleaned_pages = _strip_headers_footers(parsed.pages, threshold=3)
+    clean_text = "\n\n".join(t for _, t in cleaned_pages if t.strip())
 
-    text = parsed.full_text[:_LLM_CHUNK_MAX_INPUT_CHARS]
+    text = clean_text[:_LLM_CHUNK_MAX_INPUT_CHARS]
     prompt = _LLM_CHUNK_PROMPT.format(text=text)
-    logger.info("LLM chunker input prompt len=%d preview=%r", len(prompt), prompt[:1000])
+    logger.info("LLM chunker input prompt len=%d preview=%r", len(prompt), prompt)
     
     try:
-        raw, _, source = llm_service.generate(
+        raw, _, source = llm_service.generate_json(
             prompt=prompt,
             system="Bạn là hệ thống xử lý văn bản. Chỉ trả về JSON thuần túy, không giải thích, không markdown.",
-            max_tokens=4096,
+            max_tokens=16000,
             temperature=0.0,
-            fallback_to_ollama=True,
+            use_default_instructions=False,
         )
         logger.info("LLM chunker response source=%s len=%d raw_preview=%r", source, len(raw), raw[:200])
     except Exception as exc:
@@ -351,19 +377,26 @@ def _chunk_with_llm(parsed: ParsedDocument, cfg: ChunkConfig) -> list[dict]:
     raw = raw.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
+    raw = raw.strip()
 
-    logger.info("LLM chunker raw response: %r", raw[:1000])
     try:
         data = json.loads(raw)
-        if isinstance(data, str):
-            data = json.loads(data)
-        logger.info("LLM chunker parsed data type=%s keys=%s preview=%r",
-                    type(data).__name__,
-                    list(data.keys()) if isinstance(data, dict) else "N/A",
-                    str(data)[:300])
-    except Exception as exc:
-        logger.error("LLM chunker JSON parse FAILED: %s | raw=%r", exc, raw[:500])
-        raise RuntimeError(f"LLM chunker JSON parse failed: {exc}") from exc
+    except json.JSONDecodeError:
+        # Lấy JSON object đầu tiên hợp lệ nếu có extra data
+        try:
+            decoder = json.JSONDecoder()
+            data, _ = decoder.raw_decode(raw)
+        except json.JSONDecodeError:
+            # Regex extract chunks array
+            match = re.search(r'\{.*?"chunks"\s*:\s*(\[.*\])\s*\}', raw, re.DOTALL)
+            if match:
+                data = {"chunks": json.loads(match.group(1))}
+            else:
+                logger.error("LLM chunker JSON parse FAILED raw=%r", raw[:500])
+                raise RuntimeError(f"LLM chunker JSON parse failed") from None
+
+    if isinstance(data, str):
+        data = json.loads(data)
 
     items: list[dict] = data if isinstance(data, list) else data.get("chunks", [])
     if not items:

@@ -24,6 +24,7 @@ from app.services.audit_service import audit_service
 from app.services.chunker_service import ChunkConfig, chunker_service
 from app.services.chroma_service import chroma_service
 from app.services.embedding_service import embedding_service
+from app.services.entity_extractor import run_pipeline as detect_entities
 from app.services.job_service import job_service
 from app.services.parser_service import parser_service
 from app.services.storage_service import storage_service
@@ -169,6 +170,32 @@ class IngestPipelineService:
             version.chunk_status = "completed"
             db.commit()
 
+            # ── entity detection ──────────────────────────────────────
+            entity_step = job_service.add_step(
+                db, job_id=job.id, step_name="entity_detection",
+                detail_json={"chunk_count": len(chunk_models)},
+            )
+            t0 = time.perf_counter()
+            entity_results: list[dict] = []
+            for chunk_model in chunk_models:
+                try:
+                    result = detect_entities(chunk_model.chunk_text, db=db)
+                    entity_results.append(result)
+                    # Merge entity data into chunk metadata_json
+                    existing_meta = chunk_model.metadata_json or {}
+                    existing_meta["entities"]     = result["entities"]
+                    existing_meta["entity_labels"] = result["labels"]
+                    existing_meta["entity_types"] = ",".join(result["entity_types"])
+                    chunk_model.metadata_json = existing_meta
+                except Exception as exc:
+                    logger.warning("Entity detection failed for chunk %s: %s", chunk_model.id, exc)
+                    entity_results.append({"entities": [], "labels": {}, "entity_types": []})
+            job_service.finish_step(
+                db, entity_step,
+                detail_json={"latency_ms": int((time.perf_counter() - t0) * 1000)},
+            )
+            db.commit()
+
             # ── embed  (BATCH) ────────────────────────────────────────
             embed_step = job_service.add_step(
                 db, job_id=job.id, step_name="embed",
@@ -179,16 +206,18 @@ class IngestPipelineService:
             embed_texts = [c.get("embed_text") or c["chunk_text"] for c in chunks]
             vectors     = embedding_service.embed_many(embed_texts)
 
-            for chunk_model, chunk_dict, vector in zip(chunk_models, chunks, vectors):
-                meta_json = chunk_dict.get("metadata_json") or {}
-                # Dòng ~184, thay đoạn metadata:
+            for chunk_model, chunk_dict, vector, entity_result in zip(
+                chunk_models, chunks, vectors, entity_results
+            ):
+                meta_json    = chunk_dict.get("metadata_json") or {}
+                entity_labels = entity_result.get("labels") or {}
                 metadata = {
                     "document_id":         doc.id,
                     "document_version_id": version.id,
                     "document_title":      doc.title,
                     "oui_ids":             ",".join(sorted([o.id for o in (doc.ouis or [])])),
                     "document_type":       doc.document_type,
-                    "sensitivity":      doc.sensitivity,
+                    "sensitivity":         doc.sensitivity,
                     "data_type":           doc.data_type,
                     "chunk_index":         chunk_model.chunk_index,
                     "page_start":          chunk_model.page_start,
@@ -198,10 +227,17 @@ class IngestPipelineService:
                     "section_index":       meta_json.get("section_index", 0),
                     "position_ratio":      meta_json.get("position_ratio", 0.0),
                     "chunker_mode":        meta_json.get("chunker_mode", "legacy"),
+                    # Entity detection results
+                    "entity_types":        ",".join(entity_result.get("entity_types") or []),
+                    "has_pii":             entity_labels.get("has_pii", False),
+                    "has_number":          entity_labels.get("has_number", False),
+                    "has_credential":      entity_labels.get("has_credential", False),
+                    "has_legal":           entity_labels.get("has_legal", False),
+                    "has_strategic":       entity_labels.get("has_strategic", False),
                 }
                 chroma_service.upsert_chunk(
                     chunk_id=chunk_model.id,
-                    document_text=chunk_dict["chunk_text"],
+                        document_text=chunk_dict.get("embed_text") or chunk_dict["chunk_text"],  
                     embedding=vector,
                     metadata=metadata,
                 )

@@ -54,15 +54,6 @@ class LLMService:
         chat_history: list[dict] | None = None,
         extra_instructions: str | None = None,
     ) -> str:
-        """
-        Build prompt chặt chẽ cho RAG.
-        contexts: list các chunk đã retrieve, mỗi item nên có:
-          - document_text
-          - score
-          - metadata
-          - chunk_id
-        """
-
         contexts = contexts or []
         chat_history = chat_history or []
 
@@ -102,21 +93,22 @@ class LLMService:
                 history_text = "\n".join(hist_lines)
 
         prompt = f"""
-CÂU HỎI NGƯỜI DÙNG
+CÂU HỎI HIỆN TẠI (ưu tiên tuyệt đối)
 {question.strip()}
 
 NGỮ CẢNH TRUY XUẤT
 {context_text if context_text else "[Không có ngữ cảnh truy xuất]"}
 
-LỊCH SỬ HỘI THOẠI
+LỊCH SỬ HỘI THOẠI (chỉ để hiểu ngữ cảnh, KHÔNG phải câu hỏi cần trả lời)
 {history_text if history_text else "[Không có lịch sử]"}
 
 YÊU CẦU TRẢ LỜI
+- Trả lời DUY NHẤT cho "CÂU HỎI HIỆN TẠI" ở trên.
 - Chỉ dùng thông tin có trong ngữ cảnh, không đoán.
 - Không nhắc đến quá trình suy luận, không bịa thêm chi tiết.
-- Nếu ngữ cảnh OCR bẩn hoặc lẫn nhiều trường, ưu tiên nói tài liệu chưa đủ rõ.
-- Độ dài trả lời tương xứng với câu hỏi: câu hỏi đơn giản thì ngắn, câu hỏi phức tạp thì đầy đủ.
+- Lịch sử hội thoại chỉ dùng để hiểu đại từ/tham chiếu, không phải chủ đề để trả lời.
 - Dùng danh sách hoặc bảng nếu nội dung có nhiều mục cần liệt kê.
+- BẮT BUỘC: sau mỗi câu/đoạn lấy thông tin từ ngữ cảnh, chèn số thứ tự Context tương ứng dạng [N] (ví dụ [1], [2][3]). Chỉ cite Context thực sự dùng để trả lời, không cite tất cả.
 
 ĐỊNH DẠNG TRẢ LỜI
 - Trả lời trực tiếp trước, giải thích sau nếu cần.
@@ -167,6 +159,8 @@ YÊU CẦU TRẢ LỜI
                 model = settings.openai_model or "gpt-4.1-mini"
                 instructions = self._build_instructions(system)
 
+                logger.info("LLM generate SYSTEM:\n%s", instructions)
+
                 resp = client.chat.completions.create(
                     model=model,
                     messages=[
@@ -194,7 +188,6 @@ YÊU CẦU TRẢ LỜI
             if not settings.olama_url:
                 raise RuntimeError("Ollama URL not configured")
 
-            # url = settings.olama_url.rstrip("/") + "/v1/generate"
             url = settings.olama_url.rstrip("/") + "/api/generate"
             model = settings.olama_model
 
@@ -205,12 +198,12 @@ YÊU CẦU TRẢ LỜI
             payload: Dict[str, Any] = {
                 "model": model,
                 "prompt": final_prompt,
-                "stream": True,  # ← dùng streaming
+                "stream": True,
                 "options": {
                     "num_predict": max_tokens,
                     "temperature": temperature,
                 }
-}
+            }
 
             try:
                 with httpx.Client(timeout=settings.llm_timeout_seconds) as client:
@@ -228,7 +221,6 @@ YÊU CẦU TRẢ LỜI
                             except Exception:
                                 continue
 
-                    import re
                     full_text = re.sub(r"<think>.*?</think>", "", full_text, flags=re.DOTALL).strip()
 
                     source = "ollama" if provider == "ollama" else "fallback"
@@ -240,7 +232,7 @@ YÊU CẦU TRẢ LỜI
                 raise
 
         raise RuntimeError("No LLM provider configured")
-    
+
     def generate_stream(self, prompt: str, max_tokens: int = 256, temperature: float = 0.0, system: Optional[str] = None,):
         provider = settings.llm_provider
         logger.info(
@@ -249,7 +241,6 @@ YÊU CẦU TRẢ LỜI
         )
         logger.info("LLM STREAM PROMPT:\n%s", prompt)
 
-        # OpenAI streaming
         if provider == "openai":
             if OpenAI is None:
                 raise RuntimeError("openai package not installed")
@@ -259,6 +250,7 @@ YÊU CẦU TRẢ LỜI
             )
             model = settings.openai_model or "gpt-4o-mini"
             instructions = system if system else self._build_instructions(None)
+            logger.info("LLM generate_stream SYSTEM:\n%s", instructions)
             with client.chat.completions.create(
                 model=model,
                 messages=[
@@ -275,7 +267,6 @@ YÊU CẦU TRẢ LỜI
                         yield token
             return
 
-        # Ollama streaming
         url = settings.olama_url.rstrip("/") + "/api/generate"
         model = settings.olama_model
         payload = {
@@ -299,6 +290,53 @@ YÊU CẦU TRẢ LỜI
                             break
                     except Exception:
                         continue
+
+    def generate_json(
+        self,
+        prompt: str,
+        system: Optional[str] = None,
+        max_tokens: int = 16000,
+        temperature: float = 0.0,
+        use_default_instructions: bool = True,
+    ) -> Tuple[str, Any, str]:
+        """Generate với response_format=json_object — đảm bảo output là valid JSON."""
+        if settings.llm_provider != "openai":
+            return self.generate(prompt, system, max_tokens, temperature, fallback_to_ollama=True)
+        if OpenAI is None:
+            raise RuntimeError("openai package not installed")
+        client = OpenAI(
+            api_key=settings.openai_api_key,
+            base_url=settings.openai_api_base or None,
+        )
+        model = settings.openai_model or "gpt-4.1-mini"
+
+        if use_default_instructions:
+            instructions = self._build_instructions(system)
+        else:
+            instructions = (system or "").strip() or "Bạn là hệ thống xử lý dữ liệu. Chỉ trả về JSON."
+
+        # --- LOG ĐẦY ĐỦ REQUEST GỬI LÊN LLM (system + user prompt thật) ---
+        logger.info(
+            "LLM generate_json REQUEST model=%s max_tokens=%s temperature=%s use_default_instructions=%s",
+            model, max_tokens, temperature, use_default_instructions,
+        )
+        logger.info("LLM generate_json SYSTEM:\n%s", instructions)
+        logger.info("LLM generate_json USER PROMPT:\n%s", prompt)
+        # -------------------------------------------------------------------
+
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": instructions},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=max_tokens,
+            temperature=temperature,
+            response_format={"type": "json_object"},
+        )
+        text = resp.choices[0].message.content or ""
+        logger.info("LLM generate_json success model=%s len=%d", model, len(text))
+        return text, resp, "openai"
 
 
 llm_service = LLMService()

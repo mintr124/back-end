@@ -53,16 +53,9 @@ def _segment_vi(text: str) -> list[str]:
 
 
 class ChromaRepository:
-    _lock       = threading.RLock()
-    _client     = None
-    _collection = None
-
-    def __init__(self):
-        pass
-
-    # ------------------------------------------------------------------
-    # Lazy init
-    # ------------------------------------------------------------------
+    _lock = threading.RLock()
+    _client = None
+    _collections: dict[str, Any] = {}
 
     def _get_client(self) -> chromadb.HttpClient:
         if ChromaRepository._client is None:
@@ -74,18 +67,17 @@ class ChromaRepository:
                     )
         return ChromaRepository._client
 
-    def _get_collection(self):
-        if ChromaRepository._collection is None:
+    def _get_collection(self, collection_name: str | None = None):
+        name = collection_name or settings.chroma_collection
+        if name not in ChromaRepository._collections:
             with ChromaRepository._lock:
-                if ChromaRepository._collection is None:
+                if name not in ChromaRepository._collections:
                     client = self._get_client()
-                    # hnsw:space=cosine is REQUIRED so that Chroma returns
-                    # distance = 1 − cosine_similarity  (not L2 distance)
-                    ChromaRepository._collection = client.get_or_create_collection(
-                        name=settings.chroma_collection,
+                    ChromaRepository._collections[name] = client.get_or_create_collection(
+                        name=name,
                         metadata={"hnsw:space": "cosine"},
                     )
-        return ChromaRepository._collection
+        return ChromaRepository._collections[name]
 
     # ------------------------------------------------------------------
     # Metadata helpers
@@ -163,21 +155,22 @@ class ChromaRepository:
     # ------------------------------------------------------------------
 
     def query_by_embedding(
-        self,
-        *,
-        embedding: list[float],
-        top_k:     int = 5,
-        where:     dict | None = None,
-    ) -> dict:
-        collection = self._get_collection()
-        kwargs: dict[str, Any] = dict(
-            query_embeddings=[embedding],
-            n_results=top_k,
-            include=["documents", "metadatas", "distances"],
-        )
-        if where:
-            kwargs["where"] = where
-        return collection.query(**kwargs)
+            self,
+            *,
+            embedding: list[float],
+            top_k: int = 5,
+            where: dict | None = None,
+            collection_name: str | None = None,
+        ) -> dict:
+            collection = self._get_collection(collection_name)
+            kwargs: dict[str, Any] = dict(
+                query_embeddings=[embedding],
+                n_results=top_k,
+                include=["documents", "metadatas", "distances"],
+            )
+            if where:
+                kwargs["where"] = where
+            return collection.query(**kwargs)
 
     # ------------------------------------------------------------------
     # Keyword / lexical search
@@ -280,3 +273,31 @@ class ChromaRepository:
             # Lexical "distance" = 1 − f1_score  (analogous to cosine distance)
             "distances": [[1.0 - scored[j][0] for j in range(len(top_idx))]],
         }
+        
+        
+    # ------------------------------------------------------------------
+    # Fetch raw candidates for external BM25 scoring
+    # ------------------------------------------------------------------
+
+    def get_documents_for_bm25(
+            self,
+            *,
+            where: dict | None = None,
+            limit: int | None = None,
+            collection_name: str | None = None,
+        ) -> dict:
+            collection = self._get_collection(collection_name)
+            get_kwargs: dict[str, Any] = dict(include=["documents", "metadatas"])
+            if where:
+                get_kwargs["where"] = where
+            if limit:
+                get_kwargs["limit"] = limit
+            try:
+                raw = collection.get(**get_kwargs)
+            except Exception:
+                return {"ids": [], "documents": [], "metadatas": []}
+            return {
+                "ids": raw.get("ids", []) or [],
+                "documents": raw.get("documents", []) or [],
+                "metadatas": raw.get("metadatas", []) or [],
+            }

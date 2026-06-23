@@ -21,6 +21,8 @@ Cosine distance → similarity:
   So  similarity = 1 − distance  (NOT  1/(1+d) which is for L2).
 """
 from __future__ import annotations
+from rank_bm25 import BM25Okapi
+from app.repositories.chroma_repository import ChromaRepository, _segment_vi
 
 import logging
 import math
@@ -37,6 +39,43 @@ logger = logging.getLogger(__name__)
 # RRF constant – higher k → smoother ranking (less sensitive to top ranks)
 _RRF_K = 60
 GMAIL_CHROMA_COLLECTION = "gmail_chunks"
+
+# ----------------------------------------------------------------------
+# Display-score combination (NOT used for ranking, only for UI %)
+# ----------------------------------------------------------------------
+# Ranking/sort still uses RRF (rank-based, robust, unaffected by this).
+# These constants only control the absolute "match %" shown to the user.
+
+# Weight given to semantic (cosine) score vs keyword (BM25) score
+# when combining into a single display score.
+_DISPLAY_ALPHA_SEMANTIC = 0.6
+
+# BM25 raw-score saturation scale for the sigmoid below.
+# Tune this based on the real BM25 raw-score distribution of your corpus
+# (e.g. take the 90th percentile of raw scores from a sample of queries).
+_BM25_SATURATION_SCALE = 5.0
+
+
+def _bm25_raw_to_absolute_score(raw_score: float) -> float:
+    """
+    Convert a raw BM25 score into an absolute [0, 1] relevance score that
+    does NOT depend on the other candidates in the current query's batch.
+
+    BM25 raw scores have no fixed upper bound, so instead of normalising
+    by the max score within the current result set (which always forces
+    the top result to 1.0 regardless of how good the actual match is),
+    we saturate the raw score with a sigmoid. A higher raw score still
+    maps to a higher fraction, but the ceiling is fixed and the result is
+    comparable across different queries/result sets.
+    """
+    try:
+        r = float(raw_score)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(r) or r <= 0.0:
+        return 0.0
+    return 1.0 / (1.0 + math.exp(-r / _BM25_SATURATION_SCALE))
+
 
 class RetrievalService:
     def __init__(
@@ -64,6 +103,72 @@ class RetrievalService:
             return max(0.0, min(1.0, 1.0 - d))
         except Exception:
             return 0.0
+        
+    # ------------------------------------------------------------------
+    # BM25 lexical search 
+    # ------------------------------------------------------------------
+
+    def _bm25_search(
+            self,
+            *,
+            query: str,
+            top_k: int,
+            where: dict | None = None,
+            collection_name: str | None = None,
+        ) -> list[dict]:
+            raw = self.repo.get_documents_for_bm25(where=where, collection_name=collection_name)
+            ids       = raw["ids"]
+            docs      = raw["documents"]
+            metadatas = raw["metadatas"]
+
+            if not ids:
+                return []
+
+            tokenized_corpus = []
+            valid_idx = []
+            for i, doc in enumerate(docs):
+                tokens = [t for t in _segment_vi(str(doc or "")) if len(t) > 1]
+                if tokens:
+                    tokenized_corpus.append(tokens)
+                    valid_idx.append(i)
+
+            if not tokenized_corpus:
+                return []
+
+            bm25 = BM25Okapi(tokenized_corpus)
+            query_tokens = [t for t in _segment_vi(query) if len(t) > 1]
+            if not query_tokens:
+                return []
+
+            scores = bm25.get_scores(query_tokens)
+            scored = [(float(scores[j]), valid_idx[j]) for j in range(len(valid_idx))]
+            scored = [s for s in scored if s[0] > 0.0]
+            scored.sort(key=lambda x: x[0], reverse=True)
+            scored = scored[:top_k]
+
+            if not scored:
+                return []
+
+            # NOTE: `distance` here is only used by RRF ranking via _fuse(),
+            # which only cares about rank order — not the absolute magnitude.
+            # We still derive it from a batch-relative normalisation because
+            # that's fine for *ranking* purposes. The user-facing keyword
+            # score (see `_keyword_absolute_score` in registry items) is
+            # computed separately from `_bm25_raw` using a batch-independent
+            # saturation function, so the UI % is not affected by this.
+            max_score = scored[0][0] or 1.0
+            results = []
+            for raw_score, idx in scored:
+                norm_sim = raw_score / max_score
+                distance = max(0.0, 1.0 - norm_sim)
+                results.append({
+                    "chunk_id":      ids[idx],
+                    "document_text": docs[idx],
+                    "metadata":      metadatas[idx] or {},
+                    "distance":      distance,
+                    "_bm25_raw":     raw_score,
+                })
+            return results
 
     # ------------------------------------------------------------------
     # RRF fusion
@@ -99,6 +204,7 @@ class RetrievalService:
                         "metadata": item["metadata"],
                         "semantic_distance": None,
                         "lexical_distance": None,
+                        "lexical_raw_score": None,
                         "sources": set(),
                     }
 
@@ -107,6 +213,7 @@ class RetrievalService:
 
                 if source == "lexical":
                     registry[cid]["lexical_distance"] = item.get("distance")
+                    registry[cid]["lexical_raw_score"] = item.get("_bm25_raw")
 
                 registry[cid]["sources"].add(source)
 
@@ -122,6 +229,7 @@ class RetrievalService:
                 "metadata": item["metadata"],
                 "semantic_distance": item.get("semantic_distance"),
                 "lexical_distance": item.get("lexical_distance"),
+                "lexical_raw_score": item.get("lexical_raw_score"),
                 "rrf_score": round(rrf, 6),
                 "sources": sorted(item["sources"]),
             })
@@ -249,6 +357,44 @@ class RetrievalService:
         return new_chunk
 
     # ------------------------------------------------------------------
+    # Absolute (batch-independent) display score
+    # ------------------------------------------------------------------
+
+    def _compute_display_score(
+        self,
+        sem: float | None,
+        lexical_raw_score: float | None,
+    ) -> tuple[float, float | None]:
+        """
+        Combine semantic similarity and keyword relevance into a single
+        absolute [0, 1] score for UI display, WITHOUT depending on the
+        other results in the current batch.
+
+        - sem: cosine similarity, already absolute (0..1).
+        - lexical_raw_score: raw BM25 score (unbounded, batch-independent
+          input), converted here via a fixed saturation function instead
+          of dividing by the batch max.
+
+        Returns (display_score, keyword_absolute_score).
+        """
+        sem_val = sem if sem is not None else 0.0
+        kw_abs = (
+            _bm25_raw_to_absolute_score(lexical_raw_score)
+            if lexical_raw_score is not None
+            else None
+        )
+        kw_val = kw_abs if kw_abs is not None else 0.0
+
+        if sem is None and kw_abs is None:
+            return 0.0, None
+
+        display = (
+            _DISPLAY_ALPHA_SEMANTIC * sem_val
+            + (1.0 - _DISPLAY_ALPHA_SEMANTIC) * kw_val
+        )
+        return round(min(1.0, max(0.0, display)), 6), kw_abs
+
+    # ------------------------------------------------------------------
     # Main retrieve
     # ------------------------------------------------------------------
 
@@ -276,7 +422,9 @@ class RetrievalService:
             return self._retrieve_from_collection(
                 query=query, user=user, top_k=top_k,
                 collection_name=GMAIL_CHROMA_COLLECTION,
-                extra_where={"user_id": {"$eq": user_id}} if user_id else None,  # ← $eq operator
+                extra_where={"user_id": {"$eq": user_id}} if user_id else None,
+                semantic_candidates=40,
+                lexical_candidates=40,
             )
         elif chat_mode == "all":
             rag_results = self._retrieve_main(query=query, user=user, top_k=top_k, oui_ids=oui_ids)
@@ -292,6 +440,80 @@ class RetrievalService:
             return self._retrieve_main(
                 query=query, user=user, top_k=top_k, mode=mode, oui_ids=oui_ids
             )
+            
+            
+    def _retrieve_from_collection(
+        self,
+        *,
+        query: str,
+        user=None,
+        top_k: int = 5,
+        collection_name: str,
+        extra_where: dict | None = None,
+        mode: str = "hybrid",
+        semantic_candidates: int | None = None,
+        lexical_candidates: int | None = None,
+    ) -> list[dict]:
+        """
+        Retrieve từ 1 collection Chroma tuỳ ý (vd gmail_chunks).
+        Không qua FGA document permission — chỉ filter theo extra_where
+        (vd user_id) để đảm bảo user chỉ thấy dữ liệu của chính họ.
+        """
+        where = extra_where
+        sem_k = semantic_candidates or self.semantic_candidates
+        lex_k = lexical_candidates or self.lexical_candidates
+
+        semantic_list: list[dict] = []
+        lexical_list: list[dict] = []
+
+        if mode in ("semantic", "hybrid"):
+            emb = embedding_service.embed(query)
+            raw = self.repo.query_by_embedding(
+                embedding=emb, top_k=sem_k, where=where,
+                collection_name=collection_name,
+            )
+            semantic_list = self._parse_chroma(raw)
+
+        if mode in ("keyword", "hybrid"):
+            lexical_list = self._bm25_search(
+                query=query, top_k=lex_k, where=where,
+                collection_name=collection_name,
+            )
+            
+        if not semantic_list and not lexical_list:
+            return []
+
+        fused = self._fuse(semantic_list, lexical_list) if mode == "hybrid" else (
+            sorted([{**i, "rrf_score": self._cosine_sim(i.get("distance")), "sources": ["semantic"]}
+                    for i in semantic_list], key=lambda x: x["rrf_score"], reverse=True)
+            if mode == "semantic" else
+            sorted([{**i, "rrf_score": max(0.0, 1.0 - float(i.get("distance") or 1.0)), "sources": ["lexical"]}
+                    for i in lexical_list], key=lambda x: x["rrf_score"], reverse=True)
+        )
+
+        # NOTE: RRF score (rrf_score) is only used to ORDER `fused` (already
+        # sorted above). It is intentionally NOT used to compute the
+        # user-facing `score` below — that comes from an absolute,
+        # batch-independent combination of semantic + keyword scores.
+        results = []
+        for item in fused:
+            sem = self._cosine_sim(item.get("semantic_distance")) if item.get("semantic_distance") is not None else None
+            lexical_raw = item.get("lexical_raw_score")
+            display_score, kw_abs = self._compute_display_score(sem, lexical_raw)
+            if display_score < self.minimum_score:
+                continue
+            results.append({
+                "chunk_id": item["chunk_id"],
+                "document_text": item["document_text"],
+                "metadata": item["metadata"] or {},
+                "score": display_score,
+                "semantic_score": round(sem, 6) if sem is not None else None,
+                "keyword_score": round(kw_abs, 6) if kw_abs is not None else None,
+                "sources": item.get("sources", []),
+            })
+
+        return results[:top_k]
+    
 
     def _retrieve_main(
         self,
@@ -321,12 +543,13 @@ class RetrievalService:
             )
             semantic_list = self._parse_chroma(raw)
             
-            logger.warning("========== TOP SEMANTIC ==========")
+            print("========== TOP SEMANTIC ==========")
+            logger.info("========== TOP SEMANTIC ==========")
 
             for idx, r in enumerate(semantic_list[:5], start=1):
                 md = r.get("metadata", {})
 
-                logger.warning(
+                print(
                     "[SEM %d] distance=%.6f heading=%s chunk=%s",
                     idx,
                     float(r.get("distance") or 999),
@@ -334,24 +557,24 @@ class RetrievalService:
                     r.get("chunk_id"),
                 )
 
-                logger.warning(
+                print(
                     "[SEM %d TEXT] %s",
                     idx,
-                    (r.get("document_text") or "")[:300],
+                    (r.get("document_text") or ""),
                 )
 
         if mode in ("keyword", "hybrid"):
-            raw = self.repo.query_by_keyword(
+            lexical_list = self._bm25_search(
                 query=query, top_k=self.lexical_candidates, where=where,
             )
-            lexical_list = self._parse_chroma(raw)
             
-            logger.warning("========== TOP LEXICAL ==========")
+            print("========== TOP LEXICAL ==========")
+            logger.info("========== TOP LEXICAL ==========")
 
             for idx, r in enumerate(lexical_list[:5], start=1):
                 md = r.get("metadata", {})
 
-                logger.warning(
+                print(
                     "[LEX %d] distance=%.6f heading=%s chunk=%s",
                     idx,
                     float(r.get("distance") or 999),
@@ -359,7 +582,7 @@ class RetrievalService:
                     r.get("chunk_id"),
                 )
 
-                logger.warning(
+                print(
                     "[LEX %d TEXT] %s",
                     idx,
                     (r.get("document_text") or "")[:300],
@@ -376,12 +599,13 @@ class RetrievalService:
                     for i in lexical_list], key=lambda x: x["rrf_score"], reverse=True)
         )
         
-        logger.warning("========== TOP FUSED ==========")
+        print("========== TOP FUSED ==========")
+        logger.info("========== TOP FUSED ==========")
 
         for idx, r in enumerate(fused[:10], start=1):
             md = r.get("metadata", {})
 
-            logger.warning(
+            print(
                 "[FUSED %d] rrf=%.6f heading=%s sources=%s",
                 idx,
                 r.get("rrf_score"),
@@ -389,22 +613,27 @@ class RetrievalService:
                 r.get("sources"),
             )
 
-        max_rrf = fused[0]["rrf_score"] if fused else 0.0
-
+        # NOTE: RRF score (rrf_score) is only used to ORDER `fused` (already
+        # sorted above). It is intentionally NOT used to compute the
+        # user-facing `score` below — that comes from an absolute,
+        # batch-independent combination of semantic + keyword scores.
+        # This is what fixes the "always one source at 100%" issue: the
+        # top-ranked chunk no longer automatically gets score = 1.0 just
+        # because it happened to rank first within THIS query's batch.
         results = []
         for item in fused:
             sem = self._cosine_sim(item.get("semantic_distance")) if item.get("semantic_distance") is not None else None
-            kw = max(0.0, min(1.0, 1.0 - float(item["lexical_distance"]))) if item.get("lexical_distance") is not None else None
-            score = round(item["rrf_score"] / max_rrf, 6) if max_rrf else 0.0
-            if score < self.minimum_score:
+            lexical_raw = item.get("lexical_raw_score")
+            display_score, kw_abs = self._compute_display_score(sem, lexical_raw)
+            if display_score < self.minimum_score:
                 continue
             results.append({
                 "chunk_id": item["chunk_id"],
                 "document_text": item["document_text"],
                 "metadata": item["metadata"] or {},
-                "score": round(score, 6),
+                "score": display_score,
                 "semantic_score": round(sem, 6) if sem is not None else None,
-                "keyword_score": round(kw, 6) if kw is not None else None,
+                "keyword_score": round(kw_abs, 6) if kw_abs is not None else None,
                 "sources": item.get("sources", []),
             })
 

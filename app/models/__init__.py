@@ -12,6 +12,7 @@ from app.models.org_unit import OrgUnit
 from app.models.org_unit_instance import OrgUnitInstance
 from app.models.outbox_event import OutboxEvent
 from app.models.policy_snapshot import DocumentPolicySnapshot
+from app.models.policy_domain import PolicyDomain, DomainEntityType, DomainRule
 from app.models.position import Position
 from app.models.storage_object import StorageObject
 from app.models.trace import Trace
@@ -19,8 +20,10 @@ from app.models.user import User
 from app.models.user_oui_position import UserOuiPosition
 
 __all__ = [
-    "AuditLog", "ChunkEmbedding", "Conversation", 
+    "AuditLog", "ChunkEmbedding", "Conversation",
     "Document", "DocumentChunk", "DocumentVersion", "Job", "JobStep",
     "Message", "MessageSource", "OrgUnit", "OrgUnitInstance",
-    "OutboxEvent", "DocumentPolicySnapshot", "Position", "StorageObject", "Trace", "User", "UserOuiPosition",
+    "OutboxEvent", "DocumentPolicySnapshot",
+    "PolicyDomain", "DomainEntityType", "DomainRule",
+    "Position", "StorageObject", "Trace", "User", "UserOuiPosition",
 ]

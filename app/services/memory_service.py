@@ -40,7 +40,7 @@ RECENT_PAIRS    = 3    # số cặp Q&A gần nhất giữ nguyên
 RELEVANT_PAIRS  = 3    # số cặp Q&A liên quan nhất
 SUMMARY_UPDATE_EVERY = 6   # update summary sau mỗi N cặp Q&A mới
 MAX_SUMMARY_TOKENS   = 150 # LLM prompt token limit cho summary
-DONE_STATUSES = {"success", "fallback", "no_answer", "llm_error"}
+DONE_STATUSES = {"success", "fallback", "no_answer", "llm_error", "blocked"}
 # ──────────────────────────────────────────────────────────────────────────
 
 

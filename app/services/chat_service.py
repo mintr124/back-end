@@ -40,10 +40,15 @@ from app.services.audit_service import audit_service
 from app.services.llm_service import llm_service
 from app.services.memory_service import memory_service
 from app.services.guard_service import guard_service        # ← NEW
+from app.services.intent_classifier import intent_classifier
+from app.services.policy_agent import policy_contract_agent
 from app.utils.status_answer import is_no_answer
 from app.core.config import settings
+from app.repositories.system_setting_repository import system_setting_repository
 
 GUARDS_ENABLED = False
+POLICY_ENABLED = True  # Set True to enable policy enforcement
+DONE_STATUSES = {"success", "fallback", "no_answer", "llm_error", "blocked"}
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +79,7 @@ class ChatService:
         self.msg_sources = MessageSourceRepository()
 
     # ------------------------------------------------------------------
-    # Helpers (giữ nguyên từ v2)
+    # Helpers 
     # ------------------------------------------------------------------
 
     def create_conversation(self, db: Session, user, title: str | None) -> Conversation:
@@ -96,18 +101,23 @@ class ChatService:
         except Exception:
             return None
 
-    def _normalize_retrieved(self, retrieved: list[dict], limit: int = 5) -> list[dict]:
+    def _normalize_retrieved(
+        self, retrieved: list[dict], limit: int = 5, min_score: float = 0.0
+    ) -> list[dict]:
         cleaned: list[dict] = []
         for r in retrieved or []:
             doc_text = (r.get("document_text") or "").strip()
             if not doc_text:
+                continue
+            score = self._safe_score(r)
+            if min_score > 0.0 and score is not None and score < min_score:
                 continue
             md = r.get("metadata") or {}
             cleaned.append({
                 "chunk_id":       r.get("chunk_id"),
                 "document_text":  doc_text,
                 "metadata":       md,
-                "score":          self._safe_score(r),
+                "score":          score,
                 "semantic_score": r.get("semantic_score"),
                 "keyword_score":  r.get("keyword_score"),
                 "distance":       r.get("distance"),
@@ -156,6 +166,65 @@ class ChatService:
             )
             self.msg_sources.create(db, src)
 
+    def _apply_policy_contracts(
+        self,
+        db: Session,
+        chunks: list[dict],
+        user,
+        raw_query: str,
+        intent_class: str,
+    ) -> tuple[list[dict], list[dict]]:
+        """
+        Run policy-contract agent per chunk.
+        Returns (approved_chunks, contracts).
+        DENY   → chunk removed
+        REDACT → chunk text replaced with policy notice
+        ALLOW / ALLOW_WITH_WATERMARK → pass through
+        """
+        approved: list[dict] = []
+        contracts: list[dict] = []
+
+        declared_sensitivity = 2  # default Internal; overridden per-chunk from metadata
+
+        for chunk in chunks:
+            md = chunk.get("metadata") or {}
+            chunk_id = chunk.get("chunk_id") or "unknown"
+            chunk_text = chunk.get("document_text") or ""
+            chunk_sensitivity = int(md.get("sensitivity") or declared_sensitivity)
+
+            try:
+                contract = policy_contract_agent.generate_contract(
+                    chunk_id=chunk_id,
+                    chunk_text=chunk_text,
+                    chunk_metadata=md,
+                    declared_sensitivity=chunk_sensitivity,
+                    user_role=getattr(user, "role", "Employee"),
+                    user_level=getattr(user, "clearance_level", 1),
+                    user_department=getattr(user, "department", ""),
+                    user_id=user.id,
+                    intent_class=intent_class,
+                    raw_query=raw_query,
+                    db=db,
+                )
+                contracts.append(contract)
+
+                decision = contract.get("decision", "ALLOW")
+                if decision == "DENY":
+                    logger.info("Policy DENY chunk=%s domain=%s", chunk_id, contract.get("domains"))
+                    continue
+                elif decision == "REDACT":
+                    chunk = dict(chunk)
+                    chunk["document_text"] = "[Nội dung này đã được ẩn theo chính sách phân quyền.]"
+                    logger.info("Policy REDACT chunk=%s", chunk_id)
+                # ALLOW / ALLOW_WITH_WATERMARK → pass through
+
+                approved.append(chunk)
+            except Exception as exc:
+                logger.warning("Policy contract failed chunk=%s: %s", chunk_id, exc)
+                approved.append(chunk)  # fail-open: pass through on error
+
+        return approved, contracts
+
     def _update_summary_background(self, conversation_id: str) -> None:
         try:
             with SessionLocal() as db:
@@ -163,6 +232,43 @@ class ChatService:
                 db.commit()
         except Exception:
             logger.exception("Background summary update failed conv_id=%s", conversation_id)
+            
+    def _extract_cited_indices(self, answer_text: str) -> set[int]:
+        """Lấy các số N từ các marker [N] xuất hiện trong câu trả lời của LLM."""
+        if not answer_text:
+            return set()
+        found = re.findall(r"\[(\d+)\]", answer_text)
+        return {int(n) for n in found}
+
+    def _build_sources_from_retrieved(self, retrieved: list[dict], answer_text: str | None = None) -> list[dict]:
+        cited = self._extract_cited_indices(answer_text) if answer_text else None
+        no_citations = cited is not None and not cited
+
+        sources: list[dict] = []
+        seen_docs: set[str] = set()
+        for r in retrieved or []:
+            md = r.get("metadata", {}) or {}
+            doc_id = md.get("document_id")
+
+            if no_citations:
+                # LLM answered but cited nothing (e.g. all chunks redacted):
+                # deduplicate by document — one entry per document is enough
+                if doc_id in seen_docs:
+                    continue
+                seen_docs.add(doc_id)
+            # When LLM cited specific sources, keep ALL chunks in original order
+            # so that [n] in the answer text maps correctly to source n in the panel.
+            # Do NOT filter by cited indices — filtering shifts indices and breaks mapping.
+
+            sources.append({
+                "documentId":    doc_id,
+                "documentTitle": md.get("document_title") or doc_id,
+                "versionId":     md.get("document_version_id"),
+                "sectionPath":   md.get("section_heading"),
+                "relevance":     r.get("score") if r.get("score") is not None else r.get("relevance"),
+                "excerpt":       r.get("document_text") or md.get("excerpt"),
+            })
+        return sources
 
     # ------------------------------------------------------------------
     # Guard helpers
@@ -185,6 +291,7 @@ class ChatService:
             content=block_text,
             status="blocked",
             trace_id=tid,
+            parent_message_id=user_msg.id,
         )
         self.msgs.create(db, assistant_msg)
         db.flush()
@@ -260,13 +367,24 @@ class ChatService:
             effective_query = content
 
         # ── Retrieval ─────────────────────────────────────────────────
-        retrieved_raw = retrieval_service.retrieve(query=effective_query, user=user, top_k=5)
-        retrieved     = self._normalize_retrieved(retrieved_raw, limit=5)
+        _top_k   = int(system_setting_repository.get(db, "rag.top_k") or 5)
+        _min_score = float(system_setting_repository.get(db, "rag.similarity_threshold") or 0.0)
+        retrieved_raw = retrieval_service.retrieve(query=effective_query, user=user, top_k=_top_k)
+        retrieved     = self._normalize_retrieved(retrieved_raw, limit=_top_k, min_score=_min_score)
 
         # ── [GUARD 2] PII scan trên retrieved chunks ───────────────────
         logger.info("USER ROLE: %s USER ID: %s", getattr(user, "role", None), getattr(user, "id", None))
         if GUARDS_ENABLED:
             retrieved = guard_service.scan_chunks(retrieved, user=user)
+
+        # ── [POLICY] Policy-contract enforcement ──────────────────────
+        policy_contracts: list[dict] = []
+        if POLICY_ENABLED and retrieved:
+            query_intent = intent_classifier.classify(effective_query)
+            retrieved, policy_contracts = self._apply_policy_contracts(
+                db, retrieved, user, effective_query, query_intent
+            )
+            logger.info("Policy: intent=%s approved=%d/%d", query_intent, len(retrieved), len(retrieved_raw))
 
         history = self._load_history(db, conversation_id, effective_query)
 
@@ -294,7 +412,7 @@ class ChatService:
                 if llm_text and llm_text.strip():
                     answer_text = llm_text.strip()
                 assistant_status = "no_answer" if is_no_answer(answer_text) else "success"
-                sources = self._build_sources_from_retrieved(retrieved) if assistant_status == "success" else []
+                sources = self._build_sources_from_retrieved(retrieved, answer_text) if assistant_status == "success" else []
             except Exception:
                 logger.exception("LLM generation failed trace_id=%s", tid)
                 answer_text = None
@@ -304,7 +422,7 @@ class ChatService:
             answer_text, sources = answer_service.generate(user_input=effective_query, retrieved=retrieved)
             assistant_status = "fallback"
             if not sources:
-                sources = self._build_sources_from_retrieved(retrieved)
+                sources = self._build_sources_from_retrieved(retrieved, answer_text)
 
         # ── [GUARD 3] PII + Secret scan trên LLM response ─────────────
         if GUARDS_ENABLED and answer_text:
@@ -329,6 +447,7 @@ class ChatService:
             content=answer_text,
             status=assistant_status,
             trace_id=tid,
+            parent_message_id=user_msg.id,
         )
         self.msgs.create(db, assistant_msg)
         db.flush()
@@ -370,53 +489,69 @@ class ChatService:
     # ------------------------------------------------------------------
 
     def list_messages_flat(self, db: Session, conversation_id: str, limit: int = 1000) -> list[dict]:
-        msgs = self.msgs.list_by_conversation(db, conversation_id, limit=limit)
-        out: list[dict] = []
-        i = 0
-        while i < len(msgs):
-            m = msgs[i]
-            if m.role == "user":
-                user_msg      = m
-                assistant_msg = None
-                if i + 1 < len(msgs) and msgs[i + 1].role == "assistant":
-                    assistant_msg = msgs[i + 1]
-                    i += 2
-                else:
-                    i += 1
+        from app.models.message import Message as MsgModel
 
-                item = {
-                    "conversationId": conversation_id,
-                    "messageId":      user_msg.id,
-                    "content":        user_msg.content,
-                    "createdAt":      user_msg.created_at,
-                    "assistantMessage": None,
-                    "traceId":        None,
-                    "sources":        [],
-                }
-                if assistant_msg:
-                    srcs = self.msg_sources.list_by_message(db, assistant_msg.id)
-                    item["assistantMessage"] = {
-                        "id":        assistant_msg.id,
-                        "content":   assistant_msg.content,
-                        "status":    assistant_msg.status,
-                        "createdAt": assistant_msg.created_at,
+        user_msgs = (
+            db.query(MsgModel)
+            .filter(
+                MsgModel.conversation_id == conversation_id,
+                MsgModel.role == "user",
+            )
+            .order_by(MsgModel.created_at.asc())
+            .limit(limit)
+            .all()
+        )
+
+        assistant_msgs_raw = (
+            db.query(MsgModel)
+            .filter(
+                MsgModel.conversation_id == conversation_id,
+                MsgModel.role == "assistant",
+                MsgModel.status.in_(DONE_STATUSES),
+                MsgModel.content.isnot(None),
+                MsgModel.content != "",
+            )
+            .order_by(MsgModel.created_at.asc())
+            .all()
+        )
+
+        # Dùng parent_message_id làm khóa nối, lấy cái mới nhất nếu retry
+        assistant_by_parent: dict[str, MsgModel] = {}
+        for a in assistant_msgs_raw:
+            if a.parent_message_id:
+                assistant_by_parent[a.parent_message_id] = a
+
+        out = []
+        for user_msg in user_msgs:
+            assistant_msg = assistant_by_parent.get(user_msg.id)
+            srcs = self.msg_sources.list_by_message(db, assistant_msg.id) if assistant_msg else []
+
+            out.append({
+                "conversationId": conversation_id,
+                "messageId": user_msg.id,
+                "content": user_msg.content,
+                "createdAt": user_msg.created_at,
+                "traceId": (assistant_msg.trace_id if assistant_msg else None) or user_msg.trace_id,
+                "assistantMessage": {
+                    "id": assistant_msg.id,
+                    "content": assistant_msg.content,
+                    "status": assistant_msg.status,
+                    "createdAt": assistant_msg.created_at,
+                } if assistant_msg else None,
+                "sources": [
+                    {
+                        "documentId": s.document_id,
+                        "documentTitle": s.document_title,
+                        "versionId": s.version_id,
+                        "sectionPath": s.section_path,
+                        "relevance": s.relevance,
+                        "excerpt": s.excerpt,
+                        "surroundingContext": s.surrounding_context,
                     }
-                    item["traceId"] = assistant_msg.trace_id or user_msg.trace_id
-                    item["sources"] = [
-                        {
-                            "documentId":         s.document_id,
-                            "documentTitle":      s.document_title,
-                            "versionId":          s.version_id,
-                            "sectionPath":        s.section_path,
-                            "relevance":          s.relevance,
-                            "excerpt":            s.excerpt,
-                            "surroundingContext": s.surrounding_context,
-                        }
-                        for s in (srcs or [])
-                    ]
-                out.append(item)
-            else:
-                i += 1
+                    for s in (srcs or [])
+                ],
+            })
+
         return out
 
     # ------------------------------------------------------------------
@@ -477,6 +612,7 @@ class ChatService:
                     content=block_text,
                     status="blocked",
                     trace_id=tid,
+                    parent_message_id=user_msg.id,
                 )
                 self.msgs.create(db, assistant_msg)
                 db.flush()
@@ -518,6 +654,7 @@ class ChatService:
             content="",
             status="streaming",
             trace_id=tid,
+            parent_message_id=user_msg.id,
         )
         self.msgs.create(db, assistant_msg)
         db.flush()
@@ -570,22 +707,37 @@ class ChatService:
 
         # ── RAG MODE ──────────────────────────────────────────────────
         else:
-            retrieved_raw = retrieval_service.retrieve(
-                query=effective_query,
-                user=user,
-                top_k=5,
-                oui_ids=oui_ids,    
-                chat_mode=chat_source,
-            )
+            _top_k     = int(system_setting_repository.get(db, "rag.top_k") or 5)
+            _min_score = float(system_setting_repository.get(db, "rag.similarity_threshold") or 0.0)
+            try:
+                retrieved_raw = retrieval_service.retrieve(
+                    query=effective_query,
+                    user=user,
+                    top_k=_top_k,
+                    oui_ids=oui_ids,
+                    chat_mode=chat_source,
+                )
+            except Exception:
+                logger.exception("Retrieval failed trace_id=%s chat_source=%s", tid, chat_source)
+                retrieved_raw = []
+
             logger.info("STREAM RETRIEVED COUNT: %d", len(retrieved_raw))
 
-            retrieved = self._normalize_retrieved(retrieved_raw, limit=5)
+            retrieved = self._normalize_retrieved(retrieved_raw, limit=_top_k, min_score=_min_score)
 
             # ── [GUARD 2] PII scan chunks ──────────────────────────────
             logger.info("Guard2 stream: user_role=%s user_id=%s",
             getattr(user, "role", None), getattr(user, "id", None))
             if GUARDS_ENABLED:
                 retrieved = guard_service.scan_chunks(retrieved, user=user)
+
+            # ── [POLICY] Policy-contract enforcement ──────────────────
+            if POLICY_ENABLED and retrieved:
+                query_intent = intent_classifier.classify(effective_query)
+                retrieved, _ = self._apply_policy_contracts(
+                    db, retrieved, user, effective_query, query_intent
+                )
+                logger.info("Policy stream: intent=%s approved=%d", query_intent, len(retrieved))
 
             history = self._load_history(db, conversation_id, effective_query)
 
@@ -617,7 +769,7 @@ class ChatService:
             if not full_text:
                 full_text, _ = answer_service.generate(user_input=effective_query, retrieved=retrieved)
 
-            sources = self._build_sources_from_retrieved(retrieved)
+            sources = self._build_sources_from_retrieved(retrieved, full_text)
 
         # ── [GUARD 3] PII + Secret scan trên response (stream) ─────────
         if GUARDS_ENABLED and full_text:

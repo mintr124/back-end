@@ -2,6 +2,8 @@ from fastapi import APIRouter, Depends, Request, HTTPException
 from sqlalchemy.orm import Session
 from fastapi.responses import StreamingResponse
 import json as jsonlib
+import logging
+logger = logging.getLogger(__name__)
 
 from app.core.deps import get_current_user, get_db
 from app.schemas.chat import (
@@ -124,28 +126,34 @@ def post_message_stream(
     conversation_id: str,
     payload: MessageCreateRequest,
     request: Request,
-    db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    repo = ConversationRepository()
-    conv = repo.get(db, conversation_id)
-    if not conv:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    if conv.status != "open":
-        raise HTTPException(status_code=404, detail="Conversation not found")
+    from app.db.session import SessionLocal
+    db_check = SessionLocal()
+    try:
+        repo = ConversationRepository()
+        conv = repo.get(db_check, conversation_id)
+        if not conv or conv.status != "open":
+            raise HTTPException(status_code=404, detail="Conversation not found")
+    finally:
+        db_check.close()
 
     def generate():
-        for event in chat_service.post_message_stream(
-            db, current_user, conversation_id,
-            payload.content, payload.clientMessageId,
-            request.state.trace_id,
-            oui_ids=payload.oui_ids,
-            mode=payload.mode,
-            chat_source=payload.chat_source,
-            file_content=payload.file_content,
-            file_name=payload.file_name,
-        ):
-            yield f"data: {jsonlib.dumps(event)}\n\n"
+        stream_db = SessionLocal()
+        try:
+            for event in chat_service.post_message_stream(
+                stream_db, current_user, conversation_id,
+                payload.content, payload.clientMessageId,
+                request.state.trace_id,
+                oui_ids=payload.oui_ids,
+                mode=payload.mode,
+                chat_source=payload.chat_source,
+                file_content=payload.file_content,
+                file_name=payload.file_name,
+            ):
+                yield f"data: {jsonlib.dumps(event)}\n\n"
+        finally:
+            stream_db.close()
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
@@ -166,3 +174,38 @@ def search_documents(
         query=query, user=current_user, top_k=top_k, mode=mode
     )
     return results
+
+
+@router.post("/conversations/{conversation_id}/generate-title")
+def generate_title(
+    conversation_id: str,
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.llm_service import llm_service
+
+    first_message = (payload.get("first_message") or "").strip()
+    if not first_message:
+        return {"title": "Cuộc trò chuyện"}
+
+    try:
+        title, _, _ = llm_service.generate(
+            prompt=f'Tạo tiêu đề ngắn gọn (tối đa 6 từ, không dấu ngoặc kép) cho cuộc trò chuyện bắt đầu bằng câu hỏi sau:\n"{first_message}"\n\nChỉ trả về tiêu đề, không giải thích thêm.',
+            system="Bạn là trợ lý tạo tiêu đề ngắn gọn. Chỉ trả về tiêu đề, không có gì khác.",
+            max_tokens=30,
+            temperature=0.3,
+            fallback_to_ollama=False,
+        )
+        title = (title or "").strip().strip('"').strip("'")
+        if not title:
+            title = first_message[:40]
+    except Exception:
+        logger.exception("generate_title failed conv_id=%s", conversation_id)
+        title = first_message[:40]
+
+    repo = ConversationRepository()
+    repo.update_title(db, conversation_id, title)
+    db.commit()
+
+    return {"title": title}

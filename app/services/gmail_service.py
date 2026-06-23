@@ -5,6 +5,7 @@ import logging
 import os
 import pickle
 from typing import Optional
+import re as _re_html
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -103,6 +104,25 @@ class GmailService:
 
     def _build_service(self, creds: Credentials):
         return build("gmail", "v1", credentials=creds)
+    
+    def _strip_html(html: str) -> str:
+        """Loại bỏ tag HTML, style/script block, và whitespace dư thừa."""
+        if not html:
+            return ""
+        # Xóa toàn bộ <style>...</style> và <script>...</script> (kể cả nội dung CSS/JS bên trong)
+        html = _re_html.sub(r"<(style|script)[^>]*>.*?</\1>", "", html, flags=_re_html.DOTALL | _re_html.IGNORECASE)
+        # Xóa comment HTML (<!--...-->) — chứa rác như "Leave Spaces 1019 characters for iOS Buffering"
+        html = _re_html.sub(r"<!--.*?-->", "", html, flags=_re_html.DOTALL)
+        # Xóa toàn bộ tag còn lại
+        html = _re_html.sub(r"<[^>]+>", " ", html)
+        # Decode 1 số HTML entity phổ biến
+        html = (html.replace("&nbsp;", " ").replace("&amp;", "&")
+                    .replace("&lt;", "<").replace("&gt;", ">")
+                    .replace("&quot;", '"').replace("&#39;", "'"))
+        # Gộp nhiều khoảng trắng/newline liên tiếp
+        html = _re_html.sub(r"[ \t]+", " ", html)
+        html = _re_html.sub(r"\n{3,}", "\n\n", html)
+        return html.strip()
 
     def _get_body(self, payload: dict) -> str:
         def extract(parts):
