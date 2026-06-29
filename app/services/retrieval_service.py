@@ -543,50 +543,50 @@ class RetrievalService:
             )
             semantic_list = self._parse_chroma(raw)
             
-            print("========== TOP SEMANTIC ==========")
-            logger.info("========== TOP SEMANTIC ==========")
+            # print("========== TOP SEMANTIC ==========")
+            # logger.info("========== TOP SEMANTIC ==========")
 
             for idx, r in enumerate(semantic_list[:5], start=1):
                 md = r.get("metadata", {})
 
-                print(
-                    "[SEM %d] distance=%.6f heading=%s chunk=%s",
-                    idx,
-                    float(r.get("distance") or 999),
-                    md.get("section_heading"),
-                    r.get("chunk_id"),
-                )
+                # print(
+                #     "[SEM %d] distance=%.6f heading=%s chunk=%s",
+                #     idx,
+                #     float(r.get("distance") or 999),
+                #     md.get("section_heading"),
+                #     r.get("chunk_id"),
+                # )
 
-                print(
-                    "[SEM %d TEXT] %s",
-                    idx,
-                    (r.get("document_text") or ""),
-                )
+                # print(
+                #     "[SEM %d TEXT] %s",
+                #     idx,
+                #     (r.get("document_text") or ""),
+                # )
 
         if mode in ("keyword", "hybrid"):
             lexical_list = self._bm25_search(
                 query=query, top_k=self.lexical_candidates, where=where,
             )
             
-            print("========== TOP LEXICAL ==========")
-            logger.info("========== TOP LEXICAL ==========")
+            # print("========== TOP LEXICAL ==========")
+            # logger.info("========== TOP LEXICAL ==========")
 
             for idx, r in enumerate(lexical_list[:5], start=1):
                 md = r.get("metadata", {})
 
-                print(
-                    "[LEX %d] distance=%.6f heading=%s chunk=%s",
-                    idx,
-                    float(r.get("distance") or 999),
-                    md.get("section_heading"),
-                    r.get("chunk_id"),
-                )
+                # print(
+                #     "[LEX %d] distance=%.6f heading=%s chunk=%s",
+                #     idx,
+                #     float(r.get("distance") or 999),
+                #     md.get("section_heading"),
+                #     r.get("chunk_id"),
+                # )
 
-                print(
-                    "[LEX %d TEXT] %s",
-                    idx,
-                    (r.get("document_text") or "")[:300],
-                )
+                # print(
+                #     "[LEX %d TEXT] %s",
+                #     idx,
+                #     (r.get("document_text") or "")[:300],
+                # )
 
         if not semantic_list and not lexical_list:
             return []
@@ -599,19 +599,19 @@ class RetrievalService:
                     for i in lexical_list], key=lambda x: x["rrf_score"], reverse=True)
         )
         
-        print("========== TOP FUSED ==========")
-        logger.info("========== TOP FUSED ==========")
+        # print("========== TOP FUSED ==========")
+        # logger.info("========== TOP FUSED ==========")
 
         for idx, r in enumerate(fused[:10], start=1):
             md = r.get("metadata", {})
 
-            print(
-                "[FUSED %d] rrf=%.6f heading=%s sources=%s",
-                idx,
-                r.get("rrf_score"),
-                md.get("section_heading"),
-                r.get("sources"),
-            )
+            # print(
+            #     "[FUSED %d] rrf=%.6f heading=%s sources=%s",
+            #     idx,
+            #     r.get("rrf_score"),
+            #     md.get("section_heading"),
+            #     r.get("sources"),
+            # )
 
         # NOTE: RRF score (rrf_score) is only used to ORDER `fused` (already
         # sorted above). It is intentionally NOT used to compute the

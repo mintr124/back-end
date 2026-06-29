@@ -107,12 +107,14 @@ YÊU CẦU TRẢ LỜI
 - Chỉ dùng thông tin có trong ngữ cảnh, không đoán.
 - Không nhắc đến quá trình suy luận, không bịa thêm chi tiết.
 - Lịch sử hội thoại chỉ dùng để hiểu đại từ/tham chiếu, không phải chủ đề để trả lời.
-- Dùng danh sách hoặc bảng nếu nội dung có nhiều mục cần liệt kê.
-- BẮT BUỘC: sau mỗi câu/đoạn lấy thông tin từ ngữ cảnh, chèn số thứ tự Context tương ứng dạng [N] (ví dụ [1], [2][3]). Chỉ cite Context thực sự dùng để trả lời, không cite tất cả.
+- Nếu ngữ cảnh chứa bảng markdown (dòng bắt đầu và kết thúc bằng ký tự |), BẮT BUỘC trình bày dữ liệu đó dưới dạng bảng markdown trong câu trả lời. Không được chuyển thành danh sách hay văn xuôi.
+- Dùng danh sách khi nội dung là các bước tuần tự hoặc nhiều mục rời rạc không có cấu trúc bảng.
+- BẮT BUỘC trích dẫn (citation): mỗi Context được sử dụng để tổng hợp câu trả lời PHẢI xuất hiện ít nhất một lần dưới dạng [N] trong câu trả lời. Chèn [N] ngay sau câu/đoạn lấy thông tin từ Context N. Ví dụ: nếu dùng Context 1 và Context 2 thì phải có [1] và [2] trong câu trả lời. Không cite Context không được sử dụng.
 
 ĐỊNH DẠNG TRẢ LỜI
 - Trả lời trực tiếp trước, giải thích sau nếu cần.
 - Không bắt đầu bằng "Dựa trên ngữ cảnh..." hay các cụm mở đầu thừa.
+- Giữ nguyên hoàn toàn định dạng markdown từ ngữ cảnh: **in đậm**, *in nghiêng*, | bảng |, danh sách. Khi trích dẫn nội dung, sao chép định dạng gốc, không chuyển thành văn xuôi hay định dạng khác.
 """.strip()
 
         if extra_instructions and extra_instructions.strip():

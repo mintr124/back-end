@@ -18,6 +18,7 @@ from app.repositories.policy_repository import policy_repository
 from app.schemas.policy import (
     DomainRuleCreate,
     DomainRuleUpdate,
+    derive_action,
     EntityTypeCreate,
     PolicyDomainCreate,
     PolicyDomainUpdate,
@@ -224,10 +225,10 @@ class PolicyService:
             domain_id=domain_id,
             rule_code=data.rule_code,
             name=data.name,
-            action=data.action,
+            action=derive_action(data.contract.violation_action, data.contract.max_detail),
             priority=data.priority,
             mandatory=data.mandatory,
-            risk_level=data.risk_level,
+            risk_level="low",
             audit_log=data.audit_log,
             conditions_json=data.conditions.model_dump(),
             contract_json=data.contract.model_dump(),
@@ -242,14 +243,10 @@ class PolicyService:
         updates: dict = {}
         if data.name is not None:
             updates["name"] = data.name
-        if data.action is not None:
-            updates["action"] = data.action
         if data.priority is not None:
             updates["priority"] = data.priority
         if data.mandatory is not None:
             updates["mandatory"] = data.mandatory
-        if data.risk_level is not None:
-            updates["risk_level"] = data.risk_level
         if data.is_active is not None:
             updates["is_active"] = data.is_active
         if data.audit_log is not None:
@@ -258,6 +255,7 @@ class PolicyService:
             updates["conditions_json"] = data.conditions.model_dump()
         if data.contract is not None:
             updates["contract_json"] = data.contract.model_dump()
+            updates["action"] = derive_action(data.contract.violation_action, data.contract.max_detail)
         policy_repository.update_rule(db, rule, **updates)
         db.commit()
         return rule

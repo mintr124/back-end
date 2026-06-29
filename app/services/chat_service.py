@@ -166,6 +166,192 @@ class ChatService:
             )
             self.msg_sources.create(db, src)
 
+    def _generalize_chunk(self, chunk: dict) -> dict:
+        """Dùng LLM để khái quát hóa nội dung chunk dựa trên contract phân quyền."""
+        original = chunk.get("document_text", "")
+        if not original:
+            return chunk
+
+        contract = chunk.get("_generalize_contract", {})
+        max_detail          = (contract.get("max_detail") or "department").lower()
+        numeric_granularity = (contract.get("numeric_granularity") or "aggregated").lower()
+        allowed_entities    = contract.get("allowed_entities") or []
+        print(f"[GENERALIZE] chunk={chunk.get('chunk_id','?')[:8]} max_detail={max_detail} numeric={numeric_granularity} allowed={allowed_entities}")
+
+        # Map entity type code (tiếng Anh) → nhãn tiếng Việt để LLM nhận diện đúng
+        _ENTITY_VI = {
+            "full_name":        "họ và tên (tên người)",
+            "name":             "tên",
+            "national_id":      "số CCCD / hộ chiếu / số căn cước",
+            "phone":            "số điện thoại",
+            "email":            "địa chỉ email",
+            "address":          "địa chỉ (thường trú, tạm trú, nơi ở)",
+            "dob":              "ngày sinh / năm sinh",
+            "employee_id":      "mã nhân viên",
+            "job_title":        "chức danh / vị trí công việc",
+            "department":       "phòng ban / bộ phận",
+            "salary":           "mức lương / thu nhập",
+            "social_insurance": "số bảo hiểm xã hội",
+            "bank_account":     "tài khoản ngân hàng",
+            "company_name":     "tên công ty / tổ chức",
+            "tax_id":           "mã số thuế",
+            "contract_id":      "số hợp đồng",
+        }
+
+        _detail_desc = {
+            "company":    "ẩn thông tin chi tiết dưới cấp công ty (phòng ban, cá nhân, ...)",
+            "branch":     "ẩn thông tin chi tiết dưới cấp chi nhánh (phòng ban, cá nhân, ...)",
+            "department": "ẩn thông tin chi tiết dưới cấp phòng ban (cá nhân cụ thể, ...)",
+            "team":       "ẩn thông tin chi tiết dưới cấp nhóm/tổ",
+            "project":    "ẩn thông tin cá nhân, giữ thông tin cấp dự án",
+            "individual": "có thể giữ thông tin đến cấp cá nhân",
+        }
+        _numeric_desc = {
+            "hidden":     "ẩn hoàn toàn tất cả số liệu (lương, ngân sách, KPI, mã số, ...)",
+            "aggregated": "chỉ dùng số liệu tổng hợp/ước lượng (ví dụ: 'khoảng vài triệu')",
+            "range_only": "chỉ dùng dạng khoảng (ví dụ: '10–20 triệu')",
+            "exact":      "giữ nguyên số liệu chính xác",
+        }
+
+        detail_hint  = _detail_desc.get(max_detail, f"ẩn chi tiết vượt cấp '{max_detail}'")
+        numeric_hint = _numeric_desc.get(numeric_granularity, f"xử lý số liệu theo mức '{numeric_granularity}'")
+
+        if allowed_entities:
+            vi_labels = [_ENTITY_VI.get(e.lower(), e) for e in allowed_entities]
+            exempt_str = ", ".join(vi_labels)
+            prompt = (
+                "Bạn là agent viết lại nội dung theo chính sách phân quyền dữ liệu.\n\n"
+                "## QUY TẮC BẮT BUỘC (ưu tiên tuyệt đối)\n"
+                f"Các loại thông tin sau PHẢI GIỮ NGUYÊN giá trị thực tế, TUYỆT ĐỐI không được ẩn, "
+                f"thay thế hay khái quát hóa:\n  {exempt_str}\n\n"
+                "## QUY TẮC KHÁI QUÁT HÓA (áp dụng cho thông tin KHÔNG trong danh sách trên)\n"
+                f"- Độ chi tiết: {detail_hint}.\n"
+                f"- Số liệu: {numeric_hint}.\n\n"
+                "Chỉ trả về đoạn văn đã viết lại, không giải thích.\n\n"
+                f"Đoạn văn gốc:\n{original[:1500]}"
+            )
+        else:
+            prompt = (
+                "Bạn là agent viết lại nội dung theo chính sách phân quyền dữ liệu.\n\n"
+                "## QUY TẮC KHÁI QUÁT HÓA\n"
+                f"- Độ chi tiết: {detail_hint}.\n"
+                f"- Số liệu: {numeric_hint}.\n"
+                "- Khái quát hóa tất cả thông tin cụ thể nhạy cảm: "
+                "định danh cá nhân, số liệu tài chính, thông tin liên lạc, mã số, dữ liệu nội bộ.\n\n"
+                "Chỉ trả về đoạn văn đã viết lại, không giải thích.\n\n"
+                f"Đoạn văn gốc:\n{original[:1500]}"
+            )
+        try:
+            text, _, _ = llm_service.generate(prompt=prompt, max_tokens=1024, temperature=0.0)
+            if text and text.strip():
+                result = dict(chunk)
+                result["document_text"] = text.strip()
+                return result
+        except Exception as exc:
+            logger.warning("Generalize chunk failed chunk=%s: %s", chunk.get("chunk_id"), exc)
+        # fallback nếu LLM lỗi
+        result = dict(chunk)
+        result["document_text"] = "[Nội dung đã được khái quát hóa theo chính sách phân quyền.]"
+        return result
+
+    def _anonymize_chunk(self, chunk: dict) -> dict:
+        """Thay thế định danh cá nhân bằng alias nhất quán (Nhân viên A, Phòng X, ...)."""
+        original = chunk.get("document_text", "")
+        if not original:
+            return chunk
+        contract = chunk.get("_generalize_contract", {})
+        allowed_entities = contract.get("allowed_entities") or []
+        numeric_granularity = (contract.get("numeric_granularity") or "aggregated").lower()
+        _NUMERIC_DESC = {
+            "hidden":     "ẩn hoàn toàn tất cả số liệu",
+            "aggregated": "chỉ dùng số liệu tổng hợp/ước lượng",
+            "range_only": "chỉ dùng dạng khoảng",
+            "exact":      "giữ nguyên số liệu chính xác",
+        }
+        _ENTITY_VI = {
+            "full_name": "họ và tên", "national_id": "số CCCD/hộ chiếu",
+            "phone": "số điện thoại", "email": "địa chỉ email",
+            "address": "địa chỉ", "dob": "ngày sinh", "employee_id": "mã nhân viên",
+            "job_title": "chức danh", "department": "phòng ban",
+            "social_insurance": "số bảo hiểm xã hội", "bank_account": "tài khoản ngân hàng",
+            "company_name": "tên công ty", "tax_id": "mã số thuế",
+        }
+        numeric_hint = _NUMERIC_DESC.get(numeric_granularity, f"xử lý số liệu theo mức '{numeric_granularity}'")
+        if allowed_entities:
+            vi_labels = [_ENTITY_VI.get(e.lower(), e) for e in allowed_entities]
+            exempt_str = ", ".join(vi_labels)
+            prompt = (
+                "Bạn là agent ẩn danh hóa dữ liệu theo chính sách phân quyền.\n\n"
+                "## QUY TẮC BẮT BUỘC\n"
+                f"Các loại thông tin sau PHẢI GIỮ NGUYÊN: {exempt_str}.\n\n"
+                "## QUY TẮC ẨN DANH HÓA (cho thông tin KHÔNG trong danh sách trên)\n"
+                "- Thay thế tên người bằng alias nhất quán (VD: 'Nhân viên A', 'Nhân viên B').\n"
+                "- Thay thế mã số, số tài khoản bằng dạng 'XXX-###' nhất quán.\n"
+                f"- Số liệu: {numeric_hint}.\n\n"
+                "Chỉ trả về đoạn văn đã viết lại, không giải thích.\n\n"
+                f"Đoạn văn gốc:\n{original[:1500]}"
+            )
+        else:
+            prompt = (
+                "Bạn là agent ẩn danh hóa dữ liệu.\n"
+                "Thay thế TẤT CẢ định danh cá nhân và mã số cụ thể bằng alias nhất quán "
+                "(VD: tên người → 'Nhân viên A', mã số → 'ID-001', ...).\n"
+                f"Số liệu: {numeric_hint}.\n"
+                "Chỉ trả về đoạn văn đã viết lại, không giải thích.\n\n"
+                f"Đoạn văn gốc:\n{original[:1500]}"
+            )
+        try:
+            text, _, _ = llm_service.generate(prompt=prompt, max_tokens=1024, temperature=0.0)
+            if text and text.strip():
+                result = dict(chunk)
+                result["document_text"] = text.strip()
+                return result
+        except Exception as exc:
+            logger.warning("Anonymize chunk failed chunk=%s: %s", chunk.get("chunk_id"), exc)
+        result = dict(chunk)
+        result["document_text"] = "[Nội dung đã được ẩn danh hóa theo chính sách phân quyền.]"
+        return result
+
+    def _summarize_chunk(self, chunk: dict) -> dict:
+        """Tóm tắt chunk thành 1-2 câu, không tiết lộ giá trị cụ thể."""
+        original = chunk.get("document_text", "")
+        if not original:
+            return chunk
+        prompt = (
+            "Bạn là agent tóm tắt nội dung theo chính sách phân quyền dữ liệu.\n"
+            "Hãy tóm tắt đoạn văn sau thành 1-2 câu ngắn gọn, "
+            "chỉ nêu chủ đề và loại thông tin có trong đoạn. "
+            "TUYỆT ĐỐI không tiết lộ giá trị cụ thể (tên người, số liệu, mã số, địa chỉ, ...).\n"
+            "Ví dụ đầu ra: 'Thông tin nhân viên bao gồm thông tin cá nhân và liên hệ.'\n"
+            "Chỉ trả về câu tóm tắt, không giải thích.\n\n"
+            f"Đoạn văn:\n{original[:1500]}"
+        )
+        try:
+            text, _, _ = llm_service.generate(prompt=prompt, max_tokens=256, temperature=0.0)
+            if text and text.strip():
+                result = dict(chunk)
+                result["document_text"] = text.strip()
+                return result
+        except Exception as exc:
+            logger.warning("Summarize chunk failed chunk=%s: %s", chunk.get("chunk_id"), exc)
+        result = dict(chunk)
+        result["document_text"] = "[Nội dung đã được tóm tắt theo chính sách phân quyền.]"
+        return result
+
+    def _apply_transforms(self, chunks: list[dict]) -> list[dict]:
+        """Áp dụng các transformation đã được đánh dấu bởi policy (GENERALIZE/ANONYMIZE/SUMMARIZE)."""
+        result = []
+        for c in chunks:
+            if c.get("_needs_generalize"):
+                result.append(self._generalize_chunk(c))
+            elif c.get("_needs_anonymize"):
+                result.append(self._anonymize_chunk(c))
+            elif c.get("_needs_summarize"):
+                result.append(self._summarize_chunk(c))
+            else:
+                result.append(c)
+        return result
+
     def _apply_policy_contracts(
         self,
         db: Session,
@@ -177,14 +363,24 @@ class ChatService:
         """
         Run policy-contract agent per chunk.
         Returns (approved_chunks, contracts).
-        DENY   → chunk removed
-        REDACT → chunk text replaced with policy notice
+        DENY       → chunk removed
+        REDACT     → chunk text replaced with policy notice
+        GENERALIZE → chunk marked for LLM generalization
         ALLOW / ALLOW_WITH_WATERMARK → pass through
         """
         approved: list[dict] = []
         contracts: list[dict] = []
 
-        declared_sensitivity = 2  # default Internal; overridden per-chunk from metadata
+        declared_sensitivity = 2
+
+        user_positions: list[dict] = []
+        for up in (getattr(user, "oui_positions", None) or []):
+            pos = getattr(up, "position", None)
+            if pos and up.oui_id:
+                user_positions.append({
+                    "oui_id":    up.oui_id,
+                    "clearance": pos.clearance,
+                })
 
         for chunk in chunks:
             md = chunk.get("metadata") or {}
@@ -204,24 +400,44 @@ class ChatService:
                     user_id=user.id,
                     intent_class=intent_class,
                     raw_query=raw_query,
+                    user_positions=user_positions,
                     db=db,
                 )
                 contracts.append(contract)
 
                 decision = contract.get("decision", "ALLOW")
+                _ctr = {
+                    "max_detail":          contract.get("max_detail", "generalize"),
+                    "numeric_granularity": contract.get("numeric_granularity", "aggregated"),
+                    "allowed_entities":    contract.get("allowed_entities", []),
+                }
                 if decision == "DENY":
-                    logger.info("Policy DENY chunk=%s domain=%s", chunk_id, contract.get("domains"))
+                    logger.info("Policy DENY chunk=%s", chunk_id)
                     continue
                 elif decision == "REDACT":
                     chunk = dict(chunk)
                     chunk["document_text"] = "[Nội dung này đã được ẩn theo chính sách phân quyền.]"
                     logger.info("Policy REDACT chunk=%s", chunk_id)
+                elif decision == "ANONYMIZE":
+                    chunk = dict(chunk)
+                    chunk["_needs_anonymize"] = True
+                    chunk["_generalize_contract"] = _ctr
+                    logger.info("Policy ANONYMIZE chunk=%s", chunk_id)
+                elif decision == "GENERALIZE":
+                    chunk = dict(chunk)
+                    chunk["_needs_generalize"] = True
+                    chunk["_generalize_contract"] = _ctr
+                    logger.info("Policy GENERALIZE chunk=%s", chunk_id)
+                elif decision == "SUMMARIZE":
+                    chunk = dict(chunk)
+                    chunk["_needs_summarize"] = True
+                    logger.info("Policy SUMMARIZE chunk=%s", chunk_id)
                 # ALLOW / ALLOW_WITH_WATERMARK → pass through
 
                 approved.append(chunk)
             except Exception as exc:
                 logger.warning("Policy contract failed chunk=%s: %s", chunk_id, exc)
-                approved.append(chunk)  # fail-open: pass through on error
+                approved.append(chunk)
 
         return approved, contracts
 
@@ -244,9 +460,17 @@ class ChatService:
         cited = self._extract_cited_indices(answer_text) if answer_text else None
         no_citations = cited is not None and not cited
 
+        # When LLM cited specific [N] markers, only include chunks up to the
+        # highest cited index so that uncited trailing chunks are excluded from the
+        # sources panel. Index alignment is preserved: citation [N] → sources[N-1].
+        max_cited_idx = max(cited) if cited else None
+
         sources: list[dict] = []
         seen_docs: set[str] = set()
-        for r in retrieved or []:
+        for i, r in enumerate(retrieved or [], start=1):
+            if max_cited_idx is not None and i > max_cited_idx:
+                break  # stop — remaining chunks were not cited
+
             md = r.get("metadata", {}) or {}
             doc_id = md.get("document_id")
 
@@ -256,9 +480,6 @@ class ChatService:
                 if doc_id in seen_docs:
                     continue
                 seen_docs.add(doc_id)
-            # When LLM cited specific sources, keep ALL chunks in original order
-            # so that [n] in the answer text maps correctly to source n in the panel.
-            # Do NOT filter by cited indices — filtering shifts indices and breaks mapping.
 
             sources.append({
                 "documentId":    doc_id,
@@ -371,6 +592,11 @@ class ChatService:
         _min_score = float(system_setting_repository.get(db, "rag.similarity_threshold") or 0.0)
         retrieved_raw = retrieval_service.retrieve(query=effective_query, user=user, top_k=_top_k)
         retrieved     = self._normalize_retrieved(retrieved_raw, limit=_top_k, min_score=_min_score)
+        # Fallback: nếu threshold lọc hết, chỉ lấy 1 chunk tốt nhất (best-effort)
+        if not retrieved and _min_score > 0.0:
+            retrieved = self._normalize_retrieved(retrieved_raw, limit=1, min_score=0.0)
+            if retrieved:
+                logger.info("Retrieval fallback best-effort: top1 score=%.3f", retrieved[0].get("score") or 0)
 
         # ── [GUARD 2] PII scan trên retrieved chunks ───────────────────
         logger.info("USER ROLE: %s USER ID: %s", getattr(user, "role", None), getattr(user, "id", None))
@@ -379,14 +605,34 @@ class ChatService:
 
         # ── [POLICY] Policy-contract enforcement ──────────────────────
         policy_contracts: list[dict] = []
+        has_watermark = False
         if POLICY_ENABLED and retrieved:
             query_intent = intent_classifier.classify(effective_query)
             retrieved, policy_contracts = self._apply_policy_contracts(
                 db, retrieved, user, effective_query, query_intent
             )
-            logger.info("Policy: intent=%s approved=%d/%d", query_intent, len(retrieved), len(retrieved_raw))
+            has_watermark = any(c.get("decision") == "ALLOW_WITH_WATERMARK" for c in policy_contracts)
+            print(f"[POLICY] intent={query_intent} approved={len(retrieved)}/{len(retrieved_raw)} watermark={has_watermark}")
+            for _c in policy_contracts:
+                rules = [r.get("rule_code") for r in _c.get("applied_rules", [])]
+                domains = [d.get("code") for d in _c.get("domains", [])]
+                print(f"[POLICY] chunk={_c.get('chunk_id','?')[:8]} domains={domains} decision={_c.get('decision')} rules={rules}")
+            retrieved = self._apply_transforms(retrieved)
+
+        # ── Phát hiện REDACT/DENY để chặn memory leak ─────────────────
+        _POLICY_NOTICE = "[Nội dung này đã được ẩn theo chính sách phân quyền.]"
+        has_restricted = bool(retrieved and any(
+            c.get("document_text") == _POLICY_NOTICE for c in retrieved
+        )) or bool(
+            policy_contracts and any(c.get("decision") in ("DENY", "REDACT") for c in policy_contracts)
+        )
+        all_restricted = bool(retrieved and all(
+            c.get("document_text") == _POLICY_NOTICE for c in retrieved
+        ))
 
         history = self._load_history(db, conversation_id, effective_query)
+        # Khi có REDACT/DENY: không truyền history để tránh memory leak từ session cũ
+        safe_history: list = [] if has_restricted else history
 
         answer_text: str | None = None
         llm_raw: Any = None
@@ -395,17 +641,36 @@ class ChatService:
         assistant_status = "fallback"
         llm_text: str | None = None
 
-        if llm_service.is_configured():
+        # Nếu TẤT CẢ chunk đều bị REDACT → trả thông báo trực tiếp, không dùng LLM
+        if all_restricted:
+            answer_text = "Thông tin này bị hạn chế theo chính sách phân quyền của hệ thống và không thể hiển thị."
+            sources = self._build_sources_from_retrieved(retrieved, answer_text)
+            assistant_status = "success"
+
+        elif llm_service.is_configured():
             try:
+                _has_transform = bool(policy_contracts and any(
+                    c.get("decision") in ("ANONYMIZE", "GENERALIZE", "SUMMARIZE")
+                    for c in policy_contracts
+                ))
+                _extra_instructions = (
+                    "Dữ liệu trong context đã được ẩn danh hóa theo chính sách phân quyền "
+                    "(tên người thay bằng alias như 'Nhân viên A', mã số thay bằng ID đại diện, "
+                    "số liệu thể hiện dạng khoảng hoặc tổng hợp). "
+                    "Hãy trả lời dựa trên thông tin ẩn danh đó. "
+                    "Không xác định danh tính cụ thể. "
+                    "Không nói 'không có trong tài liệu' nếu thông tin liên quan (dù đã ẩn danh) thực sự có trong context."
+                ) if _has_transform else (
+                    "Nếu câu hỏi là dạng hỏi trực tiếp về một người, "
+                    "hãy trả lời đúng thông tin đó, ngắn gọn, không kèm dữ liệu thừa."
+                )
                 prompt = llm_service.build_prompt(
                     question=effective_query,
                     contexts=retrieved,
-                    chat_history=history,
-                    extra_instructions=(
-                        "Nếu câu hỏi là dạng hỏi trực tiếp về một người, "
-                        "hãy trả lời đúng thông tin đó, ngắn gọn, không kèm dữ liệu thừa."
-                    ),
+                    chat_history=safe_history,
+                    extra_instructions=_extra_instructions,
                 )
+                print(f"[LLM PROMPT]\n{'='*60}\n{prompt}\n{'='*60}")
                 llm_text, llm_raw, _ = llm_service.generate(
                     prompt=prompt, max_tokens=512, temperature=0.0,
                 )
@@ -426,7 +691,7 @@ class ChatService:
 
         # ── [GUARD 3] PII + Secret scan trên LLM response ─────────────
         if GUARDS_ENABLED and answer_text:
-            post_scan = guard_service.scan_response(answer_text, user=user) 
+            post_scan = guard_service.scan_response(answer_text, user=user)
 
             if post_scan.judge and post_scan.judge.should_block:
                 logger.warning("Guard3b BLOCK: reason=%s trace_id=%s", post_scan.judge.reason, tid)
@@ -440,6 +705,13 @@ class ChatService:
             if post_scan.has_pii or post_scan.has_secret:
                 logger.warning("Guard3 POST-LLM: has_pii=%s has_secret=%s trace_id=%s",
                             post_scan.has_pii, post_scan.has_secret, tid)
+
+        # ── Watermark notice ──────────────────────────────────────────
+        if has_watermark and answer_text:
+            answer_text = (
+                answer_text
+                + "\n\n---\nNội dung này được truy cập theo điều kiện kiểm soát phân quyền. Hoạt động truy vấn đã được ghi nhận."
+            )
 
         assistant_msg = Message(
             conversation_id=conversation_id,
@@ -724,6 +996,11 @@ class ChatService:
             logger.info("STREAM RETRIEVED COUNT: %d", len(retrieved_raw))
 
             retrieved = self._normalize_retrieved(retrieved_raw, limit=_top_k, min_score=_min_score)
+            # Fallback: nếu threshold lọc hết, chỉ lấy 1 chunk tốt nhất (best-effort)
+            if not retrieved and _min_score > 0.0:
+                retrieved = self._normalize_retrieved(retrieved_raw, limit=1, min_score=0.0)
+                if retrieved:
+                    logger.info("Retrieval fallback best-effort: top1 score=%.3f", retrieved[0].get("score") or 0)
 
             # ── [GUARD 2] PII scan chunks ──────────────────────────────
             logger.info("Guard2 stream: user_role=%s user_id=%s",
@@ -732,27 +1009,64 @@ class ChatService:
                 retrieved = guard_service.scan_chunks(retrieved, user=user)
 
             # ── [POLICY] Policy-contract enforcement ──────────────────
+            stream_has_watermark = False
             if POLICY_ENABLED and retrieved:
                 query_intent = intent_classifier.classify(effective_query)
-                retrieved, _ = self._apply_policy_contracts(
+                retrieved, stream_policy_contracts = self._apply_policy_contracts(
                     db, retrieved, user, effective_query, query_intent
                 )
-                logger.info("Policy stream: intent=%s approved=%d", query_intent, len(retrieved))
+                stream_has_watermark = any(c.get("decision") == "ALLOW_WITH_WATERMARK" for c in stream_policy_contracts)
+                print(f"[POLICY STREAM] intent={query_intent} approved={len(retrieved)} watermark={stream_has_watermark}")
+                for _c in stream_policy_contracts:
+                    rules = [r.get("rule_code") for r in _c.get("applied_rules", [])]
+                    domains = [d.get("code") for d in _c.get("domains", [])]
+                    print(f"[POLICY STREAM] chunk={_c.get('chunk_id','?')[:8]} domains={domains} decision={_c.get('decision')} rules={rules}")
+                retrieved = self._apply_transforms(retrieved)
+
+            # ── Phát hiện REDACT/DENY để chặn memory leak (stream) ────
+            _POLICY_NOTICE = "[Nội dung này đã được ẩn theo chính sách phân quyền.]"
+            _spc = locals().get("stream_policy_contracts") or []
+            stream_has_restricted = bool(retrieved and any(
+                c.get("document_text") == _POLICY_NOTICE for c in retrieved
+            )) or bool(any(c.get("decision") in ("DENY", "REDACT") for c in _spc))
+            stream_all_restricted = bool(retrieved and all(
+                c.get("document_text") == _POLICY_NOTICE for c in retrieved
+            ))
 
             history = self._load_history(db, conversation_id, effective_query)
+            safe_history = [] if stream_has_restricted else history
 
             if not retrieved:
                 full_text = "Xin lỗi, không tìm thấy thông tin liên quan. Vui lòng thử diễn đạt lại câu hỏi."
                 for token in full_text:
                     yield {"type": "token", "text": token}
 
+            elif stream_all_restricted:
+                full_text = "Thông tin này bị hạn chế theo chính sách phân quyền của hệ thống và không thể hiển thị."
+                for token in full_text:
+                    yield {"type": "token", "text": token}
+
             elif llm_service.is_configured():
                 try:
+                    _stream_has_transform = bool(_spc and any(
+                        c.get("decision") in ("ANONYMIZE", "GENERALIZE", "SUMMARIZE")
+                        for c in _spc
+                    ))
+                    _stream_extra = (
+                        "Dữ liệu trong context đã được ẩn danh hóa theo chính sách phân quyền "
+                        "(tên người thay bằng alias như 'Nhân viên A', mã số thay bằng ID đại diện, "
+                        "số liệu thể hiện dạng khoảng hoặc tổng hợp). "
+                        "Hãy trả lời dựa trên thông tin ẩn danh đó. "
+                        "Không xác định danh tính cụ thể. "
+                        "Không nói 'không có trong tài liệu' nếu thông tin liên quan (dù đã ẩn danh) thực sự có trong context."
+                    ) if _stream_has_transform else None
                     prompt = llm_service.build_prompt(
                         question=llm_extra_context + effective_query,
                         contexts=retrieved,
-                        chat_history=history,
+                        chat_history=safe_history,
+                        extra_instructions=_stream_extra,
                     )
+                    print(f"[LLM STREAM PROMPT]\n{'='*60}\n{prompt}\n{'='*60}")
                     logger.info("LLM stream prompt trace_id=%s", tid)
 
                     for token in llm_service.generate_stream(prompt=prompt, max_tokens=2048):
@@ -768,6 +1082,12 @@ class ChatService:
 
             if not full_text:
                 full_text, _ = answer_service.generate(user_input=effective_query, retrieved=retrieved)
+
+            # ── Watermark notice (stream) ──────────────────────────────
+            if stream_has_watermark and full_text:
+                watermark_text = "\n\n---\n⚠️ Nội dung này được truy cập theo điều kiện kiểm soát phân quyền. Hoạt động truy vấn đã được ghi nhận."
+                yield {"type": "token", "text": watermark_text}
+                full_text += watermark_text
 
             sources = self._build_sources_from_retrieved(retrieved, full_text)
 

@@ -125,6 +125,7 @@ class GmailService:
         return html.strip()
 
     def _get_body(self, payload: dict) -> str:
+        """Extract text/plain — dùng cho RAG embedding."""
         def extract(parts):
             for part in parts:
                 if part.get("mimeType") == "text/plain":
@@ -142,6 +143,31 @@ class GmailService:
         data = payload.get("body", {}).get("data", "")
         if data:
             return base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="ignore")
+        return ""
+
+    def _get_html_body(self, payload: dict) -> str:
+        """Extract text/html — dùng để hiển thị email đẹp trên UI."""
+        def extract(parts):
+            for part in parts:
+                if part.get("mimeType") == "text/html":
+                    data = part.get("body", {}).get("data", "")
+                    if data:
+                        return base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="ignore")
+                if "parts" in part:
+                    result = extract(part["parts"])
+                    if result:
+                        return result
+            return ""
+
+        if "parts" in payload:
+            result = extract(payload["parts"])
+            if result:
+                return result
+        # Single-part email có mimeType = text/html
+        if payload.get("mimeType") == "text/html":
+            data = payload.get("body", {}).get("data", "")
+            if data:
+                return base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="ignore")
         return ""
 
     def _get_header(self, headers: list, name: str) -> str:
@@ -203,6 +229,7 @@ class GmailService:
                 continue
             headers = msg["payload"]["headers"]
             body = self._get_body(msg["payload"])
+            body_html = self._get_html_body(msg["payload"])
             emails.append({
                 "message_id": ref["id"],
                 "thread_id": msg.get("threadId", ""),
@@ -212,6 +239,7 @@ class GmailService:
                 "date": self._get_header(headers, "Date"),
                 "snippet": msg.get("snippet", ""),
                 "body": body,
+                "body_html": body_html,
                 "label_ids": msg.get("labelIds", []),
                 "synced": ref["id"] in synced_ids,
             })

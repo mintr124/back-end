@@ -131,14 +131,14 @@ class DomainClassifier:
                 temperature=0.0,
             )
             raw = _extract_json(text)
-            primary_code = raw.get("primary_domain", "GEN-00")
+            primary_code = raw.get("primary_domain", "")
             primary_conf = float(raw.get("primary_confidence", 0.5))
             sec_code     = raw.get("secondary_domain")
             sec_conf     = raw.get("secondary_confidence")
 
-            # Validate codes
+            # LLM trả về code không hợp lệ → fallthrough sang keyword classifier
             if primary_code not in domain_descriptions:
-                primary_code = "GEN-00"
+                return None
             secondary = None
             if sec_code and sec_code in domain_descriptions and sec_conf is not None:
                 secondary = DomainPrediction(sec_code, round(float(sec_conf), 3))
@@ -178,8 +178,9 @@ class DomainClassifier:
                 score += 0.05
             scores[code] = score
 
+        MIN_KEYWORD_SCORE = 0.03  # dưới ngưỡng này → không đủ evidence → GEN-00
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        if not ranked or ranked[0][1] <= 0.0:
+        if not ranked or ranked[0][1] < MIN_KEYWORD_SCORE:
             return ClassificationResult(
                 primary=DomainPrediction("GEN-00", 1.0),
                 secondary=None,

@@ -23,6 +23,78 @@ from app.services.policy_agent.rule_selector import RuleSelector, SelectionConte
 
 logger = logging.getLogger(__name__)
 
+
+def _get_oui_ancestors(db, oui_id: str) -> set[str]:
+    """Trả về tập tất cả ancestor OUI ID (bao gồm chính nó) qua BFS."""
+    from app.models.org_unit_instance import OrgUnitInstance
+    visited: set[str] = set()
+    queue = [oui_id]
+    while queue:
+        cur = queue.pop()
+        if cur in visited:
+            continue
+        visited.add(cur)
+        oui = db.get(OrgUnitInstance, cur)
+        if oui:
+            for parent in oui.parents:
+                if parent.id not in visited:
+                    queue.append(parent.id)
+    return visited
+
+
+def _compute_effective_clearance(
+    user_positions: list[dict],   # [{oui_id, clearance}]
+    chunk_oui_ids: set[str],      # OUI IDs của document chứa chunk
+    db,
+) -> int:
+    """
+    Tính clearance hiệu dụng của user đối với chunk này.
+
+    - Exact match: user có position tại đúng OUI của doc → lấy clearance đó.
+    - Doc nằm TRÊN user (ancestor): lấy clearance của position user gần nhất
+      đi xuống từ vị trí doc (position của user nằm dưới doc trong cây).
+    - Doc nằm DƯỚI user (descendant): lấy max clearance trong các position
+      của user là ancestor của doc.
+    - Không có quan hệ: trả về 1 (clearance thấp nhất, áp dụng rule).
+    """
+    if not user_positions or not chunk_oui_ids:
+        return max((p["clearance"] for p in user_positions), default=1)
+
+    # Case 1: exact match
+    for oui_id in chunk_oui_ids:
+        for pos in user_positions:
+            if pos["oui_id"] == oui_id:
+                return pos["clearance"]
+
+    # Lấy ancestors của tất cả chunk OUI
+    chunk_ancestor_sets: dict[str, set[str]] = {}
+    for oui_id in chunk_oui_ids:
+        chunk_ancestor_sets[oui_id] = _get_oui_ancestors(db, oui_id)
+
+    # Case 2: doc ABOVE user → chunk_oui là ancestor của user's OUI
+    # → user position nằm DƯỚI chunk trong cây
+    positions_under_chunk: list[dict] = []
+    for pos in user_positions:
+        pos_ancestors = _get_oui_ancestors(db, pos["oui_id"])
+        for oui_id in chunk_oui_ids:
+            if oui_id in pos_ancestors and oui_id != pos["oui_id"]:
+                positions_under_chunk.append(pos)
+                break
+    if positions_under_chunk:
+        # Nhiều branch → lấy clearance thấp nhất (an toàn nhất)
+        return min(p["clearance"] for p in positions_under_chunk)
+
+    # Case 3: doc BELOW user → user position là ancestor của chunk_oui
+    all_chunk_ancestors = set().union(*chunk_ancestor_sets.values())
+    positions_above_chunk = [
+        pos for pos in user_positions
+        if pos["oui_id"] in all_chunk_ancestors
+    ]
+    if positions_above_chunk:
+        return max(p["clearance"] for p in positions_above_chunk)
+
+    return 1  # Không có quan hệ → clearance thấp nhất
+
 _INT_TO_SENSITIVITY = {1: "Public", 2: "Internal", 3: "Confidential", 4: "Restricted", 5: "TopSecret"}
 
 # Default policy-contract when no domain/rule is configured
@@ -56,6 +128,7 @@ class PolicyContractAgent:
         intent_class:         str,
         raw_query:            str,
         is_off_hours:         bool = False,
+        user_positions:       list[dict] | None = None,  # [{oui_id, clearance}]
         db=None,
     ) -> dict:
         """
@@ -127,6 +200,15 @@ class PolicyContractAgent:
         )
 
         # ── 4. Rule Selection ──────────────────────────────────────────────
+        # Tính clearance hiệu dụng từ vị trí user tương ứng chunk OUI
+        chunk_oui_ids: set[str] = set(
+            filter(None, (chunk_metadata.get("oui_id") or "").split(","))
+        )
+        if db is not None and user_positions and chunk_oui_ids:
+            eff_clearance = _compute_effective_clearance(user_positions, chunk_oui_ids, db)
+        else:
+            eff_clearance = user_level  # fallback khi không có dữ liệu OUI
+
         ctx = SelectionContext(
             domain_codes=domain_codes,
             effective_sensitivity=sensitivity_result.effective_sensitivity,
@@ -142,6 +224,7 @@ class PolicyContractAgent:
             has_assigned_customer=False,
             intent_class=intent_class,
             intent_risk_signal=intent_result.risk_signal,
+            effective_clearance=eff_clearance,
         )
 
         db_rules: list = []

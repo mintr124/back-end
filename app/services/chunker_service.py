@@ -92,11 +92,14 @@ def _is_heading(line: str) -> bool:
         return False
     if _PAGE_HEADER_CHECK_RE.search(line):
         return False
-    if line.endswith((",", "và", "hoặc", "của", "theo", "để", "trong", "khi",
+    # Strip markdown bold/italic markers (**text**, *text*, ***text***) before matching,
+    # so headings detected by the bold-font parser still split chunks correctly.
+    test_line = re.sub(r"^\*{1,3}(.*?)\*{1,3}$", r"\1", line)
+    if test_line.endswith((",", "và", "hoặc", "của", "theo", "để", "trong", "khi",
                       "là", "các", "được", "có", "về", "với", "tại", "cho",
                       "từ", "như", "này")):
         return False
-    return bool(_HEADING_RE.match(line))
+    return bool(_HEADING_RE.match(test_line))
 
 
 # ---------------------------------------------------------------------------
@@ -303,8 +306,8 @@ dù chỉ 1 đoạn, đều là lỗi nghiêm trọng không được phép xả
 
 QUY TRÌNH BẮT BUỘC (làm theo đúng thứ tự, không bỏ bước):
 Bước 1 — Liệt kê TRƯỚC: Đọc toàn bộ tài liệu, liệt kê danh sách TẤT CẢ các
-  đề mục cấp lớn nhất bạn thấy (ví dụ: Chương 1, Chương 2, ... Chương N,
-  hoặc Phần 1, Mục 1...). Đây là checklist bạn phải hoàn thành ở Bước 3.
+  đề mục nhỏ nhất bạn thấy (ví dụ: Điều 1, Điều 2, ... Điều N,
+  hoặc Phần 1, Mục 1, Chương 1...). Nếu một đề mà ngay dưới nó không có nội dung, hoặc chỉ có đề mục cấp nhỏ hơn hoặc đề mục khác thì không tính vào checklist. Đây là checklist bạn phải hoàn thành ở Bước 3.
 Bước 2 — Xác định entity: Tìm các entity chính (tên người, tổ chức, mã số,
   mã hợp đồng...) để gắn vào section_heading.
 Bước 3 — Chunk theo checklist: Với MỖI đề mục đã liệt kê ở Bước 1, tạo ra
@@ -326,10 +329,12 @@ Quy tắc chunk:
   chứ không chỉ phần nội dung sau mục đề)
 - Không split 1 bảng/nhóm field liên quan thành nhiều chunk
 - Giữ nguyên giá trị gốc, không paraphrase, không tóm tắt, không rút gọn
+- GIỮ NGUYÊN các ký hiệu định dạng markdown: **chữ đậm**, *chữ nghiêng*, | bảng |
+  Tuyệt đối không được xóa hay sửa các ký tự *, **, | trong chunk_text
 
 ĐỊNH DẠNG TRẢ VỀ — JSON, không giải thích thêm, đúng cấu trúc sau:
 {{
-  "outline_checklist": ["Chương 1 - ...", "Chương 2 - ...", "..."],
+  "outline_checklist": ["Điều (hoặc Phần/Mục/Chương/...) 1 - ...", "Điều (hoặc Phần/Mục/Chương/...) 2 - ...", "..."],
   "chunks": [
     {{"section_heading": "...", "chunk_text": "..."}}
   ]
