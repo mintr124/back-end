@@ -24,7 +24,7 @@ from app.services.audit_service import audit_service
 from app.services.chunker_service import ChunkConfig, chunker_service
 from app.services.chroma_service import chroma_service
 from app.services.embedding_service import embedding_service
-from app.services.entity_extractor import run_pipeline as detect_entities
+from app.services.entity_extractor import run_pipeline as detect_entities, compute_chunk_sensitivity
 from app.services.job_service import job_service
 from app.services.parser_service import parser_service
 from app.services.storage_service import storage_service
@@ -55,6 +55,7 @@ class IngestPipelineService:
             return
 
         try:
+            pre_ingest_status     = doc.status   # lưu lại để khôi phục sau ingest
             doc.status            = "processing"
             version.ingest_status = "running"
             version.parse_status  = "running"
@@ -183,9 +184,10 @@ class IngestPipelineService:
                     entity_results.append(result)
                     # Merge entity data into chunk metadata_json
                     existing_meta = chunk_model.metadata_json or {}
-                    existing_meta["entities"]     = result["entities"]
-                    existing_meta["entity_labels"] = result["labels"]
-                    existing_meta["entity_types"] = ",".join(result["entity_types"])
+                    existing_meta["entities"]          = result["entities"]
+                    existing_meta["entity_labels"]     = result["labels"]
+                    existing_meta["entity_types"]      = ",".join(result["entity_types"])
+                    existing_meta["chunk_sensitivity"] = compute_chunk_sensitivity(doc.sensitivity, result["labels"])
                     chunk_model.metadata_json = existing_meta
                 except Exception as exc:
                     logger.warning("Entity detection failed for chunk %s: %s", chunk_model.id, exc)
@@ -230,10 +232,12 @@ class IngestPipelineService:
                     # Entity detection results
                     "entity_types":        ",".join(entity_result.get("entity_types") or []),
                     "has_pii":             entity_labels.get("has_pii", False),
-                    "has_number":          entity_labels.get("has_number", False),
+                    "has_financial":       entity_labels.get("has_financial", False),
                     "has_credential":      entity_labels.get("has_credential", False),
                     "has_legal":           entity_labels.get("has_legal", False),
                     "has_strategic":       entity_labels.get("has_strategic", False),
+                    "has_hr":              entity_labels.get("has_hr", False),
+                    "chunk_sensitivity":   (chunk_model.metadata_json or {}).get("chunk_sensitivity", doc.sensitivity),
                 }
                 chroma_service.upsert_chunk(
                     chunk_id=chunk_model.id,
@@ -263,19 +267,17 @@ class IngestPipelineService:
             version.embed_status  = "completed"
             version.ingest_status = "succeeded"
 
-            creator = job.created_by
-            from app.services.user_service import user_service as _user_service
-            if creator:
-                from app.services.user_service import user_service as _user_service
-                from app.db.session import SessionLocal
-                with SessionLocal() as tmp_db:
-                    creator_resp = _user_service.build_user_response(tmp_db, creator)
-                    if creator_resp.is_corp_member:
-                        doc.status = "approved"
-                    elif doc.status not in {"approved", "ready"}:
-                        doc.status = "review"
+            if pre_ingest_status == "approved":
+                doc.status = "approved"
             else:
-                if doc.status not in {"approved", "ready"}:
+                creator = job.created_by
+                if creator:
+                    from app.services.user_service import user_service as _user_service
+                    from app.db.session import SessionLocal
+                    with SessionLocal() as tmp_db:
+                        creator_resp = _user_service.build_user_response(tmp_db, creator)
+                        doc.status = "approved" if creator_resp.is_corp_member else "review"
+                else:
                     doc.status = "review"
 
             doc.current_version_id = version.id

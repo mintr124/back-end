@@ -27,64 +27,33 @@ from app.services.llm_service import llm_service
 
 logger = logging.getLogger(__name__)
 
-# All possible GLiNER-compatible entity labels in this system.
-# These are the only values the LLM should pick from.
-ALL_ENTITY_LABELS: list[str] = [
-    # Identity / HR
-    "full_name",            # Tên người
-    "job_title",            # Chức danh
-    "department",           # Phòng/ban
-    "employee_id",          # Mã nhân viên
-    "dob",                  # Ngày sinh
-    "national_id",          # CCCD/CMND
-    "social_insurance",     # Số BHXH
-    "bank_account",         # Số tài khoản
-    "tax_id",               # Mã số thuế
-    # Contact
-    "email",                # Email
-    "phone",                # Số điện thoại
-    "address",              # Địa chỉ
-    # Organization
-    "organization",         # Tên công ty/tổ chức
-    "brand_name",           # Tên thương hiệu
-    "customer_name",        # Tên khách hàng
-    # Projects / Strategy
-    "project_name",         # Tên dự án
-    "strategic_plan",       # Kế hoạch/chiến lược
-    "campaign_name",        # Tên chiến dịch marketing
-    # Products / Finance
-    "product_name",         # Tên sản phẩm
-    "service_name",         # Tên dịch vụ
-    "product_launch",       # Thông tin ra mắt sản phẩm
-    "pricing_strategy",     # Chiến lược giá
-    "revenue",              # Doanh thu
-    "investment_amount",    # Số tiền đầu tư
-    "money",                # Số tiền (chung)
-    "percentage",           # Phần trăm
-    # Legal / Compliance
-    "contract_id",          # Mã hợp đồng
-    "contract_clause",      # Điều khoản hợp đồng
-    "law_reference",        # Văn bản pháp luật
-    "policy_reference",     # Tham chiếu chính sách
-    # Content / Meeting
-    "sentiment_expression", # Cảm xúc/đánh giá
-    "meeting_subject",      # Chủ đề cuộc họp
-    "decision_record",      # Quyết định được ghi nhận
-    # Technical
-    "system_name",          # Tên hệ thống/phần mềm
-    "technical_spec",       # Thông số kỹ thuật
-    # Generic
-    "location",             # Địa điểm (thành phố, khu vực)
-    "date_generic",         # Ngày tháng chung
+# Fixed set of boolean flags. LLM must classify each entity type into one or more of these.
+BOOLEAN_FLAGS = [
+    "has_pii",        # personal identifiable information
+    "has_financial",  # financial / quantitative business data
+    "has_credential", # authentication secrets (passwords, tokens, keys)
+    "has_legal",      # legal / regulatory / contractual content
+    "has_strategic",  # strategic / competitive plans
+    "has_hr",         # HR-specific sensitive data (salary, employment, medical)
 ]
 
 _SUGGEST_SYSTEM = (
     "You are a data governance expert. "
-    "Given a business domain name and description, list the entity types most commonly found "
-    "in documents belonging to this domain. "
-    "Respond with a JSON object: {\"entity_types\": [\"type1\", \"type2\", ...]}. "
-    "Return exactly 10 entity types, choosing only from the allowed list provided. "
-    "No explanation, only JSON."
+    "Given a business domain name and description, generate entity types that commonly appear "
+    "in documents of this domain. Entity type names must be in snake_case English. "
+    "For each entity type, classify it into one or more of these boolean flags:\n"
+    "  has_pii        — personal identifiable information (names, IDs, contacts, addresses)\n"
+    "  has_financial  — financial or quantitative business data (money, revenue, %, investments)\n"
+    "  has_credential — authentication secrets (passwords, tokens, API keys, OTPs)\n"
+    "  has_legal      — legal/regulatory/contractual content (clauses, law refs, contracts)\n"
+    "  has_strategic  — strategic or competitive information (plans, M&A, roadmaps, launches)\n"
+    "  has_hr         — HR-specific sensitive data (salary, employment records, medical, BHXH)\n"
+    "Respond with JSON only:\n"
+    "{\"entity_types\": [{\"entity_type\": \"<name>\", \"label_vi\": \"<Vietnamese label>\", "
+    "\"boolean_labels\": [\"<flag>\", ...]}, ...]}\n"
+    "Generate up to 10 entity types most relevant to this domain — fewer is fine if the domain "
+    "does not have that many distinct entity types worth tracking. "
+    "Use [] for boolean_labels if the entity type is not sensitive. No explanation, only JSON."
 )
 
 
@@ -126,6 +95,7 @@ class PolicyService:
                             domain_id=domain.id,
                             entity_type=et.entity_type,
                             label_vi=et.label_vi,
+                            boolean_labels=et.boolean_labels,
                             is_system_suggested=True,
                         )
             except Exception as exc:
@@ -156,29 +126,41 @@ class PolicyService:
     def _suggest_entity_types(
         self, name: str, description: Optional[str]
     ) -> list[EntityTypeCreate]:
-        labels_str = ", ".join(ALL_ENTITY_LABELS)
         prompt = (
-            f"Business domain name: {name}\n"
+            f"Business domain: {name}\n"
             f"Description: {description or 'N/A'}\n\n"
-            f"Allowed entity types: {labels_str}\n\n"
-            "Return a JSON with exactly 10 entity_types most relevant to this domain."
+            "Generate up to 10 entity types most commonly found in documents of this domain — "
+            "use fewer if the domain is narrow. "
+            "For each, classify it into the appropriate boolean flag(s) from the list above."
         )
         try:
             text, _, _ = llm_service.generate(
                 prompt=prompt,
                 system=_SUGGEST_SYSTEM,
-                max_tokens=256,
+                max_tokens=512,
                 temperature=0.0,
             )
             raw = _extract_json(text)
-            types: list[str] = raw.get("entity_types", [])
-            # Filter to only known labels
-            types = [t for t in types if t in ALL_ENTITY_LABELS][:10]
+            items: list[dict] = raw.get("entity_types", [])
         except Exception as exc:
             logger.error("LLM entity suggestion error: %s", exc)
-            types = []
+            items = []
 
-        return [EntityTypeCreate(entity_type=t) for t in types]
+        result = []
+        seen: set[str] = set()
+        for item in items:
+            et = item.get("entity_type", "").strip().lower().replace(" ", "_")
+            if not et or et in seen:
+                continue
+            seen.add(et)
+            # Validate flags — only keep known flag names
+            flags = [f for f in (item.get("boolean_labels") or []) if f in BOOLEAN_FLAGS]
+            result.append(EntityTypeCreate(
+                entity_type=et,
+                label_vi=item.get("label_vi"),
+                boolean_labels=flags,
+            ))
+        return result[:10]
 
     def add_entity_type(
         self,
@@ -195,6 +177,7 @@ class PolicyService:
             domain_id=domain_id,
             entity_type=data.entity_type,
             label_vi=data.label_vi,
+            boolean_labels=data.boolean_labels,
             is_system_suggested=False,
         )
         db.commit()

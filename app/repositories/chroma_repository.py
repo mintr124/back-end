@@ -119,6 +119,16 @@ class ChromaRepository:
             return
         self._get_collection().delete(ids=ids)
 
+    def get_metadatas_by_ids(self, ids: list[str]) -> dict[str, dict]:
+        """Return {chunk_id: metadata_dict} for the given IDs (only present ones)."""
+        if not ids:
+            return {}
+        raw = self._get_collection().get(ids=ids, include=["metadatas"])
+        result = {}
+        for chunk_id, meta in zip(raw.get("ids", []), raw.get("metadatas", [])):
+            result[chunk_id] = meta or {}
+        return result
+
     def update_document_metadata(
         self, chunk_ids: list[str], metadata_updates: dict
     ) -> None:

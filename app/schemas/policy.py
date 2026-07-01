@@ -18,11 +18,13 @@ class EntityTypeRead(BaseModel):
     is_system_suggested: bool
     is_active: bool
     created_at: datetime
+    boolean_labels: list[str] = []   # computed from ENTITY_FLAG_MAP, not stored in DB
 
 
 class EntityTypeCreate(BaseModel):
     entity_type: str = Field(..., min_length=1, max_length=128)
     label_vi: Optional[str] = Field(None, max_length=255)
+    boolean_labels: list[str] = []   # populated when returned from suggestion/list endpoints
 
 
 class EntityTypeBulkCreate(BaseModel):

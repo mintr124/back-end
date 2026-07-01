@@ -304,11 +304,7 @@ def assign_user_to_oui(
     db.add(record)
     db.commit()
 
-    # Sync FGA membership
     fga_adapter.add_oui_member(payload.user_id, payload.oui_id)
-
-    # Re-sync tất cả doc của OUI này và docs của ancestors (vì user mới → tuples thay đổi)
-    _resync_docs_for_oui(db, payload.oui_id)
 
     return {"status": "assigned", "user_id": payload.user_id, "oui": oui.name, "position": pos.name}
 
@@ -332,7 +328,6 @@ def unassign_user_from_oui(
     db.commit()
 
     fga_adapter.remove_oui_member(payload.user_id, payload.oui_id)
-    _resync_docs_for_oui(db, payload.oui_id)
 
     return {"status": "unassigned"}
 
@@ -360,8 +355,6 @@ def change_position(
     record.position_id = payload.position_id
     db.commit()
 
-    # Re-sync docs vì clearance có thể thay đổi
-    _resync_docs_for_oui(db, oui_id)
     return {"status": "updated"}
 
 

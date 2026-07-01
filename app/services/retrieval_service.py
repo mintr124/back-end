@@ -407,6 +407,7 @@ class RetrievalService:
         mode: str = "hybrid",
         oui_ids: list[str] | None = None,
         chat_mode: str = "rag",
+        db=None,
     ) -> list[dict]:
         query = (query or "").strip()
         if not query:
@@ -427,18 +428,18 @@ class RetrievalService:
                 lexical_candidates=40,
             )
         elif chat_mode == "all":
-            rag_results = self._retrieve_main(query=query, user=user, top_k=top_k, oui_ids=oui_ids)
+            rag_results = self._retrieve_main(query=query, user=user, top_k=top_k, oui_ids=oui_ids, db=db)
             gmail_results = self._retrieve_from_collection(
                 query=query, user=user, top_k=top_k,
                 collection_name=GMAIL_CHROMA_COLLECTION,
-                extra_where={"user_id": {"$eq": user_id}} if user_id else None,  # ← $eq operator
+                extra_where={"user_id": {"$eq": user_id}} if user_id else None,
             )
             merged = rag_results + gmail_results
             merged.sort(key=lambda x: x.get("score", 0), reverse=True)
             return merged[:top_k]
         else:
             return self._retrieve_main(
-                query=query, user=user, top_k=top_k, mode=mode, oui_ids=oui_ids
+                query=query, user=user, top_k=top_k, mode=mode, oui_ids=oui_ids, db=db
             )
             
             
@@ -523,15 +524,55 @@ class RetrievalService:
         top_k: int = 5,
         mode: str = "hybrid",
         oui_ids: list[str] | None = None,
+        db=None,
     ) -> list[dict]:
-        """Retrieve từ collection chính (document_chunks)."""
-        allowed_doc_ids: list[str] | None = None
-        if user is not None:
-            allowed_doc_ids = fga_adapter.list_viewable_document_ids(user.id)
-            if not allowed_doc_ids:
-                return []
+        """Retrieve từ collection chính (document_chunks).
 
-        where = self._build_where(allowed_doc_ids, oui_ids)
+        Access logic (ưu tiên từ trên xuống):
+          FGA allow + approved request              → include, full source
+          FGA allow + chunk_sensitivity ≤ clearance → include, full source
+          FGA allow + chunk_sensitivity > clearance  → exclude
+          FGA deny  + chunk_sensitivity ≤ clearance
+                    + in query scope                 → include, doc_restricted=True
+          FGA deny  + chunk_sensitivity > clearance  → exclude
+        """
+        if user is None:
+            return []
+
+        # ── User clearance ──────────────────────────────────────────────
+        user_clearance = 1
+        for uop in getattr(user, "oui_positions", []):
+            if uop.position and uop.position.clearance > user_clearance:
+                user_clearance = uop.position.clearance
+
+        # ── FGA-allowed doc IDs ─────────────────────────────────────────
+        fga_allowed_ids: set[str] = set(
+            fga_adapter.list_viewable_document_ids(str(user.id), user_clearance)
+        )
+
+        # ── Approved access requests (per-doc, not expired) ─────────────
+        approved_doc_ids: set[str] = set()
+        scope_mode = "full_db"
+        if db is not None:
+            from app.repositories.document_access_request_repository import doc_access_request_repo
+            from app.repositories.system_setting_repository import system_setting_repository
+            approved_doc_ids = doc_access_request_repo.get_active_approved_doc_ids(db, str(user.id))
+            scope_mode = system_setting_repository.get(db, "query_scope_mode") or "full_db"
+
+        # ── Chroma query scope ──────────────────────────────────────────
+        # full_db  → query toàn bộ Chroma (không filter doc_id)
+        # branch_only → chỉ query doc thuộc nhánh OUI của user
+        if scope_mode == "branch_only" and db is not None:
+            from app.services.oui_tree_service import oui_tree_service
+            branch_oui_ids = oui_tree_service.get_user_branch_oui_ids(db, user)
+            branch_doc_ids = oui_tree_service.get_doc_ids_for_oui_ids(db, branch_oui_ids)
+            query_doc_ids = list(fga_allowed_ids | branch_doc_ids)
+            where = self._build_where(query_doc_ids or None, oui_ids)
+            if not query_doc_ids:
+                return []
+        else:
+            # full_db: không filter → Chroma trả tất cả
+            where = None if not oui_ids else self._build_where(None, oui_ids)
 
         semantic_list: list[dict] = []
         lexical_list: list[dict] = []
@@ -621,23 +662,66 @@ class RetrievalService:
         # top-ranked chunk no longer automatically gets score = 1.0 just
         # because it happened to rank first within THIS query's batch.
         results = []
+        # Track FGA-allowed docs where some chunk exceeds clearance (no approval).
+        # Used in 2nd pass to set doc_restricted=True on their returned low-sens chunks
+        # so the frontend hides Eye/Plus (full file is blocked until admin approves).
+        fga_has_blocked: set[str] = set()
+
         for item in fused:
             sem = self._cosine_sim(item.get("semantic_distance")) if item.get("semantic_distance") is not None else None
             lexical_raw = item.get("lexical_raw_score")
             display_score, kw_abs = self._compute_display_score(sem, lexical_raw)
             if display_score < self.minimum_score:
                 continue
-            results.append({
-                "chunk_id": item["chunk_id"],
-                "document_text": item["document_text"],
-                "metadata": item["metadata"] or {},
-                "score": display_score,
-                "semantic_score": round(sem, 6) if sem is not None else None,
-                "keyword_score": round(kw_abs, 6) if kw_abs is not None else None,
-                "sources": item.get("sources", []),
-            })
 
-        results = self._apply_sensitivity_gate(results, user)
+            meta     = item.get("metadata") or {}
+            doc_id   = meta.get("document_id", "")
+            chunk_sens = int(meta.get("chunk_sensitivity") or meta.get("sensitivity") or 1)
+
+            fga_allow    = doc_id in fga_allowed_ids
+            has_approval = doc_id in approved_doc_ids
+
+            if fga_allow:
+                if has_approval or chunk_sens <= user_clearance:
+                    results.append({
+                        "chunk_id":       item["chunk_id"],
+                        "document_text":  item["document_text"],
+                        "metadata":       meta,
+                        "score":          display_score,
+                        "semantic_score": round(sem, 6) if sem is not None else None,
+                        "keyword_score":  round(kw_abs, 6) if kw_abs is not None else None,
+                        "sources":        item.get("sources", []),
+                        "doc_restricted": False,
+                    })
+                else:
+                    # Case 3.2: FGA allow but chunk sensitivity exceeds clearance, no approval
+                    fga_has_blocked.add(doc_id)
+                    logger.debug(
+                        "CHUNK BLOCKED (sensitivity): chunk=%s chunk_sens=%d clearance=%d",
+                        item["chunk_id"], chunk_sens, user_clearance,
+                    )
+            else:
+                # FGA deny — chỉ hiện nếu chunk_sensitivity ≤ clearance (case 3.3)
+                if chunk_sens <= user_clearance:
+                    results.append({
+                        "chunk_id":       item["chunk_id"],
+                        "document_text":  item["document_text"],
+                        "metadata":       meta,
+                        "score":          display_score,
+                        "semantic_score": round(sem, 6) if sem is not None else None,
+                        "keyword_score":  round(kw_abs, 6) if kw_abs is not None else None,
+                        "sources":        item.get("sources", []),
+                        "doc_restricted": True,   # frontend ẩn Eye / attach
+                    })
+
+        # 2nd pass (case 3.2): docs that have blocked high-sens chunks must hide
+        # Eye/Plus on their low-sens returned chunks too — file view is forbidden
+        # until admin grants approval.
+        if fga_has_blocked:
+            for r in results:
+                if (r.get("metadata") or {}).get("document_id") in fga_has_blocked:
+                    r["doc_restricted"] = True
+
         results = self._post_filter_oui(results, oui_ids)
         return results[:top_k]
 

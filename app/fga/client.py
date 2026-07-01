@@ -10,12 +10,12 @@ class FGAClient:
     def _base(self) -> str:
         return f"{settings.openfga_url}/stores/{settings.openfga_store_id}"
 
-    def check(self, user: str, relation: str, object: str) -> bool:
+    def check(self, user: str, relation: str, object: str, context: dict | None = None) -> bool:
         try:
-            resp = self._http.post(
-                f"{self._base}/check",
-                json={"tuple_key": {"user": user, "relation": relation, "object": object}},
-            )
+            body: dict = {"tuple_key": {"user": user, "relation": relation, "object": object}}
+            if context:
+                body["context"] = context
+            resp = self._http.post(f"{self._base}/check", json=body)
             resp.raise_for_status()
             return resp.json().get("allowed", False)
         except Exception:
@@ -32,21 +32,23 @@ class FGAClient:
                 ).raise_for_status()
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 400:
-                    continue  
+                    continue
                 raise
 
     def delete(self, tuples: list[dict]) -> None:
         if not tuples:
             return
         for t in tuples:
+            # Strip condition field — delete only needs the base tuple key
+            base = {k: v for k, v in t.items() if k != "condition"}
             try:
                 self._http.post(
                     f"{self._base}/write",
-                    json={"deletes": {"tuple_keys": [t]}},
+                    json={"deletes": {"tuple_keys": [base]}},
                 ).raise_for_status()
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 400:
-                    continue  
+                    continue
                 raise
 
     def create_store(self, name: str) -> str:
@@ -64,7 +66,7 @@ class FGAClient:
         )
         resp.raise_for_status()
         return resp.json()["authorization_model_id"]
-    
+
     def read(self, object: str) -> list[dict]:
         resp = self._http.post(
             f"{self._base}/read",
@@ -72,18 +74,15 @@ class FGAClient:
         )
         resp.raise_for_status()
         return [t["key"] for t in resp.json().get("tuples", [])]
-    
-    def list_objects(self, user: str, relation: str, object_type: str) -> list[str]:
-        """Lấy danh sách tất cả object mà user có relation nhất định."""
+
+    def list_objects(
+        self, user: str, relation: str, object_type: str, context: dict | None = None
+    ) -> list[str]:
         try:
-            resp = self._http.post(
-                f"{self._base}/list-objects",
-                json={
-                    "user": user,
-                    "relation": relation,
-                    "type": object_type,
-                },
-            )
+            body: dict = {"user": user, "relation": relation, "type": object_type}
+            if context:
+                body["context"] = context
+            resp = self._http.post(f"{self._base}/list-objects", json=body)
             resp.raise_for_status()
             return resp.json().get("objects", [])
         except Exception:

@@ -12,6 +12,24 @@ class OuiTreeService:
     - Access check (node con xem doc public của node cha)
     """
 
+    def get_direct_parents(self, db: Session, oui_id: str) -> list[str]:
+        """Trả về list oui_id của các parent trực tiếp (không đệ quy)."""
+        rows = db.execute(
+            oui_parent.select().where(oui_parent.c.oui_id == oui_id)
+        ).fetchall()
+        return [row.parent_oui_id for row in rows]
+
+    def get_root_oui_id(self, db: Session, oui_id: str) -> str:
+        """Traverse lên gốc, trả về oui_id của root (không có parent)."""
+        current = oui_id
+        while True:
+            rows = db.execute(
+                oui_parent.select().where(oui_parent.c.oui_id == current)
+            ).fetchall()
+            if not rows:
+                return current
+            current = rows[0].parent_oui_id
+
     def get_ancestors(self, db: Session, oui_id: str) -> list[str]:
         """
         Trả về list oui_id của tất cả ancestors (không bao gồm chính nó).
@@ -81,6 +99,30 @@ class OuiTreeService:
                     f"— không thể assign thêm vào node cùng nhánh"
                 )
         return None
+
+
+    def get_user_branch_oui_ids(self, db: Session, user) -> set[str]:
+        """
+        Trả về tất cả OUI IDs trong nhánh cây chứa user:
+        user's OUIs + tất cả ancestors + tất cả descendants.
+        Dùng cho query_scope_mode = 'branch_only'.
+        """
+        user_oui_ids = {uop.oui_id for uop in getattr(user, "oui_positions", [])}
+        all_ids: set[str] = set(user_oui_ids)
+        for oui_id in user_oui_ids:
+            all_ids.update(self.get_ancestors(db, oui_id))
+            all_ids.update(self.get_descendants(db, oui_id))
+        return all_ids
+
+    def get_doc_ids_for_oui_ids(self, db: Session, oui_ids: set[str]) -> set[str]:
+        """Trả về tất cả document IDs thuộc các OUI trong oui_ids."""
+        if not oui_ids:
+            return set()
+        from app.models.document import document_oui
+        rows = db.execute(
+            document_oui.select().where(document_oui.c.oui_id.in_(list(oui_ids)))
+        ).fetchall()
+        return {row.document_id for row in rows}
 
 
 oui_tree_service = OuiTreeService()

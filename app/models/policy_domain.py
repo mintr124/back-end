@@ -36,12 +36,13 @@ class DomainEntityType(Base, TimestampMixin):
         UniqueConstraint("domain_id", "entity_type", name="uq_domain_entity"),
     )
 
-    id          = Column(String(36), primary_key=True, default=new_uuid)
-    domain_id   = Column(String(36), ForeignKey("policy_domains.id"), nullable=False, index=True)
-    entity_type = Column(String(128), nullable=False)          # e.g. "full_name"
-    label_vi    = Column(String(255), nullable=True)           # e.g. "Tên người"
+    id             = Column(String(36), primary_key=True, default=new_uuid)
+    domain_id      = Column(String(36), ForeignKey("policy_domains.id"), nullable=False, index=True)
+    entity_type    = Column(String(128), nullable=False)          # e.g. "salary_amount"
+    label_vi       = Column(String(255), nullable=True)           # e.g. "Mức lương"
+    boolean_labels = Column(JSON, nullable=False, default=list)   # e.g. ["has_pii", "has_financial"]
     is_system_suggested = Column(Boolean, nullable=False, default=False)
-    is_active   = Column(Boolean, nullable=False, default=True)
+    is_active      = Column(Boolean, nullable=False, default=True)
 
     domain = relationship("PolicyDomain", back_populates="entity_types")
 

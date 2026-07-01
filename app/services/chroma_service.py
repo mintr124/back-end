@@ -49,5 +49,8 @@ class ChromaService:
     def update_document_metadata(self, chunk_ids: list[str], metadata_updates: dict) -> None:
         self.repo.update_document_metadata(chunk_ids, metadata_updates)
 
+    def get_metadatas_by_ids(self, chunk_ids: list[str]) -> dict[str, dict]:
+        return self.repo.get_metadatas_by_ids(chunk_ids)
+
 
 chroma_service = ChromaService()

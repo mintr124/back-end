@@ -18,6 +18,7 @@ from app.api.v1.gmail import router as gmail_router
 from app.api.v1.org_units import router as org_units_router
 from app.api.v1.policy import router as policy_router
 from app.api.v1.settings import router as settings_router
+from app.api.v1.document_access_requests import router as access_requests_router
 from app.core.exceptions import register_exception_handlers
 from app.db.init_db import init_db
 from app.db.session import SessionLocal, engine, get_db
@@ -108,6 +109,7 @@ app.include_router(org_units_router, prefix="", tags=["org-units"])
 app.include_router(gmail_router, prefix="", tags=["gmail"])
 app.include_router(policy_router, prefix="/policy", tags=["policy"])
 app.include_router(settings_router, prefix="/settings", tags=["settings"])
+app.include_router(access_requests_router, prefix="", tags=["access-requests"])
 
 
 

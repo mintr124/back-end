@@ -456,39 +456,78 @@ class ChatService:
         found = re.findall(r"\[(\d+)\]", answer_text)
         return {int(n) for n in found}
 
-    def _build_sources_from_retrieved(self, retrieved: list[dict], answer_text: str | None = None) -> list[dict]:
-        cited = self._extract_cited_indices(answer_text) if answer_text else None
-        no_citations = cited is not None and not cited
+    @staticmethod
+    def _make_source_entry(r: dict) -> dict:
+        md = r.get("metadata", {}) or {}
+        return {
+            "documentId":    md.get("document_id"),
+            "documentTitle": md.get("document_title") or md.get("document_id"),
+            "versionId":     md.get("document_version_id"),
+            "sectionPath":   md.get("section_heading"),
+            "relevance":     r.get("score") if r.get("score") is not None else r.get("relevance"),
+            "excerpt":       r.get("document_text") or md.get("excerpt"),
+            "docRestricted": r.get("doc_restricted", False),
+        }
 
-        # When LLM cited specific [N] markers, only include chunks up to the
-        # highest cited index so that uncited trailing chunks are excluded from the
-        # sources panel. Index alignment is preserved: citation [N] → sources[N-1].
-        max_cited_idx = max(cited) if cited else None
+    def _normalize_citations(
+        self,
+        answer_text: str | None,
+        retrieved: list[dict],
+    ) -> tuple[str | None, list[dict]]:
+        """Normalize [N] citation markers in LLM answer to be sequential (1-based)
+        and return the matching sources list in that order.
 
-        sources: list[dict] = []
-        seen_docs: set[str] = set()
-        for i, r in enumerate(retrieved or [], start=1):
-            if max_cited_idx is not None and i > max_cited_idx:
-                break  # stop — remaining chunks were not cited
+        Rules:
+          - No [N] found → answer unchanged; sources = restricted chunks only (or [])
+          - [N] found, e.g. [1],[3],[5] → renumber to [1],[2],[3] in answer text;
+            sources[0]=chunk_1, sources[1]=chunk_3, sources[2]=chunk_5
+        """
+        if not answer_text:
+            return answer_text, []
 
-            md = r.get("metadata", {}) or {}
-            doc_id = md.get("document_id")
+        cited = self._extract_cited_indices(answer_text)
 
-            if no_citations:
-                # LLM answered but cited nothing (e.g. all chunks redacted):
-                # deduplicate by document — one entry per document is enough
-                if doc_id in seen_docs:
+        if not cited:
+            # LLM cited nothing — surface only restricted chunks so the user
+            # knows to request access for potentially relevant content.
+            seen: set[str] = set()
+            restricted: list[dict] = []
+            for r in (retrieved or []):
+                if not r.get("doc_restricted", False):
                     continue
-                seen_docs.add(doc_id)
+                md = r.get("metadata", {}) or {}
+                doc_id = md.get("document_id")
+                if doc_id in seen:
+                    continue
+                seen.add(doc_id)
+                entry = self._make_source_entry(r)
+                entry["docRestricted"] = True
+                restricted.append(entry)
+            return answer_text, restricted
 
-            sources.append({
-                "documentId":    doc_id,
-                "documentTitle": md.get("document_title") or doc_id,
-                "versionId":     md.get("document_version_id"),
-                "sectionPath":   md.get("section_heading"),
-                "relevance":     r.get("score") if r.get("score") is not None else r.get("relevance"),
-                "excerpt":       r.get("document_text") or md.get("excerpt"),
-            })
+        # Sort cited indices → stable sequential mapping: old→new
+        sorted_cited = sorted(cited)
+        old_to_new = {old: new for new, old in enumerate(sorted_cited, start=1)}
+
+        # Renumber every [N] in the answer text
+        def _replace(m: re.Match) -> str:
+            new_n = old_to_new.get(int(m.group(1)))
+            return f"[{new_n}]" if new_n is not None else m.group(0)
+
+        normalized_text = re.sub(r"\[(\d+)\]", _replace, answer_text)
+
+        # Build sources in sorted citation order (exactly one entry per cited chunk)
+        retrieved_list = list(retrieved or [])
+        sources: list[dict] = []
+        for old_idx in sorted_cited:
+            if 1 <= old_idx <= len(retrieved_list):
+                sources.append(self._make_source_entry(retrieved_list[old_idx - 1]))
+
+        return normalized_text, sources
+
+    def _build_sources_from_retrieved(self, retrieved: list[dict], answer_text: str | None = None) -> list[dict]:
+        """Legacy wrapper — prefer _normalize_citations for LLM answers."""
+        _, sources = self._normalize_citations(answer_text, retrieved)
         return sources
 
     # ------------------------------------------------------------------
@@ -590,7 +629,7 @@ class ChatService:
         # ── Retrieval ─────────────────────────────────────────────────
         _top_k   = int(system_setting_repository.get(db, "rag.top_k") or 5)
         _min_score = float(system_setting_repository.get(db, "rag.similarity_threshold") or 0.0)
-        retrieved_raw = retrieval_service.retrieve(query=effective_query, user=user, top_k=_top_k)
+        retrieved_raw = retrieval_service.retrieve(query=effective_query, user=user, top_k=_top_k, db=db)
         retrieved     = self._normalize_retrieved(retrieved_raw, limit=_top_k, min_score=_min_score)
         # Fallback: nếu threshold lọc hết, chỉ lấy 1 chunk tốt nhất (best-effort)
         if not retrieved and _min_score > 0.0:
@@ -644,7 +683,7 @@ class ChatService:
         # Nếu TẤT CẢ chunk đều bị REDACT → trả thông báo trực tiếp, không dùng LLM
         if all_restricted:
             answer_text = "Thông tin này bị hạn chế theo chính sách phân quyền của hệ thống và không thể hiển thị."
-            sources = self._build_sources_from_retrieved(retrieved, answer_text)
+            sources = []
             assistant_status = "success"
 
         elif llm_service.is_configured():
@@ -677,7 +716,8 @@ class ChatService:
                 if llm_text and llm_text.strip():
                     answer_text = llm_text.strip()
                 assistant_status = "no_answer" if is_no_answer(answer_text) else "success"
-                sources = self._build_sources_from_retrieved(retrieved, answer_text) if assistant_status == "success" else []
+                if assistant_status == "success":
+                    answer_text, sources = self._normalize_citations(answer_text, retrieved)
             except Exception:
                 logger.exception("LLM generation failed trace_id=%s", tid)
                 answer_text = None
@@ -687,7 +727,7 @@ class ChatService:
             answer_text, sources = answer_service.generate(user_input=effective_query, retrieved=retrieved)
             assistant_status = "fallback"
             if not sources:
-                sources = self._build_sources_from_retrieved(retrieved, answer_text)
+                answer_text, sources = self._normalize_citations(answer_text, retrieved)
 
         # ── [GUARD 3] PII + Secret scan trên LLM response ─────────────
         if GUARDS_ENABLED and answer_text:
@@ -988,6 +1028,7 @@ class ChatService:
                     top_k=_top_k,
                     oui_ids=oui_ids,
                     chat_mode=chat_source,
+                    db=db,
                 )
             except Exception:
                 logger.exception("Retrieval failed trace_id=%s chat_source=%s", tid, chat_source)
@@ -1089,7 +1130,7 @@ class ChatService:
                 yield {"type": "token", "text": watermark_text}
                 full_text += watermark_text
 
-            sources = self._build_sources_from_retrieved(retrieved, full_text)
+            full_text, sources = self._normalize_citations(full_text, retrieved)
 
         # ── [GUARD 3] PII + Secret scan trên response (stream) ─────────
         if GUARDS_ENABLED and full_text:

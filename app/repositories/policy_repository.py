@@ -77,6 +77,7 @@ class PolicyRepository:
         domain_id: str,
         entity_type: str,
         label_vi: Optional[str] = None,
+        boolean_labels: Optional[list] = None,
         is_system_suggested: bool = False,
     ) -> DomainEntityType:
         obj = DomainEntityType(
@@ -84,6 +85,7 @@ class PolicyRepository:
             domain_id=domain_id,
             entity_type=entity_type,
             label_vi=label_vi,
+            boolean_labels=boolean_labels or [],
             is_system_suggested=is_system_suggested,
         )
         db.add(obj)

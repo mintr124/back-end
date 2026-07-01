@@ -46,6 +46,7 @@ class SourceRead(BaseModel):
     relevance: Optional[float]
     excerpt: Optional[str]
     surroundingContext: Optional[str] = None
+    docRestricted: Optional[bool] = False
 
 
 class MessagePostResponse(BaseModel):

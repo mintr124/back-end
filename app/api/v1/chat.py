@@ -171,7 +171,7 @@ def search_documents(
     if not query:
         return []
     results = retrieval_service.retrieve(
-        query=query, user=current_user, top_k=top_k, mode=mode
+        query=query, user=current_user, top_k=top_k, mode=mode, db=db
     )
     return results
 

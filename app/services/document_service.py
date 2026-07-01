@@ -49,14 +49,14 @@ class DocumentService:
         """User xem được doc nếu FGA cho phép."""
         if doc.owner_user_id == user.id:
             return True, ""
-        if fga_adapter.can_view(user.id, doc.id):
+        if fga_adapter.can_view(user.id, doc.id, self._user_clearance(db, user)):
             return True, ""
         return False, "No permission to view this document"
 
     def _can_edit(self, db: Session, user: User, doc: Document) -> tuple[bool, str]:
         if doc.owner_user_id == user.id:
             return True, ""
-        if fga_adapter.can_edit(user.id, doc.id):
+        if fga_adapter.can_edit(user.id, doc.id, self._user_clearance(db, user)):
             return True, ""
         return False, "No permission to edit this document"
 
@@ -89,7 +89,7 @@ class DocumentService:
 
     def list_documents(self, db: Session, user: User) -> list[Document]:
         """Trả về docs mà user có quyền xem qua FGA."""
-        viewable_ids = fga_adapter.list_viewable_document_ids(user.id)
+        viewable_ids = fga_adapter.list_viewable_document_ids(user.id, self._user_clearance(db, user))
         if not viewable_ids:
             # Owner luôn xem được doc của mình
             return db.query(Document).filter(Document.owner_user_id == user.id).all()
@@ -188,7 +188,10 @@ class DocumentService:
         if payload.document_type is not None:
             doc.document_type = payload.document_type
         if payload.sensitivity is not None:
+            old_sensitivity = doc.sensitivity
             doc.sensitivity = payload.sensitivity
+            if old_sensitivity != payload.sensitivity:
+                self._resync_chunk_sensitivity(db, doc, payload.sensitivity)
         if payload.tags is not None:
             doc.tags = payload.tags
 
@@ -204,6 +207,70 @@ class DocumentService:
         db.refresh(doc)
         self._sync_fga(db, doc)
         return doc
+
+    def _resync_chunk_sensitivity(self, db: Session, doc: Document, new_sensitivity: int) -> None:
+        """Re-compute chunk_sensitivity for all chunks of this doc after sensitivity change.
+
+        Reads entity flags from Chroma (source of truth) because MySQL metadata_json
+        may be missing entity_labels for chunks ingested before entity detection was added.
+        Also updates the doc-level `sensitivity` field stored in Chroma metadata.
+        """
+        from app.services.entity_extractor import compute_chunk_sensitivity
+        from collections import defaultdict
+
+        # Query chunk IDs directly via SQL join (avoid lazy-load issues with doc.versions)
+        version_ids_q = (
+            db.query(DocumentVersion.id)
+            .filter(DocumentVersion.document_id == doc.id)
+            .all()
+        )
+        version_ids = [row[0] for row in version_ids_q]
+        if not version_ids:
+            return
+
+        chunks = db.query(DocumentChunk).filter(
+            DocumentChunk.document_version_id.in_(version_ids)
+        ).all()
+        if not chunks:
+            return
+
+        chunk_ids = [c.id for c in chunks]
+        chunk_by_id = {c.id: c for c in chunks}
+
+        # Read current flags from Chroma (has_pii, has_financial, etc. are stored there)
+        try:
+            chroma_metas = chroma_service.get_metadatas_by_ids(chunk_ids)
+        except Exception as exc:
+            logger.warning("Could not fetch Chroma metadata for doc %s: %s", doc.id, exc)
+            chroma_metas = {}
+
+        _FLAG_KEYS = ("has_pii", "has_financial", "has_credential", "has_legal", "has_strategic", "has_hr")
+
+        # Compute new sensitivity per chunk; group by value for batch Chroma update
+        groups: dict[int, list[str]] = defaultdict(list)
+        for cid in chunk_ids:
+            chroma_meta = chroma_metas.get(cid, {})
+            # Build labels dict from flat Chroma flags
+            labels = {flag: bool(chroma_meta.get(flag, False)) for flag in _FLAG_KEYS}
+            new_cs = compute_chunk_sensitivity(new_sensitivity, labels)
+            groups[new_cs].append(cid)
+
+            # Update MySQL metadata_json
+            chunk = chunk_by_id[cid]
+            meta = dict(chunk.metadata_json or {})
+            meta["chunk_sensitivity"] = new_cs
+            if "entity_labels" not in meta or not meta["entity_labels"]:
+                meta["entity_labels"] = labels
+            chunk.metadata_json = meta
+
+        # Batch-update Chroma: both chunk_sensitivity and doc-level sensitivity
+        for cs_val, cids in groups.items():
+            try:
+                chroma_service.update_document_metadata(
+                    cids, {"chunk_sensitivity": cs_val, "sensitivity": new_sensitivity}
+                )
+            except Exception as exc:
+                logger.warning("Failed to update Chroma chunk_sensitivity for doc %s: %s", doc.id, exc)
 
     def get_versions(self, db: Session, user: User, doc_id: str) -> list[DocumentVersion]:
         doc = self.get_document(db, user, doc_id)
@@ -264,6 +331,7 @@ class DocumentService:
         job, created = job_service.create_or_get_ingest_job(
             db, trace_id=trace_id, document_id=doc.id,
             version_id=version.id, created_by_user_id=user.id,
+            initial_status="pending_approval",
         )
 
         audit_service.log_action(

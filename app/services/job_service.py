@@ -21,6 +21,7 @@ class JobService:
         version_id: str,
         created_by_user_id: str,
         force_new: bool = False,
+        initial_status: str = "queued",
     ) -> tuple[Job, bool]:
         key = f"ingest:{version_id}" if not force_new else f"ingest:{version_id}:{uuid.uuid4().hex}"
         existing = self.repo.get_by_idempotency_key(db, key)
@@ -29,7 +30,7 @@ class JobService:
 
         job = Job(
             job_type="document_ingest",
-            status="queued",
+            status=initial_status,
             progress=0,
             idempotency_key=key,
             trace_id=trace_id,

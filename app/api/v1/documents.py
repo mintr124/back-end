@@ -12,6 +12,7 @@ from app.schemas.document import (
     DocumentUpdateRequest, DocumentVersionRead, UploadVersionResponse,
 )
 from app.schemas.job import JobRead
+from app.models.job import Job as JobModel
 from app.services.document_service import document_service
 from app.services.user_service import user_service as _user_service
 from app.workers.ingest_tasks import process_ingest_job
@@ -21,6 +22,17 @@ router = APIRouter()
 
 def _is_corp_member(db: Session, user: User) -> bool:
     return _user_service.build_user_response(db, user).is_corp_member
+
+
+def _trigger_pending_job(db: Session, document_id: str) -> None:
+    job = db.query(JobModel).filter(
+        JobModel.document_id == document_id,
+        JobModel.status == "pending_approval",
+    ).order_by(JobModel.created_at.desc()).first()
+    if job:
+        job.status = "queued"
+        db.commit()
+        process_ingest_job.delay(job.id)
 
 
 @router.post("", response_model=DocumentRead)
@@ -41,6 +53,17 @@ def list_documents(
 ):
     docs = document_service.list_documents(db, current_user)
     return [DocumentRead.model_validate(d) for d in docs]
+
+
+@router.get("/pending-review-count")
+def pending_review_count(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not _is_corp_member(db, current_user):
+        return {"count": 0}
+    count = db.query(DocumentModel).filter(DocumentModel.status == "review").count()
+    return {"count": count}
 
 
 @router.get("/{document_id}", response_model=DocumentRead)
@@ -102,8 +125,11 @@ async def upload_version(
         trace_id=request.state.trace_id, chunking_config=chunking_config,
     )
 
-    if queued:
-        process_ingest_job.delay(job.id)
+    if _is_corp_member(db, current_user):
+        # Corp member: tự động approve và chunk ngay
+        doc.status = "approved"
+        db.commit()
+        _trigger_pending_job(db, document_id)
 
     return UploadVersionResponse(
         document=DocumentRead.model_validate(doc),
@@ -121,9 +147,33 @@ def view_document_file(
     current_user: User = Depends(get_current_user),
 ):
     import io
+    from sqlalchemy import text
     from app.repositories.storage_repository import StorageRepository
+    from app.repositories.document_access_request_repository import doc_access_request_repo
 
     document_service.get_document(db, current_user, document_id)
+
+    # Chunk-level sensitivity gate: block if any chunk > user clearance without approval
+    user_clearance = max(
+        (uop.position.clearance for uop in getattr(current_user, "oui_positions", []) if uop.position),
+        default=1,
+    )
+    if not _is_corp_member(db, current_user):
+        row = db.execute(text("""
+            SELECT MAX(CAST(JSON_UNQUOTE(JSON_EXTRACT(dc.metadata_json, '$.chunk_sensitivity')) AS UNSIGNED))
+            FROM document_chunks dc
+            JOIN document_versions dv ON dc.document_version_id = dv.id
+            WHERE dv.document_id = :doc_id
+        """), {"doc_id": document_id}).scalar()
+        max_chunk_sens = int(row or 0)
+        if max_chunk_sens > user_clearance:
+            approved_ids = doc_access_request_repo.get_active_approved_doc_ids(db, str(current_user.id))
+            if document_id not in approved_ids:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Tài liệu này chứa nội dung vượt mức độ phân quyền của bạn. Vui lòng gửi yêu cầu xem tài liệu.",
+                )
+
     version = db.query(DocumentVersion).filter(
         DocumentVersion.id == version_id,
         DocumentVersion.document_id == document_id,
@@ -162,10 +212,12 @@ def submit_for_review(
 
     if _is_corp_member(db, current_user):
         doc.status = "approved"
+        db.commit()
+        _trigger_pending_job(db, doc.id)
     else:
         doc.status = "review"
+        db.commit()
 
-    db.commit()
     db.refresh(doc)
     return DocumentRead.model_validate(doc)
 
@@ -185,6 +237,7 @@ def approve_document(
         raise HTTPException(status_code=400, detail=f"Cannot approve with status '{doc.status}'")
     doc.status = "approved"
     db.commit()
+    _trigger_pending_job(db, doc.id)
     db.refresh(doc)
     return DocumentRead.model_validate(doc)
 
@@ -204,6 +257,13 @@ def reject_document(
     if doc.status not in {"review", "uploaded"}:
         raise HTTPException(status_code=400, detail=f"Cannot reject with status '{doc.status}'")
     doc.status = "draft"
+    job = db.query(JobModel).filter(
+        JobModel.document_id == doc.id,
+        JobModel.status == "pending_approval",
+    ).order_by(JobModel.created_at.desc()).first()
+    if job:
+        job.status = "cancelled"
+        job.error_message = "Rejected by reviewer"
     db.commit()
     db.refresh(doc)
     return DocumentRead.model_validate(doc)
