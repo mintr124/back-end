@@ -173,14 +173,25 @@ class ChromaRepository:
             collection_name: str | None = None,
         ) -> dict:
             collection = self._get_collection(collection_name)
+            # Cap n_results to collection size to avoid HNSW "ef or M too small" error
+            total = collection.count()
+            n_results = min(top_k, max(1, total))
             kwargs: dict[str, Any] = dict(
                 query_embeddings=[embedding],
-                n_results=top_k,
+                n_results=n_results,
                 include=["documents", "metadatas", "distances"],
             )
             if where:
                 kwargs["where"] = where
-            return collection.query(**kwargs)
+            try:
+                return collection.query(**kwargs)
+            except RuntimeError:
+                # Filtered subset smaller than n_results — retry with n_results=1
+                kwargs["n_results"] = 1
+                try:
+                    return collection.query(**kwargs)
+                except RuntimeError:
+                    return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
 
     # ------------------------------------------------------------------
     # Keyword / lexical search

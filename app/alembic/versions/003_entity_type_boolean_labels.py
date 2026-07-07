@@ -14,19 +14,19 @@ depends_on = None
 
 
 def upgrade():
-    # MySQL không cho phép DEFAULT trên JSON → thêm nullable trước
-    op.add_column(
-        'domain_entity_types',
-        sa.Column('boolean_labels', sa.JSON, nullable=True),
-    )
-    # Gán [] cho tất cả rows hiện có
-    op.execute("UPDATE domain_entity_types SET boolean_labels = '[]' WHERE boolean_labels IS NULL")
-    # Chuyển sang NOT NULL
-    op.alter_column(
-        'domain_entity_types', 'boolean_labels',
-        existing_type=sa.JSON,
-        nullable=False,
-    )
+    from sqlalchemy import inspect
+    cols = [c['name'] for c in inspect(op.get_bind()).get_columns('domain_entity_types')]
+    if 'boolean_labels' not in cols:
+        op.add_column(
+            'domain_entity_types',
+            sa.Column('boolean_labels', sa.JSON, nullable=True),
+        )
+        op.execute("UPDATE domain_entity_types SET boolean_labels = '[]' WHERE boolean_labels IS NULL")
+        op.alter_column(
+            'domain_entity_types', 'boolean_labels',
+            existing_type=sa.JSON,
+            nullable=False,
+        )
 
 
 def downgrade():
