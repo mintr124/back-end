@@ -362,6 +362,16 @@ def _chunk_with_llm(parsed: ParsedDocument, cfg: ChunkConfig) -> list[dict]:
     cleaned_pages = _strip_headers_footers(parsed.pages, threshold=3)
     clean_text = "\n\n".join(t for _, t in cleaned_pages if t.strip())
 
+    # Build page offset map để detect page per chunk sau khi LLM trả về
+    _search_text = ""
+    _page_offsets: list[tuple[int, int, int]] = []
+    for _pno, _ptxt in cleaned_pages:
+        _pt = _ptxt.strip()
+        if _pt:
+            _start = len(_search_text)
+            _search_text += _pt + "\n\n"
+            _page_offsets.append((_pno, _start, len(_search_text)))
+
     text = clean_text[:_LLM_CHUNK_MAX_INPUT_CHARS]
     prompt = _LLM_CHUNK_PROMPT.format(text=text)
     logger.info("LLM chunker input prompt len=%d preview=%r", len(prompt), prompt)
@@ -418,6 +428,11 @@ def _chunk_with_llm(parsed: ParsedDocument, cfg: ChunkConfig) -> list[dict]:
 
         token_count = _estimate_tokens(chunk_text)
 
+        # Tìm page range thực tế cho chunk này
+        pg_start, pg_end = _find_pages_for_chunk(
+            chunk_text, _search_text, _page_offsets, total_pages
+        )
+
         if token_count > cfg.max_tokens * 2:
             logger.warning("LLM chunk idx=%d quá lớn (%d tokens), hard split", idx, token_count)
             sub_chunks = _LegacyChunker(cfg)._hard_split(chunk_text)
@@ -426,7 +441,8 @@ def _chunk_with_llm(parsed: ParsedDocument, cfg: ChunkConfig) -> list[dict]:
                     idx=len(results),
                     chunk_text=sub_text,
                     heading=heading,
-                    total_pages=total_pages,
+                    page_start=pg_start,
+                    page_end=pg_end,
                     total_chunks=len(items),
                     mode="llm_structured",
                 ))
@@ -436,7 +452,8 @@ def _chunk_with_llm(parsed: ParsedDocument, cfg: ChunkConfig) -> list[dict]:
             idx=len(results),
             chunk_text=chunk_text,
             heading=heading,
-            total_pages=total_pages,
+            page_start=pg_start,
+            page_end=pg_end,
             total_chunks=len(items),
             mode="llm_structured",
         ))
@@ -449,7 +466,8 @@ def _make_chunk_dict(
     idx: int,
     chunk_text: str,
     heading: str,
-    total_pages: int,
+    page_start: int,
+    page_end: int,
     total_chunks: int,
     mode: str,
 ) -> dict:
@@ -458,8 +476,8 @@ def _make_chunk_dict(
         "chunk_index":   idx,
         "chunk_text":    chunk_text,
         "embed_text":    embed_text,
-        "page_start":    1,
-        "page_end":      total_pages,
+        "page_start":    page_start,
+        "page_end":      page_end,
         "token_count":   _estimate_tokens(chunk_text),
         "chunk_hash":    _sha256(chunk_text),
         "metadata_json": {
@@ -518,6 +536,46 @@ def _estimate_tokens(text: str, tokenizer: Any = None) -> int:
         except Exception:
             pass
     return max(1, (len(text) + 3) // 4)
+
+
+def _find_pages_for_chunk(
+    chunk_text: str,
+    search_text: str,
+    page_offsets: list[tuple[int, int, int]],
+    total_pages: int,
+) -> tuple[int, int]:
+    """
+    Tìm page_start/page_end cho một chunk bằng cách search
+    đoạn đầu chunk_text trong search_text (full doc text theo page).
+    Fallback về (1, total_pages) nếu không tìm thấy.
+    """
+    if not chunk_text or not page_offsets:
+        return 1, total_pages
+
+    # Thử nhiều probe: đoạn đầu tiên có nghĩa (bỏ qua heading ngắn)
+    probes: list[str] = []
+    lines = [ln.strip() for ln in chunk_text.splitlines() if ln.strip()]
+    for ln in lines:
+        if len(ln) > 15:
+            probes.append(ln[:80])
+            break
+    probes.append(chunk_text[:80].strip())
+
+    pos = -1
+    for probe in probes:
+        if probe and len(probe) > 10:
+            pos = search_text.find(probe)
+            if pos >= 0:
+                break
+
+    if pos < 0:
+        return 1, total_pages
+
+    chunk_end = pos + len(chunk_text)
+    pages = sorted({pno for pno, ps, pe in page_offsets if pos < pe and chunk_end > ps})
+    if pages:
+        return pages[0], pages[-1]
+    return 1, total_pages
 
 
 # ---------------------------------------------------------------------------

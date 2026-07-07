@@ -31,6 +31,7 @@ def update_settings(
         "rag.top_k",
         "rag.similarity_threshold",
         "rag.hybrid_search",
+        "query_scope_mode",
     }
     filtered = {k: v for k, v in payload.items() if k in allowed_keys}
     system_setting_repository.set_many(db, filtered)

@@ -105,6 +105,7 @@ class GmailService:
     def _build_service(self, creds: Credentials):
         return build("gmail", "v1", credentials=creds)
     
+    @staticmethod
     def _strip_html(html: str) -> str:
         """Loại bỏ tag HTML, style/script block, và whitespace dư thừa."""
         if not html:
@@ -335,6 +336,14 @@ class GmailService:
             sender = self._get_header(headers, "From")
             date_str = self._get_header(headers, "Date")
             snippet = msg.get("snippet", "")
+
+            # If body is empty or contains raw HTML, strip it
+            if not body.strip() or "<" in body:
+                html_body = self._get_html_body(msg["payload"])
+                if html_body:
+                    body = GmailService._strip_html(html_body)
+                elif "<" in body:
+                    body = GmailService._strip_html(body)
 
             text = f"Subject: {subject}\nFrom: {sender}\nDate: {date_str}\n\n{body or snippet}"
             text = text.strip()[:8000]

@@ -27,17 +27,19 @@ class AccessRequestReject(BaseModel):
 
 
 class AccessRequestRead(BaseModel):
-    id:              str
-    document_id:     str
-    document_title:  Optional[str] = None
-    user_id:         str
-    requester_name:  Optional[str] = None
-    status:          str
-    expires_at:      Optional[datetime] = None
-    admin_id:        Optional[str] = None
-    admin_note:      Optional[str] = None
-    created_at:      datetime
-    resolved_at:     Optional[datetime] = None
+    id:                   str
+    document_id:          str
+    document_title:       Optional[str] = None
+    document_sensitivity: Optional[int] = None
+    user_id:              str
+    requester_name:       Optional[str] = None
+    requester_email:      Optional[str] = None
+    status:               str
+    expires_at:           Optional[datetime] = None
+    admin_id:             Optional[str] = None
+    admin_note:           Optional[str] = None
+    created_at:           datetime
+    resolved_at:          Optional[datetime] = None
 
     model_config = {"from_attributes": True}
 

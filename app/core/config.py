@@ -14,9 +14,9 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     access_token_exp_minutes: int = 1440; 
     
-    openfga_url: str = "http://openfga:8080"; 
-    openfga_store_id: str = "01KWEP05BJ8A3J2BGH0BXSE7VK"  
-    openfga_model_id: str = "01KWEP08GY3KK61T45RJ7XFYJG"
+    openfga_url: str = "http://openfga:8080"
+    openfga_store_id: str = ""
+    openfga_model_id: str = ""
 
     minio_endpoint: str = "minio:9000"
     minio_access_key: str = "minioadmin"

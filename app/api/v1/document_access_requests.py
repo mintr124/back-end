@@ -59,21 +59,25 @@ def _build_read(db: Session, obj: DocumentAccessRequest) -> AccessRequestRead:
     from app.models.user import User as UserModel
     doc       = db.get(Document,   obj.document_id)
     requester = db.get(UserModel,  obj.user_id)
-    name = None
+    name  = None
+    email = None
     if requester:
-        name = getattr(requester, "full_name", None) or getattr(requester, "email", None)
+        name  = getattr(requester, "name", None) or getattr(requester, "email", None)
+        email = getattr(requester, "email", None)
     return AccessRequestRead(
-        id             = obj.id,
-        document_id    = obj.document_id,
-        document_title = doc.title if doc else None,
-        user_id        = obj.user_id,
-        requester_name = name,
-        status         = obj.status,
-        expires_at     = obj.expires_at,
-        admin_id       = obj.admin_id,
-        admin_note     = obj.admin_note,
-        created_at     = obj.created_at,
-        resolved_at    = obj.resolved_at,
+        id                   = obj.id,
+        document_id          = obj.document_id,
+        document_title       = doc.title if doc else None,
+        document_sensitivity = doc.sensitivity if doc else None,
+        user_id              = obj.user_id,
+        requester_name       = name,
+        requester_email      = email,
+        status               = obj.status,
+        expires_at           = obj.expires_at,
+        admin_id             = obj.admin_id,
+        admin_note           = obj.admin_note,
+        created_at           = obj.created_at,
+        resolved_at          = obj.resolved_at,
     )
 
 

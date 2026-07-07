@@ -388,6 +388,13 @@ class RetrievalService:
         if sem is None and kw_abs is None:
             return 0.0, None
 
+        # Single-source mode: use that score directly
+        if sem is None:
+            return round(min(1.0, max(0.0, kw_val)), 6), kw_abs
+        if kw_abs is None:
+            return round(min(1.0, max(0.0, sem_val)), 6), kw_abs
+
+        # Hybrid: weighted combination
         display = (
             _DISPLAY_ALPHA_SEMANTIC * sem_val
             + (1.0 - _DISPLAY_ALPHA_SEMANTIC) * kw_val
@@ -485,10 +492,12 @@ class RetrievalService:
             return []
 
         fused = self._fuse(semantic_list, lexical_list) if mode == "hybrid" else (
-            sorted([{**i, "rrf_score": self._cosine_sim(i.get("distance")), "sources": ["semantic"]}
+            sorted([{**i, "rrf_score": self._cosine_sim(i.get("distance")), "sources": ["semantic"],
+                     "semantic_distance": i.get("distance")}
                     for i in semantic_list], key=lambda x: x["rrf_score"], reverse=True)
             if mode == "semantic" else
-            sorted([{**i, "rrf_score": max(0.0, 1.0 - float(i.get("distance") or 1.0)), "sources": ["lexical"]}
+            sorted([{**i, "rrf_score": max(0.0, 1.0 - float(i.get("distance", 1.0))), "sources": ["lexical"],
+                     "lexical_raw_score": i.get("_bm25_raw")}
                     for i in lexical_list], key=lambda x: x["rrf_score"], reverse=True)
         )
 
@@ -633,13 +642,15 @@ class RetrievalService:
             return []
 
         fused = self._fuse(semantic_list, lexical_list) if mode == "hybrid" else (
-            sorted([{**i, "rrf_score": self._cosine_sim(i.get("distance")), "sources": ["semantic"]}
+            sorted([{**i, "rrf_score": self._cosine_sim(i.get("distance")), "sources": ["semantic"],
+                     "semantic_distance": i.get("distance")}
                     for i in semantic_list], key=lambda x: x["rrf_score"], reverse=True)
             if mode == "semantic" else
-            sorted([{**i, "rrf_score": max(0.0, 1.0 - float(i.get("distance") or 1.0)), "sources": ["lexical"]}
+            sorted([{**i, "rrf_score": max(0.0, 1.0 - float(i.get("distance", 1.0))), "sources": ["lexical"],
+                     "lexical_raw_score": i.get("_bm25_raw")}
                     for i in lexical_list], key=lambda x: x["rrf_score"], reverse=True)
         )
-        
+
         # print("========== TOP FUSED ==========")
         # logger.info("========== TOP FUSED ==========")
 
@@ -662,9 +673,9 @@ class RetrievalService:
         # top-ranked chunk no longer automatically gets score = 1.0 just
         # because it happened to rank first within THIS query's batch.
         results = []
-        # Track FGA-allowed docs where some chunk exceeds clearance (no approval).
-        # Used in 2nd pass to set doc_restricted=True on their returned low-sens chunks
-        # so the frontend hides Eye/Plus (full file is blocked until admin approves).
+        # Docs FGA-allowed nhưng có chunk vượt clearance mà chưa được approve.
+        # Pass 2 sẽ set doc_restricted=True cho tất cả chunk của các doc này
+        # để frontend ẩn Eye/Plus (không được mở full file).
         fga_has_blocked: set[str] = set()
 
         for item in fused:
@@ -682,24 +693,22 @@ class RetrievalService:
             has_approval = doc_id in approved_doc_ids
 
             if fga_allow:
-                if has_approval or chunk_sens <= user_clearance:
-                    results.append({
-                        "chunk_id":       item["chunk_id"],
-                        "document_text":  item["document_text"],
-                        "metadata":       meta,
-                        "score":          display_score,
-                        "semantic_score": round(sem, 6) if sem is not None else None,
-                        "keyword_score":  round(kw_abs, 6) if kw_abs is not None else None,
-                        "sources":        item.get("sources", []),
-                        "doc_restricted": False,
-                    })
-                else:
-                    # Case 3.2: FGA allow but chunk sensitivity exceeds clearance, no approval
+                # Case 3.1/3.2: FGA allow → trả TẤT CẢ chunks.
+                # chunk_blurred=True nếu chunk_sens > clearance và chưa approve (case 3.2a).
+                is_blurred = chunk_sens > user_clearance and not has_approval
+                if is_blurred:
                     fga_has_blocked.add(doc_id)
-                    logger.debug(
-                        "CHUNK BLOCKED (sensitivity): chunk=%s chunk_sens=%d clearance=%d",
-                        item["chunk_id"], chunk_sens, user_clearance,
-                    )
+                results.append({
+                    "chunk_id":       item["chunk_id"],
+                    "document_text":  item["document_text"],
+                    "metadata":       meta,
+                    "score":          display_score,
+                    "semantic_score": round(sem, 6) if sem is not None else None,
+                    "keyword_score":  round(kw_abs, 6) if kw_abs is not None else None,
+                    "sources":        item.get("sources", []),
+                    "doc_restricted": False,
+                    "chunk_blurred":  is_blurred,
+                })
             else:
                 # FGA deny — chỉ hiện nếu chunk_sensitivity ≤ clearance (case 3.3)
                 if chunk_sens <= user_clearance:
@@ -711,12 +720,11 @@ class RetrievalService:
                         "semantic_score": round(sem, 6) if sem is not None else None,
                         "keyword_score":  round(kw_abs, 6) if kw_abs is not None else None,
                         "sources":        item.get("sources", []),
-                        "doc_restricted": True,   # frontend ẩn Eye / attach
+                        "doc_restricted": True,   # frontend ẩn Eye/Plus
+                        "chunk_blurred":  False,
                     })
 
-        # 2nd pass (case 3.2): docs that have blocked high-sens chunks must hide
-        # Eye/Plus on their low-sens returned chunks too — file view is forbidden
-        # until admin grants approval.
+        # Pass 2: docs FGA-allow có chunk bị chặn → ẩn Eye/Plus trên tất cả chunk của doc đó
         if fga_has_blocked:
             for r in results:
                 if (r.get("metadata") or {}).get("document_id") in fga_has_blocked:

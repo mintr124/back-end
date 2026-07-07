@@ -51,6 +51,7 @@ async def trace_middleware(request: Request, call_next):
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "http://localhost:5173",
         "http://localhost:8083",
     ],
     allow_credentials=False,
