@@ -94,9 +94,9 @@ class MemoryService:
         # Find relevant pairs from older_pairs
         relevant_pairs = self._find_relevant(query, older_pairs, top_k=RELEVANT_PAIRS)
 
-        # Dedup: remove relevant pairs already in recent
-        recent_ids = {id(p) for p in recent_pairs}
-        relevant_pairs = [p for p in relevant_pairs if id(p) not in recent_ids]
+        # Dedup: remove relevant pairs already in recent (compare by message ID)
+        recent_ids = {u.id for u, a in recent_pairs}
+        relevant_pairs = [p for p in relevant_pairs if p[0].id not in recent_ids]
 
         # Build history list
         history: list[dict] = []

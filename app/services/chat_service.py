@@ -988,18 +988,17 @@ class ChatService:
                     summary_items    = [h for h in history if h["role"] == "system"]
                     summary_note     = summary_items[0]["content"] if summary_items else ""
 
-                    prompt = ""
-                    if summary_note:
-                        prompt += f"{summary_note}\n\n"
-                    if history_messages:
-                        history_text = "\n".join(
-                            f"{h['role']}: {h['content']}" for h in history_messages
-                        )
-                        prompt += f"LỊCH SỬ HỘI THOẠI\n{history_text}\n\n"
-                    prompt += f"Người dùng: {(llm_extra_context + effective_query).strip()}"
+                    # Build proper multi-turn messages array
+                    api_messages: list[dict] = []
+                    for i, h in enumerate(history_messages):
+                        content = h["content"]
+                        if i == 0 and summary_note:
+                            content = f"{summary_note}\n\n{content}"
+                        api_messages.append({"role": h["role"], "content": content})
+                    api_messages.append({"role": "user", "content": (llm_extra_context + effective_query).strip()})
 
                     for token in llm_service.generate_stream(
-                        prompt=prompt,
+                        messages=api_messages,
                         max_tokens=1024,
                         temperature=0.7,
                         system=CHATBOT_SYSTEM_PROMPT,

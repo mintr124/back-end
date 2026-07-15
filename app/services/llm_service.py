@@ -235,13 +235,24 @@ YÊU CẦU TRẢ LỜI
 
         raise RuntimeError("No LLM provider configured")
 
-    def generate_stream(self, prompt: str, max_tokens: int = 256, temperature: float = 0.0, system: Optional[str] = None,):
+    def generate_stream(
+        self,
+        prompt: str = None,
+        messages: list | None = None,
+        max_tokens: int = 256,
+        temperature: float = 0.0,
+        system: Optional[str] = None,
+    ):
         provider = settings.llm_provider
         logger.info(
             "LLM generate_stream start provider=%s max_tokens=%s temperature=%s",
             provider, max_tokens, temperature,
         )
-        logger.info("LLM STREAM PROMPT:\n%s", prompt)
+
+        # Build messages array if not provided
+        if messages is None:
+            logger.info("LLM STREAM PROMPT:\n%s", prompt)
+            messages = [{"role": "user", "content": prompt}]
 
         if provider == "openai":
             if OpenAI is None:
@@ -253,12 +264,10 @@ YÊU CẦU TRẢ LỜI
             model = settings.openai_model or "gpt-4o-mini"
             instructions = system if system else self._build_instructions(None)
             logger.info("LLM generate_stream SYSTEM:\n%s", instructions)
+            api_messages = [{"role": "system", "content": instructions}] + messages
             with client.chat.completions.create(
                 model=model,
-                messages=[
-                    {"role": "system", "content": instructions},
-                    {"role": "user", "content": prompt},
-                ],
+                messages=api_messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stream=True,
@@ -269,29 +278,57 @@ YÊU CẦU TRẢ LỜI
                         yield token
             return
 
-        url = settings.olama_url.rstrip("/") + "/api/generate"
+        # Ollama: use /api/chat for multi-turn, /api/generate for single prompt
         model = settings.olama_model
-        payload = {
-            "model": model,
-            "prompt": prompt,
-            "stream": True,
-            "options": {"num_predict": max_tokens, "temperature": temperature},
-        }
-        with httpx.Client(timeout=settings.llm_timeout_seconds) as client:
-            with client.stream("POST", url, json=payload) as resp:
-                resp.raise_for_status()
-                for line in resp.iter_lines():
-                    if not line.strip():
-                        continue
-                    try:
-                        chunk = jsonlib.loads(line)
-                        token = chunk.get("response", "")
-                        if token:
-                            yield token
-                        if chunk.get("done"):
-                            break
-                    except Exception:
-                        continue
+        if len(messages) > 1 or system:
+            url = settings.olama_url.rstrip("/") + "/api/chat"
+            chat_messages = messages
+            if system:
+                chat_messages = [{"role": "system", "content": system}] + messages
+            payload = {
+                "model": model,
+                "messages": chat_messages,
+                "stream": True,
+                "options": {"num_predict": max_tokens, "temperature": temperature},
+            }
+            with httpx.Client(timeout=settings.llm_timeout_seconds) as client:
+                with client.stream("POST", url, json=payload) as resp:
+                    resp.raise_for_status()
+                    for line in resp.iter_lines():
+                        if not line.strip():
+                            continue
+                        try:
+                            chunk = jsonlib.loads(line)
+                            token = chunk.get("message", {}).get("content", "")
+                            if token:
+                                yield token
+                            if chunk.get("done"):
+                                break
+                        except Exception:
+                            continue
+        else:
+            url = settings.olama_url.rstrip("/") + "/api/generate"
+            payload = {
+                "model": model,
+                "prompt": messages[0]["content"],
+                "stream": True,
+                "options": {"num_predict": max_tokens, "temperature": temperature},
+            }
+            with httpx.Client(timeout=settings.llm_timeout_seconds) as client:
+                with client.stream("POST", url, json=payload) as resp:
+                    resp.raise_for_status()
+                    for line in resp.iter_lines():
+                        if not line.strip():
+                            continue
+                        try:
+                            chunk = jsonlib.loads(line)
+                            token = chunk.get("response", "")
+                            if token:
+                                yield token
+                            if chunk.get("done"):
+                                break
+                        except Exception:
+                            continue
 
     def generate_json(
         self,
