@@ -1,21 +1,15 @@
 """
-chroma_repository.py  –  v2
-=============================
-Key improvements vs v1:
-  1. Collection created with  hnsw:space = cosine  (mandatory for correct distances)
-  2. query_by_keyword uses Chroma's built-in  where_document=$contains  filter
-     → NO full-corpus fetch; only matching docs are scored
-  3. Embedding-based query returns cosine distances in [0, 1]
-     (1 − cosine_sim), so RetrievalService can use  sim = 1 − distance
+ChromaDB vector store repository.
+Collections use hnsw:space=cosine; distances are in [0, 1] (1 − cosine_sim).
+Keyword search uses Chroma's where_document=$contains filter to avoid full-corpus scans.
 """
 from __future__ import annotations
 
 import json
 import os
 import threading
+import unicodedata
 from typing import Any
-
-from numpy import empty
 
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "FALSE")
 
@@ -23,13 +17,12 @@ import chromadb  # noqa: E402
 
 from app.core.config import settings
 
-import unicodedata
-
 try:
     from pyvi import ViTokenizer
 except ImportError:
     ViTokenizer = None
 
+# Vietnamese stopwords filtered out before keyword tokenisation.
 _VN_STOPWORDS = {
     "là", "của", "và", "có", "được", "này", "đó", "các", "cho", "với",
     "tại", "về", "như", "từ", "trong", "khi", "để", "theo", "những",
@@ -38,11 +31,15 @@ _VN_STOPWORDS = {
     "không", "còn", "nữa", "nào", "gì", "ai", "sao", "bao", "nhiêu",
 }
 
+
+# Remove Vietnamese diacritics and normalise to ASCII for accent-insensitive comparison.
 def _strip_accents(text: str) -> str:
     text = text.replace("đ", "d").replace("Đ", "D")
     nfd = unicodedata.normalize("NFD", text)
     return "".join(c for c in nfd if unicodedata.category(c) != "Mn")
 
+
+# Tokenise Vietnamese text using pyvi when available, falling back to whitespace split.
 def _segment_vi(text: str) -> list[str]:
     text = (text or "").strip().lower()
     if not text:
@@ -55,8 +52,10 @@ def _segment_vi(text: str) -> list[str]:
 class ChromaRepository:
     _lock = threading.RLock()
     _client = None
+    # Class-level collection cache shared across instances.
     _collections: dict[str, Any] = {}
 
+    # Return the shared ChromaDB HTTP client, initialising it on first use.
     def _get_client(self) -> chromadb.HttpClient:
         if ChromaRepository._client is None:
             with ChromaRepository._lock:
@@ -67,6 +66,7 @@ class ChromaRepository:
                     )
         return ChromaRepository._client
 
+    # Return the named collection, creating it with cosine space if absent.
     def _get_collection(self, collection_name: str | None = None):
         name = collection_name or settings.chroma_collection
         if name not in ChromaRepository._collections:
@@ -83,6 +83,7 @@ class ChromaRepository:
     # Metadata helpers
     # ------------------------------------------------------------------
 
+    # Flatten a metadata dict to scalar values; non-scalars are JSON-encoded.
     def _flatten_metadata(self, metadata: dict[str, Any]) -> dict[str, Any]:
         flat: dict[str, Any] = {}
         for k, v in (metadata or {}).items():
@@ -98,6 +99,7 @@ class ChromaRepository:
     # Write
     # ------------------------------------------------------------------
 
+    # Upsert a single chunk with its embedding and metadata.
     def upsert(
         self,
         *,
@@ -114,13 +116,14 @@ class ChromaRepository:
             metadatas=[self._flatten_metadata(metadata)],
         )
 
+    # Delete chunks by their IDs.
     def delete_by_ids(self, ids: list[str]) -> None:
         if not ids:
             return
         self._get_collection().delete(ids=ids)
 
+    # Return {chunk_id: metadata_dict} for the given IDs (present entries only).
     def get_metadatas_by_ids(self, ids: list[str]) -> dict[str, dict]:
-        """Return {chunk_id: metadata_dict} for the given IDs (only present ones)."""
         if not ids:
             return {}
         raw = self._get_collection().get(ids=ids, include=["metadatas"])
@@ -129,6 +132,7 @@ class ChromaRepository:
             result[chunk_id] = meta or {}
         return result
 
+    # Apply metadata_updates to all chunks matching chunk_ids via an upsert.
     def update_document_metadata(
         self, chunk_ids: list[str], metadata_updates: dict
     ) -> None:
@@ -164,6 +168,7 @@ class ChromaRepository:
     # Semantic search
     # ------------------------------------------------------------------
 
+    # Query the collection by embedding vector; caps n_results to avoid HNSW errors.
     def query_by_embedding(
             self,
             *,
@@ -197,6 +202,8 @@ class ChromaRepository:
     # Keyword / lexical search
     # ------------------------------------------------------------------
 
+    # Keyword search using where_document=$contains to avoid full-corpus scan;
+    # scores candidates with token-overlap F1. Distances are 1 − f1_score.
     def query_by_keyword(
         self,
         *,
@@ -204,15 +211,6 @@ class ChromaRepository:
         top_k: int = 5,
         where: dict | None = None,
     ) -> dict:
-        """
-        Uses Chroma's where_document $contains filter to avoid full-corpus scan.
-        Falls back to a cheap in-memory BM25-style score using only the pre-filtered docs.
-
-        Strategy:
-          - Build a list of meaningful query tokens (len > 1, no stopwords)
-          - Use the most distinctive token as the $contains filter
-          - Score remaining candidates with token-overlap F1
-        """
         collection = self._get_collection()
         empty: dict = {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
 
@@ -294,12 +292,29 @@ class ChromaRepository:
             # Lexical "distance" = 1 − f1_score  (analogous to cosine distance)
             "distances": [[1.0 - scored[j][0] for j in range(len(top_idx))]],
         }
-        
-        
+
     # ------------------------------------------------------------------
     # Fetch raw candidates for external BM25 scoring
     # ------------------------------------------------------------------
 
+    # Return the max chunk_sensitivity for all chunks of a document (from Chroma metadata).
+    def get_max_chunk_sensitivity(self, document_id: str) -> int:
+        try:
+            raw = self._get_collection().get(
+                where={"document_id": document_id},
+                include=["metadatas"],
+            )
+            metadatas = raw.get("metadatas") or []
+            max_sens = 1
+            for m in metadatas:
+                val = int((m or {}).get("chunk_sensitivity") or (m or {}).get("sensitivity") or 1)
+                if val > max_sens:
+                    max_sens = val
+            return max_sens
+        except Exception:
+            return 1
+
+    # Return raw documents and metadata for external BM25 re-ranking.
     def get_documents_for_bm25(
             self,
             *,

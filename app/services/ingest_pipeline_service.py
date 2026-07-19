@@ -1,15 +1,11 @@
 """
-ingest_pipeline_service.py  –  v3
-===================================
-Thay đổi so với v2:
-  - Đọc chunk_config_json từ DocumentVersion để lấy ChunkConfig
-  - Truyền config vào chunker_service.chunk(parsed, config=cfg)
-  - Mọi thứ khác giữ nguyên
+Ingest pipeline service: orchestrates download → parse → chunk → entity detection → embed for a document version.
 """
 from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from sqlalchemy.orm import Session
@@ -24,7 +20,6 @@ from app.services.audit_service import audit_service
 from app.services.chunker_service import ChunkConfig, chunker_service
 from app.services.chroma_service import chroma_service
 from app.services.embedding_service import embedding_service
-from app.services.entity_extractor import run_pipeline as detect_entities, compute_chunk_sensitivity
 from app.services.job_service import job_service
 from app.services.parser_service import parser_service
 from app.services.storage_service import storage_service
@@ -34,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 class IngestPipelineService:
 
+    # Execute the full ingest pipeline for a job, writing step records and updating status fields.
     def run(self, db: Session, job_id: str):
         job = job_service.get_job(db, job_id)
         if not job:
@@ -55,7 +51,7 @@ class IngestPipelineService:
             return
 
         try:
-            pre_ingest_status     = doc.status   # lưu lại để khôi phục sau ingest
+            pre_ingest_status     = doc.status   # saved to restore doc status after ingest.
             doc.status            = "processing"
             version.ingest_status = "running"
             version.parse_status  = "running"
@@ -63,9 +59,9 @@ class IngestPipelineService:
             version.embed_status  = "pending"
             db.commit()
 
-            # ── Đọc chunking config từ version ────────────────────────
-            # version.chunk_config_json được lưu lúc upload
-            # Nếu None (version cũ) → dùng legacy defaults
+            # ── Read chunking config from version ─────────────────────
+            # version.chunk_config_json is saved at upload time.
+            # If None (legacy version) → use legacy defaults.
             chunking_cfg = ChunkConfig(
                 **ChunkingConfig.from_json(version.chunk_config_json).model_dump(
                     exclude={"embed_model"}  # ChunkingConfig không có field này
@@ -141,8 +137,8 @@ class IngestPipelineService:
             )
             t0 = time.perf_counter()
 
-            # ← THAY ĐỔI DUY NHẤT: truyền config vào
-            chunks = chunker_service.chunk(parsed, config=chunking_cfg)
+            # Pass the per-version chunking config to the chunker.
+            chunks = chunker_service.chunk(parsed, config=chunking_cfg, doc_sensitivity=doc.sensitivity)
 
             chunk_models: list[DocumentChunk] = []
             for c in chunks:
@@ -171,31 +167,6 @@ class IngestPipelineService:
             version.chunk_status = "completed"
             db.commit()
 
-            # ── entity detection ──────────────────────────────────────
-            entity_step = job_service.add_step(
-                db, job_id=job.id, step_name="entity_detection",
-                detail_json={"chunk_count": len(chunk_models)},
-            )
-            t0 = time.perf_counter()
-            entity_results: list[dict] = []
-            for chunk_model in chunk_models:
-                try:
-                    result = detect_entities(chunk_model.chunk_text, db=db)
-                    entity_results.append(result)
-                    # Merge entity data into chunk metadata_json
-                    existing_meta = chunk_model.metadata_json or {}
-                    existing_meta["entities"]          = result["entities"]
-                    existing_meta["entity_labels"]     = result["labels"]
-                    existing_meta["entity_types"]      = ",".join(result["entity_types"])
-                    existing_meta["chunk_sensitivity"] = compute_chunk_sensitivity(doc.sensitivity, result["labels"])
-                    chunk_model.metadata_json = existing_meta
-                except Exception as exc:
-                    logger.warning("Entity detection failed for chunk %s: %s", chunk_model.id, exc)
-                    entity_results.append({"entities": [], "labels": {}, "entity_types": []})
-            job_service.finish_step(
-                db, entity_step,
-                detail_json={"latency_ms": int((time.perf_counter() - t0) * 1000)},
-            )
             db.commit()
 
             # ── embed  (BATCH) ────────────────────────────────────────
@@ -208,11 +179,8 @@ class IngestPipelineService:
             embed_texts = [c.get("embed_text") or c["chunk_text"] for c in chunks]
             vectors     = embedding_service.embed_many(embed_texts)
 
-            for chunk_model, chunk_dict, vector, entity_result in zip(
-                chunk_models, chunks, vectors, entity_results
-            ):
-                meta_json    = chunk_dict.get("metadata_json") or {}
-                entity_labels = entity_result.get("labels") or {}
+            for chunk_model, chunk_dict, vector in zip(chunk_models, chunks, vectors):
+                meta_json = chunk_dict.get("metadata_json") or {}
                 metadata = {
                     "document_id":         doc.id,
                     "document_version_id": version.id,
@@ -229,15 +197,8 @@ class IngestPipelineService:
                     "section_index":       meta_json.get("section_index", 0),
                     "position_ratio":      meta_json.get("position_ratio", 0.0),
                     "chunker_mode":        meta_json.get("chunker_mode", "legacy"),
-                    # Entity detection results
-                    "entity_types":        ",".join(entity_result.get("entity_types") or []),
-                    "has_pii":             entity_labels.get("has_pii", False),
-                    "has_financial":       entity_labels.get("has_financial", False),
-                    "has_credential":      entity_labels.get("has_credential", False),
-                    "has_legal":           entity_labels.get("has_legal", False),
-                    "has_strategic":       entity_labels.get("has_strategic", False),
-                    "has_hr":              entity_labels.get("has_hr", False),
-                    "chunk_sensitivity":   (chunk_model.metadata_json or {}).get("chunk_sensitivity", doc.sensitivity),
+                    "chunk_sensitivity":     meta_json.get("chunk_sensitivity", doc.sensitivity),
+                    "llm_chunk_sensitivity": meta_json.get("chunk_sensitivity", doc.sensitivity),
                 }
                 chroma_service.upsert_chunk(
                     chunk_id=chunk_model.id,
@@ -312,8 +273,9 @@ class IngestPipelineService:
                 latency_ms=int((time.perf_counter() - start_total) * 1000),
             )
 
-            job.status   = "succeeded"
-            job.progress = 100
+            job.status      = "succeeded"
+            job.progress    = 100
+            job.finished_at = datetime.now(timezone.utc).isoformat()
             db.commit()
 
         except Exception as exc:
@@ -326,6 +288,7 @@ class IngestPipelineService:
                 job.status        = "failed"
                 job.error_message = str(exc)
                 job.progress      = min(job.progress or 0, 99)
+                job.finished_at   = datetime.now(timezone.utc).isoformat()
             if doc:
                 doc.status = "failed"
             if version:
@@ -356,4 +319,5 @@ class IngestPipelineService:
             raise
 
 
+# Module-level singleton; imported by the ingest worker and job API router.
 ingest_pipeline_service = IngestPipelineService()

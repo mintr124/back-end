@@ -1,4 +1,8 @@
+"""
+Service for seeding the initial organisational structure and admin user on first startup.
+"""
 from sqlalchemy.orm import Session
+
 from app.core.security import hash_password
 from app.models.user import User
 from app.models.org_unit import OrgUnit
@@ -13,6 +17,7 @@ ADMIN_PASS   = "Admin@123"
 
 
 class BootstrapService:
+    # Create the root OrgUnit, root OUI, Admin position, and the default admin user if none exist.
     def seed_defaults(self, db: Session):
         if db.query(User).count() > 0:
             return
@@ -52,4 +57,5 @@ class BootstrapService:
         db.commit()
 
 
+# Module-level singleton; imported by the startup lifespan handler.
 bootstrap_service = BootstrapService()

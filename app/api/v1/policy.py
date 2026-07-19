@@ -1,24 +1,21 @@
 """
-api/v1/policy.py
-================
-REST API for policy domain/entity-type/rule management.
+REST API for policy domain, entity type, and rule management.
 All endpoints require authentication.
 """
 from __future__ import annotations
-
-from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_user, get_db
 from app.models.user import User
+from app.repositories.policy_repository import policy_repository
 from app.schemas.policy import (
     DomainRuleCreate,
     DomainRuleRead,
     DomainRuleUpdate,
-    EntityTypeCreate,
     EntityTypeBulkCreate,
+    EntityTypeCreate,
     EntityTypeRead,
     PolicyDomainCreate,
     PolicyDomainRead,
@@ -36,6 +33,7 @@ router = APIRouter()
 
 # ── Domains ───────────────────────────────────────────────────────────────────
 
+# Return a summary list of all policy domains, optionally filtered to active only.
 @router.get("/domains", response_model=list[PolicyDomainSummary])
 def list_domains(
     active_only: bool = Query(False),
@@ -55,6 +53,7 @@ def list_domains(
     return result
 
 
+# Retrieve a single policy domain by ID.
 @router.get("/domains/{domain_id}", response_model=PolicyDomainRead)
 def get_domain(
     domain_id: str,
@@ -68,6 +67,7 @@ def get_domain(
     return domain
 
 
+# Create a domain and auto-suggest entity types via LLM, then invalidate domain cache.
 @router.post("/domains", response_model=PolicyDomainRead, status_code=201)
 def create_domain(
     payload: PolicyDomainCreate,
@@ -85,6 +85,7 @@ def create_domain(
     return domain
 
 
+# Update an existing domain and invalidate the domain classifier cache.
 @router.put("/domains/{domain_id}", response_model=PolicyDomainRead)
 def update_domain(
     domain_id: str,
@@ -100,6 +101,7 @@ def update_domain(
     return domain
 
 
+# Delete a domain and invalidate both the domain and entity label caches.
 @router.delete("/domains/{domain_id}", status_code=204)
 def delete_domain(
     domain_id: str,
@@ -116,6 +118,7 @@ def delete_domain(
 
 # ── Entity Type Suggestion ────────────────────────────────────────────────────
 
+# Call the LLM to suggest entity types for a given domain name and description.
 @router.post("/domains/suggest-entities", response_model=SuggestEntitiesResponse)
 def suggest_entities(
     payload: SuggestEntitiesRequest,
@@ -131,6 +134,7 @@ def suggest_entities(
 
 # ── Entity Types ──────────────────────────────────────────────────────────────
 
+# List all entity types registered under a domain.
 @router.get("/domains/{domain_id}/entity-types", response_model=list[EntityTypeRead])
 def list_entity_types(
     domain_id: str,
@@ -141,10 +145,10 @@ def list_entity_types(
         policy_service.get_domain(db, domain_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
-    from app.repositories.policy_repository import policy_repository
     return policy_repository.list_entity_types(db, domain_id)
 
 
+# Add a single entity type to a domain and invalidate the label cache.
 @router.post("/domains/{domain_id}/entity-types", response_model=EntityTypeRead, status_code=201)
 def add_entity_type(
     domain_id: str,
@@ -160,6 +164,7 @@ def add_entity_type(
     return obj
 
 
+# Add multiple entity types at once, skipping duplicates, then invalidate the label cache.
 @router.post("/domains/{domain_id}/entity-types/bulk", response_model=list[EntityTypeRead], status_code=201)
 def add_entity_types_bulk(
     domain_id: str,
@@ -184,6 +189,7 @@ def add_entity_types_bulk(
     return created
 
 
+# Delete an entity type from a domain and invalidate the label cache.
 @router.delete("/domains/{domain_id}/entity-types/{entity_type_id}", status_code=204)
 def delete_entity_type(
     domain_id: str,
@@ -200,6 +206,7 @@ def delete_entity_type(
 
 # ── Rules (per domain) ────────────────────────────────────────────────────────
 
+# List all rules associated with a specific domain.
 @router.get("/domains/{domain_id}/rules", response_model=list[DomainRuleRead])
 def list_domain_rules(
     domain_id: str,
@@ -209,6 +216,7 @@ def list_domain_rules(
     return policy_service.list_rules(db, domain_id)
 
 
+# Create a new rule for a specific domain.
 @router.post("/domains/{domain_id}/rules", response_model=DomainRuleRead, status_code=201)
 def create_domain_rule(
     domain_id: str,
@@ -224,6 +232,7 @@ def create_domain_rule(
 
 # ── Global Rules (domain_id = None) ──────────────────────────────────────────
 
+# List all global rules that apply regardless of domain.
 @router.get("/global-rules", response_model=list[DomainRuleRead])
 def list_global_rules(
     db: Session = Depends(get_db),
@@ -232,6 +241,7 @@ def list_global_rules(
     return policy_service.list_rules(db, domain_id=None)
 
 
+# Create a new global rule (not bound to any domain).
 @router.post("/global-rules", response_model=DomainRuleRead, status_code=201)
 def create_global_rule(
     payload: DomainRuleCreate,
@@ -246,6 +256,7 @@ def create_global_rule(
 
 # ── Rules (update / delete by rule id) ───────────────────────────────────────
 
+# Update an existing rule by its ID.
 @router.put("/rules/{rule_id}", response_model=DomainRuleRead)
 def update_rule(
     rule_id: str,
@@ -259,6 +270,7 @@ def update_rule(
         raise HTTPException(status_code=404, detail=str(exc))
 
 
+# Delete a rule by its ID.
 @router.delete("/rules/{rule_id}", status_code=204)
 def delete_rule(
     rule_id: str,

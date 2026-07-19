@@ -1,3 +1,8 @@
+"""
+User management service: CRUD operations for users and OUI position assignments.
+"""
+from __future__ import annotations
+
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
@@ -10,19 +15,16 @@ from app.schemas.user import UserResponse, OuiPositionInfo, UserCreateRequest, U
 from app.core.security import hash_password
 from app.services.audit_service import audit_service
 
-# OU name của root — dùng để xác định is_corp_member
+# Root OrgUnit name used to determine is_corp_member flag.
 CORP_OU_NAME = "Corp."
 
 
 class UserService:
 
-    # ── Helper: build UserResponse từ User ORM object ─────────────────────────
+    # ── Helper: build full UserResponse with OUI positions ────────────────────
 
+    # Build a full UserResponse including oui_positions, max_clearance, and is_corp_member.
     def build_user_response(self, db: Session, user: User) -> UserResponse:
-        """
-        Build UserResponse đầy đủ với oui_positions.
-        Tính max_clearance và is_corp_member từ tất cả positions.
-        """
         positions_info: list[OuiPositionInfo] = []
         max_clearance = 1
         is_corp_member = False
@@ -47,7 +49,7 @@ class UserService:
             if pos.clearance > max_clearance:
                 max_clearance = pos.clearance
 
-            if ou.parent_id is None:  
+            if ou.parent_id is None:  # Root OrgUnit → user belongs to Corp.
                 is_corp_member = True
 
         return UserResponse(
@@ -55,6 +57,7 @@ class UserService:
             email=user.email,
             name=user.name,
             status=user.status,
+            created_at=user.created_at,
             oui_positions=positions_info,
             max_clearance=max_clearance,
             is_corp_member=is_corp_member,
@@ -62,12 +65,14 @@ class UserService:
 
     # ── List users ────────────────────────────────────────────────────────────
 
+    # Return all users ordered by name.
     def list_users(self, db: Session) -> list[UserResponse]:
         users = db.query(User).order_by(User.name).all()
         return [self.build_user_response(db, u) for u in users]
 
     # ── Create user ───────────────────────────────────────────────────────────
 
+    # Create a new user; only Corp-level members are allowed to perform this action.
     def create_user(
         self,
         db: Session,
@@ -75,7 +80,7 @@ class UserService:
         payload: UserCreateRequest,
         trace_id: str,
     ) -> User:
-        # Chỉ Corp. member mới tạo được user
+        # Only Corp. members may create new users.
         actor_resp = self.build_user_response(db, actor)
         if not actor_resp.is_corp_member:
             raise HTTPException(status_code=403, detail="Corp-level admin required")
@@ -105,6 +110,7 @@ class UserService:
 
     # ── Update user ───────────────────────────────────────────────────────────
 
+    # Update mutable user fields (e.g. status); restricted to Corp-level members.
     def update_user(
         self,
         db: Session,
@@ -129,6 +135,7 @@ class UserService:
 
     # ── Get single user response ──────────────────────────────────────────────
 
+    # Return the full UserResponse for a single user by ID.
     def get_user_response(self, db: Session, user_id: str) -> UserResponse:
         user = db.get(User, user_id)
         if not user:
@@ -136,4 +143,6 @@ class UserService:
         return self.build_user_response(db, user)
 
 
+
+# Module-level singleton; imported by the users API router.
 user_service = UserService()

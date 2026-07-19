@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, ForeignKey
+from sqlalchemy import Column, ForeignKey, Integer, String
 from sqlalchemy.orm import relationship
 
 from app.db.base import Base, TimestampMixin
@@ -6,20 +6,20 @@ from app.utils.ids import new_uuid
 
 
 CLEARANCE_RANK = {
-    "public":      1,
-    "internal":    2,
-    "confidential": 3,
-    "restricted":  4,
-    "top_secret":  5,
+    "public":        1,
+    "internal":      2,
+    "confidential":  3,
+    "restricted":    4,
+    "top_secret":    5,
 }
 
 
+"""
+Position (job title) within an OU type.
+E.g., OU=Department → Position: Dept Manager (clearance=4), Deputy (clearance=3), Employee (clearance=2)
+Clearance is attached to Position — user inherits clearance from the position they hold at that OUI.
+"""
 class Position(Base, TimestampMixin):
-    """
-    Vị trí (chức danh) trong một OU type.
-    VD: OU=Department → Position: Dept Manager (clearance=4), Deputy (clearance=3), Employee (clearance=2)
-    Clearance gắn vào Position — user kế thừa clearance từ position đang giữ tại OUI đó.
-    """
     __tablename__ = "positions"
 
     id          = Column(String(36), primary_key=True, default=new_uuid)

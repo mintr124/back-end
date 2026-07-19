@@ -1,4 +1,5 @@
 from sqlalchemy import Column, Integer, String
+
 from app.db.base import Base, TimestampMixin
 from app.utils.ids import new_uuid
 
@@ -15,3 +16,4 @@ class StorageObject(Base, TimestampMixin):
     content_type = Column(String(128), nullable=False)
     size_bytes = Column(Integer, nullable=False)
     checksum = Column(String(128), nullable=False, index=True)
+

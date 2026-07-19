@@ -1,32 +1,30 @@
 """
-api/v1/document_access_requests.py
-===================================
-Endpoints cho yêu cầu xem tài liệu có chunk nhạy cảm.
+Endpoints for document access requests on documents containing sensitive chunks.
 
 User flow:
-  POST /access-requests               — user tạo yêu cầu
-  GET  /access-requests/my            — user xem yêu cầu của mình
+  POST /access-requests               — submit a new access request
+  GET  /access-requests/my            — list the current user's requests
 
 Admin flow:
-  GET  /access-requests               — admin xem tất cả
-  PUT  /access-requests/{id}/approve  — admin duyệt (có thể set expires_at)
-  PUT  /access-requests/{id}/reject   — admin từ chối
+  GET  /access-requests               — list all requests
+  PUT  /access-requests/{id}/approve  — approve a request (optional expires_at)
+  PUT  /access-requests/{id}/reject   — reject a request
 
 Document access-status:
-  GET  /documents/{doc_id}/access-status  — kiểm tra has_restricted_chunks + request status
+  GET  /documents/{doc_id}/access-status  — check has_restricted_chunks and request status
 """
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_user, get_db
+from app.models.document import Document
 from app.models.document_access_request import DocumentAccessRequest
 from app.models.user import User
+from app.services.chroma_service import chroma_service
 from app.repositories.document_access_request_repository import doc_access_request_repo
 from app.schemas.document_access_request import (
     AccessRequestApprove,
@@ -42,10 +40,12 @@ router = APIRouter()
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+# Return True if the user holds a corp-level membership.
 def _is_corp_member(db: Session, user: User) -> bool:
     return _user_service.build_user_response(db, user).is_corp_member
 
 
+# Return the highest clearance level held by the user across all their positions.
 def _get_user_clearance(user: User) -> int:
     max_c = 1
     for uop in getattr(user, "oui_positions", []):
@@ -54,11 +54,10 @@ def _get_user_clearance(user: User) -> int:
     return max_c
 
 
+# Build a full AccessRequestRead response object from a DocumentAccessRequest ORM row.
 def _build_read(db: Session, obj: DocumentAccessRequest) -> AccessRequestRead:
-    from app.models.document import Document
-    from app.models.user import User as UserModel
-    doc       = db.get(Document,   obj.document_id)
-    requester = db.get(UserModel,  obj.user_id)
+    doc       = db.get(Document, obj.document_id)
+    requester = db.get(User, obj.user_id)
     name  = None
     email = None
     if requester:
@@ -83,6 +82,7 @@ def _build_read(db: Session, obj: DocumentAccessRequest) -> AccessRequestRead:
 
 # ── User endpoints ────────────────────────────────────────────────────────────
 
+# Submit a new access request for a document. Rejects if a pending request already exists.
 @router.post("/access-requests", response_model=AccessRequestRead, status_code=201)
 def create_access_request(
     payload: AccessRequestCreate,
@@ -98,6 +98,7 @@ def create_access_request(
     return _build_read(db, obj)
 
 
+# Return all access requests submitted by the current user.
 @router.get("/access-requests/my", response_model=list[AccessRequestRead])
 def my_access_requests(
     db: Session = Depends(get_db),
@@ -106,13 +107,13 @@ def my_access_requests(
     return [_build_read(db, r) for r in doc_access_request_repo.list_for_user(db, str(current_user.id))]
 
 
+# Revoke an approved access request. The owner or an admin may perform this action.
 @router.post("/access-requests/{request_id}/revoke", response_model=AccessRequestRead)
 def revoke_access_request(
     request_id: str,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """User tự hủy hoặc admin thu hồi quyền truy cập đang được duyệt."""
     obj = db.get(DocumentAccessRequest, request_id)
     if not obj:
         raise HTTPException(status_code=404, detail="Không tìm thấy yêu cầu")
@@ -132,6 +133,7 @@ def revoke_access_request(
 
 # ── Admin endpoints ───────────────────────────────────────────────────────────
 
+# Return all access requests across all users. Requires corp-level access.
 @router.get("/access-requests", response_model=list[AccessRequestRead])
 def list_access_requests(
     db: Session = Depends(get_db),
@@ -142,6 +144,7 @@ def list_access_requests(
     return [_build_read(db, r) for r in doc_access_request_repo.list_all(db)]
 
 
+# Approve an access request, optionally setting an expiry date.
 @router.put("/access-requests/{request_id}/approve", response_model=AccessRequestRead)
 def approve_access_request(
     request_id: str,
@@ -165,6 +168,7 @@ def approve_access_request(
     return _build_read(db, obj)
 
 
+# Reject an access request with an optional admin note.
 @router.put("/access-requests/{request_id}/reject", response_model=AccessRequestRead)
 def reject_access_request(
     request_id: str,
@@ -189,6 +193,7 @@ def reject_access_request(
 
 # ── Document access-status ────────────────────────────────────────────────────
 
+# Return whether a document has chunks above the user's clearance and the latest request status.
 @router.get("/documents/{document_id}/access-status", response_model=DocumentAccessStatus)
 def get_document_access_status(
     document_id: str,
@@ -196,27 +201,20 @@ def get_document_access_status(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Trả về:
-      has_restricted_chunks  — doc có chunk nào có sensitivity > user clearance không?
-      access_request_status  — trạng thái yêu cầu xem mới nhất (None nếu chưa request)
-      approved_until         — thời hạn approved (None nếu vĩnh viễn hoặc chưa approved)
+    Returns:
+      has_restricted_chunks  — True if any chunk sensitivity exceeds the user's clearance
+      access_request_status  — status of the latest request (None if none submitted)
+      approved_until         — expiry of the approved grant (None if permanent or not approved)
     """
     user_clearance = _get_user_clearance(current_user)
 
-    # Max chunk_sensitivity của doc (dùng MySQL JSON function)
-    row = db.execute(text("""
-        SELECT MAX(CAST(JSON_UNQUOTE(JSON_EXTRACT(dc.metadata_json, '$.chunk_sensitivity')) AS UNSIGNED))
-        FROM document_chunks dc
-        JOIN document_versions dv ON dc.document_version_id = dv.id
-        WHERE dv.document_id = :doc_id
-    """), {"doc_id": document_id}).scalar()
-
-    max_chunk_sens = int(row or 0)
+    # Read max chunk_sensitivity from Chroma (consistent with retrieval_service blur logic).
+    max_chunk_sens = chroma_service.get_max_chunk_sensitivity(document_id)
     has_restricted = max_chunk_sens > user_clearance
 
     latest = doc_access_request_repo.get_latest_for_user_doc(db, str(current_user.id), document_id)
-    status: Optional[str] = None
-    approved_until: Optional[datetime] = None
+    status: str | None = None
+    approved_until: datetime | None = None
     if latest:
         status = latest.status
         if latest.status == "approved":

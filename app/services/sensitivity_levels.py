@@ -1,8 +1,12 @@
-# Sensitivity scale: 1=public, 2=internal, 3=confidential, 4=restricted, 5=top_secret
+"""
+Sensitivity level constants and Vietnamese regex patterns for automated content classification.
+"""
 
+# Sensitivity scale: 1=public, 2=internal, 3=confidential, 4=restricted, 5=top_secret
 MIN_SENSITIVITY = 1
 MAX_SENSITIVITY = 5
 
+# Vietnamese regex patterns for automated sensitivity detection, grouped by sensitivity level.
 SENSITIVITY_PATTERNS = {
     4: [  # restricted
         r"hồ\s+sơ\s+nhân\s+viên",

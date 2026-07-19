@@ -1,16 +1,16 @@
 """
-risk_analyzer.py
-SensitivityScorer — kết hợp declared sensitivity + domain base + PII detection.
-IntentRiskAnalyzer — đánh giá rủi ro hành vi truy vấn.
+Sensitivity scoring and intent risk analysis for the policy-contract pipeline.
+SensitivityScorer combines declared sensitivity, domain base level, and PII detection.
+IntentRiskAnalyzer scores query behaviour risk from intent, cross-department access, and off-hours signals.
 """
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 
 SENSITIVITY_ORDER = ["Public", "Internal", "Confidential", "Restricted", "TopSecret"]
 
 
+# Return the numeric rank of a sensitivity level string (0 = lowest).
 def sensitivity_rank(level: str) -> int:
     try:
         return SENSITIVITY_ORDER.index(level)
@@ -18,6 +18,7 @@ def sensitivity_rank(level: str) -> int:
         return 0
 
 
+# Return the sensitivity label for a numeric rank, clamped to valid range.
 def sensitivity_from_rank(rank: int) -> str:
     rank = max(0, min(rank, len(SENSITIVITY_ORDER) - 1))
     return SENSITIVITY_ORDER[rank]
@@ -31,6 +32,7 @@ class SensitivityResult:
 
 
 class SensitivityScorer:
+    # Compute effective sensitivity as the max of declared, domain base, and PII-implied levels.
     def score(
         self,
         *,

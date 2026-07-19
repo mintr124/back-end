@@ -1,5 +1,13 @@
+"""
+FGA adapter. Translates domain operations (document sync, OUI membership,
+permission checks) into OpenFGA tuple writes and reads.
+"""
 from __future__ import annotations
+
+import json
 import logging
+from pathlib import Path
+
 from sqlalchemy.orm import Session
 
 from app.fga.client import fga_client
@@ -8,45 +16,50 @@ from app.services.oui_tree_service import oui_tree_service
 
 logger = logging.getLogger(__name__)
 
+# Upper bound for sensitivity-based clearance conditions written to FGA.
 MAX_CLEARANCE = 5
 
 
 class FGAAdapter:
     """
-    Sync tuples vào OpenFGA dùng Conditional Tuples.
+    Syncs relationship tuples into OpenFGA using Conditional Tuples.
 
     Access rules:
     ┌─────────────────────────────────────────────────────────────────────┐
-    │  Doc thuộc OUI-X, sensitivity=S                                     │
+    │  Doc belongs to OUI-X, sensitivity=S                                │
     │  • Owner:                              can_view + can_edit          │
-    │  • Member OUI-X, clearance ≥ S:       can_view  (viewer)           │
-    │  • Member ancestor OUI, clearance ≥ S: can_view  (viewer)          │
-    │  • Member ROOT OUI, clearance ≥ S:    can_view + can_edit (editor) │
-    │  • Member descendant OUI (S=1 only):  can_view  (viewer)           │
+    │  • Member OUI-X, clearance ≥ S:        can_view  (viewer)           │
+    │  • Member ancestor OUI, clearance ≥ S: can_view  (viewer)           │
+    │  • Member ROOT OUI, clearance ≥ S:     can_view + can_edit (editor) │
+    │  • Member descendant OUI (S=1 only):   can_view  (viewer)           │
     └─────────────────────────────────────────────────────────────────────┘
 
-    Tuple counts per doc (bất kể độ sâu cây):
+    Tuple counts per doc (regardless of tree depth):
       1 (owner) + 1 (direct#member→viewer) + 1 (parent#ancestor_member→viewer) + 1 (root#member→editor)
-      = tối đa 4 tuples, không enumerate từng ancestor.
+      = at most 4 tuples; ancestors are not enumerated individually.
     """
 
     # ── OUI membership ─────────────────────────────────────────────────────────
 
+    # Write a member tuple granting the user membership in the given OUI.
     def add_oui_member(self, user_id: str, oui_id: str) -> None:
         fga_client.write([
             {"user": f"user:{user_id}", "relation": "member", "object": f"oui:{oui_id}"}
         ])
 
+    # Delete the member tuple revoking the user's membership in the given OUI.
     def remove_oui_member(self, user_id: str, oui_id: str) -> None:
         fga_client.delete([
             {"user": f"user:{user_id}", "relation": "member", "object": f"oui:{oui_id}"}
         ])
 
+    # Write a parent_oui tuple linking oui_id as a child of parent_oui_id.
     def link_oui_parent(self, oui_id: str, parent_oui_id: str) -> None:
         fga_client.write([
             {"user": f"oui:{parent_oui_id}", "relation": "parent_oui", "object": f"oui:{oui_id}"}
         ])
 
+    # Delete the parent_oui tuple removing the parent link between the two OUIs.
     def unlink_oui_parent(self, oui_id: str, parent_oui_id: str) -> None:
         fga_client.delete([
             {"user": f"oui:{parent_oui_id}", "relation": "parent_oui", "object": f"oui:{oui_id}"}
@@ -54,6 +67,7 @@ class FGAAdapter:
 
     # ── Document sync ──────────────────────────────────────────────────────────
 
+    # Build and write all access tuples for a document based on its OUI tree and sensitivity.
     def sync_document_tuples(self, db: Session, doc: Document) -> None:
         tuples: list[dict] = []
         doc_obj = f"document:{doc.id}"
@@ -88,16 +102,16 @@ class FGAAdapter:
             # Direct OUI members → viewer
             _add(f"oui:{oui.id}#member", "viewer", condition)
 
-            # Direct parents dùng ancestor_member → FGA resolve toàn bộ ancestor → viewer
+            # Direct parents use ancestor_member so FGA resolves the full ancestor chain → viewer.
             for parent_id in oui_tree_service.get_direct_parents(db, oui.id):
                 _add(f"oui:{parent_id}#ancestor_member", "viewer", condition)
 
-            # Chỉ root mới có quyền edit
+            # Only root OUI members receive edit access.
             root_id = oui_tree_service.get_root_oui_id(db, oui.id)
             if root_id != oui.id:
                 _add(f"oui:{root_id}#member", "editor", condition)
             else:
-                # Doc thuộc root: root members vừa viewer vừa editor — dùng editor để bao cả hai
+                # Doc belongs to root: root members get editor (which implies viewer as well).
                 _add(f"oui:{root_id}#member", "editor", condition)
 
             # Descendant members → viewer chỉ khi public (sensitivity=1)
@@ -112,13 +126,16 @@ class FGAAdapter:
         if tuples:
             fga_client.write(tuples)
 
+    # Delete a list of previously written tuples for a document.
     def delete_document_tuples(self, doc_id: str, tuples_to_delete: list[dict]) -> None:
         if tuples_to_delete:
             fga_client.delete(tuples_to_delete)
 
+    # Return all currently stored tuples for a document (used before re-sync).
     def get_document_tuples(self, doc_id: str) -> list[dict]:
         return fga_client.read(object=f"document:{doc_id}")
 
+    # Return all document IDs the user can view given their clearance level.
     def list_viewable_document_ids(self, user_id: str, user_clearance: int) -> list[str]:
         objects = fga_client.list_objects(
             user=f"user:{user_id}",
@@ -130,6 +147,7 @@ class FGAAdapter:
 
     # ── Check ──────────────────────────────────────────────────────────────────
 
+    # Return True if the user has can_view permission on the document.
     def can_view(self, user_id: str, doc_id: str, user_clearance: int) -> bool:
         return fga_client.check(
             user=f"user:{user_id}",
@@ -138,6 +156,7 @@ class FGAAdapter:
             context={"user_clearance": user_clearance},
         )
 
+    # Return True if the user has can_edit permission on the document.
     def can_edit(self, user_id: str, doc_id: str, user_clearance: int) -> bool:
         return fga_client.check(
             user=f"user:{user_id}",
@@ -148,9 +167,8 @@ class FGAAdapter:
 
     # ── Model deployment ───────────────────────────────────────────────────────
 
+    # Load model.json from disk, upload it to FGA, and return the new model ID.
     def push_model(self) -> str:
-        import json
-        from pathlib import Path
         model_path = Path(__file__).parent / "model.json"
         model = json.loads(model_path.read_text(encoding="utf-8"))
         model_id = fga_client.write_model(model)
@@ -158,4 +176,5 @@ class FGAAdapter:
         return model_id
 
 
+# Module-level singleton; imported by document_service, org_units, and permission_service.
 fga_adapter = FGAAdapter()

@@ -11,3 +11,4 @@ class SystemSetting(Base):
     key = Column(String(128), primary_key=True)
     value = Column(Text, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+

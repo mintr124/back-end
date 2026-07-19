@@ -18,3 +18,4 @@ class JobStep(Base, TimestampMixin):
     duration_ms = Column(Integer, nullable=True)
 
     job = relationship("Job", back_populates="steps")
+

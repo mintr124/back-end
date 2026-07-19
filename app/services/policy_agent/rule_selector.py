@@ -6,9 +6,12 @@ Loads rules from DB (domain_rules table), scores them, applies deny-overrides co
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
 
 from app.services.policy_agent.risk_analyzer import sensitivity_rank
+
+# Restrictiveness order: higher = more restrictive
+_MAX_DETAIL_ORDER = {"redact": 4, "anonymize": 3, "generalize": 2, "summarize": 1}
+_NUMERIC_ORDER    = {"hidden": 4, "aggregated": 3, "range_only": 2, "exact": 1}
 
 
 @dataclass
@@ -43,11 +46,11 @@ class SelectionContext:
     intent_class:              str
     intent_risk_signal:        str
     # Org hierarchy: level = depth from root (0=company, 1=branch, 2=group, ...)
-    user_ou_levels:            list[int] = None   # tất cả vị trí của user
-    chunk_ou_level:            int = None         # cấp tổ chức của tài liệu
+    user_ou_levels:            list[int] = None   # all positions held by the user
+    chunk_ou_level:            int = None         # org-hierarchy level of the document
     is_before_publish_date:    bool = False
     is_after_publish_date:     bool = False
-    # Clearance tính từ vị trí user tương ứng chunk (1–5)
+    # Effective clearance derived from the user position closest to the chunk (1–5).
     effective_clearance:       int = 1
 
 
@@ -55,11 +58,9 @@ class RuleSelector:
     SCORE_THRESHOLD = 0.4
     MAX_RULES_WARN  = 8
 
+    # Score all db_rules against ctx and return selected rules, review flag, and candidate count.
+    # db_rules: list[DomainRule] ORM objects loaded from DB.
     def select(self, ctx: SelectionContext, db_rules: list) -> dict:
-        """
-        db_rules: list[DomainRule] ORM objects loaded from DB.
-        Returns dict with selected_rules, needs_human_review, candidate_count.
-        """
         candidates: list[ScoredRule] = []
 
         for db_rule in db_rules:
@@ -100,10 +101,9 @@ class RuleSelector:
                 action="ALLOW", priority=0, mandatory=False, risk_level="low",
                 domain_code="GLOBAL", score=1.0, reasons=["no_rule_match"],
                 contract={
-                    "max_detail": "company",
+                    "violation_action": "allow",
+                    "max_detail": "summarize",
                     "numeric_granularity": "exact",
-                    "allowed_entities": [],
-                    "violation_action": "mask",
                 },
             )
             selected = [fallback]
@@ -114,56 +114,86 @@ class RuleSelector:
             "candidate_count":   len(candidates),
         }
 
+    # Conflict resolution: block > conditional (merged) > watermark > allow.
+    # Conditional rules from multiple domains are merged into one contract (most restrictive wins per field).
     def resolve_conflicts(self, selected_rules: list[ScoredRule]) -> dict:
-        """Deny-overrides conflict resolution.
-        Priority: DENY > REDACT > ANONYMIZE > GENERALIZE > SUMMARIZE > ALLOW_WITH_WATERMARK > ALLOW
-        """
         if not selected_rules:
-            return {"final_action": "DENY", "winning_rule": None, "reason": "no_rule_default_deny"}
+            return {
+                "final_action": "block",
+                "winning_rule": None,
+                "contract":     {},
+                "reason":       "no_rule_default_deny",
+            }
 
-        deny_rules       = [r for r in selected_rules if r.action == "DENY"]
-        redact_rules     = [r for r in selected_rules if r.action == "REDACT"]
-        anonymize_rules  = [r for r in selected_rules if r.action == "ANONYMIZE"]
-        generalize_rules = [r for r in selected_rules if r.action == "GENERALIZE"]
-        summarize_rules  = [r for r in selected_rules if r.action == "SUMMARIZE"]
-        wm_rules         = [r for r in selected_rules if r.action == "ALLOW_WITH_WATERMARK"]
-        allow_rules      = [r for r in selected_rules if r.action == "ALLOW"]
+        def _action(r: ScoredRule) -> str:
+            return r.contract.get("violation_action") or r.action or "allow"
 
         def top(rules: list[ScoredRule]) -> ScoredRule:
             return max(rules, key=lambda r: r.priority)
 
-        if deny_rules:
-            return {"final_action": "DENY",                 "winning_rule": top(deny_rules),         "reason": "deny_overrides"}
-        if redact_rules:
-            return {"final_action": "REDACT",               "winning_rule": top(redact_rules),        "reason": "redact_overrides"}
-        if anonymize_rules:
-            return {"final_action": "ANONYMIZE",            "winning_rule": top(anonymize_rules),     "reason": "anonymize_overrides"}
-        if generalize_rules:
-            return {"final_action": "GENERALIZE",           "winning_rule": top(generalize_rules),    "reason": "generalize_overrides"}
-        if summarize_rules:
-            return {"final_action": "SUMMARIZE",            "winning_rule": top(summarize_rules),     "reason": "summarize_overrides"}
-        if wm_rules:
-            return {"final_action": "ALLOW_WITH_WATERMARK", "winning_rule": top(wm_rules),            "reason": "watermark_priority"}
-        if allow_rules:
-            return {"final_action": "ALLOW",                "winning_rule": top(allow_rules),         "reason": "allow_only"}
+        block_rules       = [r for r in selected_rules if _action(r) == "block"]
+        conditional_rules = [r for r in selected_rules if _action(r) == "conditional"]
+        watermark_rules   = [r for r in selected_rules if _action(r) == "watermark"]
+        allow_rules       = [r for r in selected_rules if _action(r) == "allow"]
 
-        return {"final_action": "DENY", "winning_rule": None, "reason": "fallback_deny"}
+        if block_rules:
+            return {
+                "final_action": "block",
+                "winning_rule": top(block_rules),
+                "contract":     {"violation_action": "block"},
+                "reason":       "block_overrides",
+            }
+
+        if conditional_rules:
+            return {
+                "final_action": "conditional",
+                "winning_rule": top(conditional_rules),
+                "contract":     self._merge_conditional(conditional_rules),
+                "reason":       "conditional_merged",
+            }
+
+        if watermark_rules:
+            return {
+                "final_action": "watermark",
+                "winning_rule": top(watermark_rules),
+                "contract":     {"violation_action": "watermark"},
+                "reason":       "watermark_only",
+            }
+
+        if allow_rules:
+            return {
+                "final_action": "allow",
+                "winning_rule": top(allow_rules),
+                "contract":     {"violation_action": "allow"},
+                "reason":       "allow_only",
+            }
+
+        return {"final_action": "block", "winning_rule": None, "contract": {}, "reason": "fallback_deny"}
+
+    # Merge multiple conditional rules into one contract: most restrictive per field wins.
+    def _merge_conditional(self, rules: list[ScoredRule]) -> dict:
+        best_detail  = max(rules, key=lambda r: _MAX_DETAIL_ORDER.get(r.contract.get("max_detail", ""), 0))
+        best_numeric = max(rules, key=lambda r: _NUMERIC_ORDER.get(r.contract.get("numeric_granularity", ""), 0))
+        return {
+            "violation_action":    "conditional",
+            "max_detail":          best_detail.contract.get("max_detail", "generalize"),
+            "numeric_granularity": best_numeric.contract.get("numeric_granularity", "aggregated"),
+        }
 
     # ── Internal scoring ──────────────────────────────────────────────────────
 
+    # Score a single rule against the selection context; return None if the rule does not apply.
     def _score_rule(
         self, rule: dict, domain_code: str, ctx: SelectionContext
-    ) -> Optional[ScoredRule]:
+    ) -> ScoredRule | None:
         reasons: list[str] = []
 
-        # ── 1. Roles được phép (EXEMPTION) ────────────────────────────────────
-        # Nếu user có role này → rule không áp dụng, bỏ qua hoàn toàn
+        # ── 1. Exemption roles — if the user holds one of these, the rule does not apply.
         exempt_roles = rule.get("applicable_roles") or []
         if exempt_roles and ctx.user_role in exempt_roles:
             return None
 
-        # ── 2. Roles bị chặn (FORCE-APPLY) ────────────────────────────────────
-        # Nếu user có role này → rule tự động áp dụng, bỏ qua mọi điều kiện khác
+        # ── 2. Blocked roles — if the user holds one of these, the rule is force-applied.
         blocked_roles = rule.get("blocked_roles") or []
         if blocked_roles and ctx.user_role in blocked_roles:
             score = 0.95
@@ -192,9 +222,9 @@ class RuleSelector:
         reasons.append("sensitivity_ok")
 
         # ── 4. Clearance check ────────────────────────────────────────────────
-        # min_user_level = clearance tối thiểu để ĐƯỢC XEM (miễn trừ khỏi rule).
-        # Nếu user đủ clearance → rule không áp dụng.
-        # Nếu không đủ → rule kích hoạt (block/redact/...).
+        # min_user_level = minimum clearance required to VIEW the content (exempts from the rule).
+        # If the user meets the clearance requirement, the rule does not apply.
+        # If not, the rule fires (block/redact/...).
         if rule.get("min_user_level") and ctx.effective_clearance >= rule["min_user_level"]:
             return None
         intents = rule.get("applicable_intents") or []
@@ -206,20 +236,20 @@ class RuleSelector:
             user_levels = ctx.user_ou_levels or []
             chunk_level = ctx.chunk_ou_level
             if chunk_level is None or not user_levels:
-                # Không có thông tin cấp tổ chức → fallback kiểm tra department string
+                # No org-hierarchy data available — fall back to department string comparison.
                 if ctx.user_department and ctx.chunk_department:
                     if ctx.user_department.lower() == ctx.chunk_department.lower():
-                        return None  # Cùng department → không trigger
+                        return None  # Same department — do not trigger the rule.
             else:
-                # Trigger khi tài liệu ở cấp cao hơn (level nhỏ hơn) tất cả vị trí của user
-                # Không trigger nếu user có BẤT KỲ vị trí nào ở cùng cấp hoặc cao hơn tài liệu
+                # Trigger when the document is at a higher level (smaller index) than all user positions.
+                # Do not trigger if the user holds any position at or above the document level.
                 has_adequate_level = any(ul <= chunk_level for ul in user_levels)
                 if has_adequate_level:
                     return None
 
         reasons.append("conditions_ok")
 
-        # ── 7. Score (rule không có role condition → neutral) ──────────────────
+        # ── 7. Score (rule with no role condition → neutral) ──────────────────
         score = 0.6 if not blocked_roles and not exempt_roles else 0.8
         reasons.append("role_neutral")
         if rule.get("mandatory"):

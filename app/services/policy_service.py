@@ -1,6 +1,4 @@
 """
-policy_service.py
-=================
 Business logic for domain/entity/rule management.
 Includes LLM-based entity type suggestion when a domain is created.
 """
@@ -9,7 +7,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Optional
 
 from sqlalchemy.orm import Session
 
@@ -61,15 +58,18 @@ class PolicyService:
 
     # ── Domains ───────────────────────────────────────────────────────────────
 
+    # Return all domains, optionally filtering to active-only.
     def list_domains(self, db: Session, *, active_only: bool = False) -> list[PolicyDomain]:
         return policy_repository.list_domains(db, active_only=active_only)
 
+    # Return a domain by ID, raising ValueError if not found.
     def get_domain(self, db: Session, domain_id: str) -> PolicyDomain:
         domain = policy_repository.get_domain(db, domain_id)
         if not domain:
             raise ValueError(f"Domain {domain_id} not found")
         return domain
 
+    # Create a domain and optionally auto-suggest entity types via LLM.
     def create_domain(
         self, db: Session, data: PolicyDomainCreate, *, auto_suggest: bool = True
     ) -> PolicyDomain:
@@ -105,6 +105,7 @@ class PolicyService:
         db.refresh(domain)
         return domain
 
+    # Update mutable fields of an existing domain.
     def update_domain(self, db: Session, domain_id: str, data: PolicyDomainUpdate) -> PolicyDomain:
         domain = self.get_domain(db, domain_id)
         updates = data.model_dump(exclude_none=True)
@@ -113,6 +114,7 @@ class PolicyService:
         db.refresh(domain)
         return domain
 
+    # Delete a domain permanently.
     def delete_domain(self, db: Session, domain_id: str) -> None:
         domain = self.get_domain(db, domain_id)
         policy_repository.delete_domain(db, domain)
@@ -120,11 +122,13 @@ class PolicyService:
 
     # ── Entity Types ──────────────────────────────────────────────────────────
 
-    def suggest_entity_types(self, name: str, description: Optional[str]) -> list[EntityTypeCreate]:
+    # Public wrapper: call the LLM to suggest entity types for a given domain name/description.
+    def suggest_entity_types(self, name: str, description: str | None) -> list[EntityTypeCreate]:
         return self._suggest_entity_types(name, description)
 
+    # Call the LLM and parse the JSON response into EntityTypeCreate objects.
     def _suggest_entity_types(
-        self, name: str, description: Optional[str]
+        self, name: str, description: str | None
     ) -> list[EntityTypeCreate]:
         prompt = (
             f"Business domain: {name}\n"
@@ -162,6 +166,7 @@ class PolicyService:
             ))
         return result[:10]
 
+    # Add a manually-defined entity type to a domain, raising ValueError on duplicate.
     def add_entity_type(
         self,
         db: Session,
@@ -183,6 +188,7 @@ class PolicyService:
         db.commit()
         return obj
 
+    # Delete an entity type from a domain, raising ValueError if not found.
     def delete_entity_type(self, db: Session, domain_id: str, entity_type_id: str) -> None:
         self.get_domain(db, domain_id)
         et = policy_repository.get_entity_type(db, entity_type_id)
@@ -193,11 +199,13 @@ class PolicyService:
 
     # ── Rules ─────────────────────────────────────────────────────────────────
 
-    def list_rules(self, db: Session, domain_id: Optional[str]) -> list[DomainRule]:
+    # Return all rules, optionally filtered to a specific domain.
+    def list_rules(self, db: Session, domain_id: str | None) -> list[DomainRule]:
         return policy_repository.list_rules(db, domain_id)
 
+    # Create a new rule, raising ValueError on duplicate rule_code.
     def create_rule(
-        self, db: Session, domain_id: Optional[str], data: DomainRuleCreate
+        self, db: Session, domain_id: str | None, data: DomainRuleCreate
     ) -> DomainRule:
         if domain_id:
             self.get_domain(db, domain_id)
@@ -219,6 +227,7 @@ class PolicyService:
         db.commit()
         return rule
 
+    # Apply partial updates to an existing rule.
     def update_rule(self, db: Session, rule_id: str, data: DomainRuleUpdate) -> DomainRule:
         rule = policy_repository.get_rule(db, rule_id)
         if not rule:
@@ -243,6 +252,7 @@ class PolicyService:
         db.commit()
         return rule
 
+    # Delete a rule by ID, raising ValueError if not found.
     def delete_rule(self, db: Session, rule_id: str) -> None:
         rule = policy_repository.get_rule(db, rule_id)
         if not rule:
@@ -253,12 +263,13 @@ class PolicyService:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+# Extract the first JSON object from LLM output text.
 def _extract_json(text: str) -> dict:
-    """Extract first JSON object from LLM output."""
     match = re.search(r'\{[\s\S]*\}', text)
     if match:
         return json.loads(match.group())
     return {}
 
 
+# Module-level singleton; imported by the policy API router and policy agent.
 policy_service = PolicyService()

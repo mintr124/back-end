@@ -1,9 +1,11 @@
 """
-domain_classifier.py
-====================
-LLM-based domain classifier.
-Loads domain descriptions from DB (with 5-minute TTL cache).
-Falls back to keyword matching if LLM is unavailable.
+LLM-based domain classifier with entity overlap scoring.
+
+Pipeline per chunk:
+  1. LLM assigns confidence score to every active domain
+  2. Entity overlap: |detected_entity_types ∩ domain_entities| / |domain_entities|
+  3. final_score = 0.4 × LLM_confidence + 0.6 × entity_overlap
+  4. Return all domains with final_score >= DOMAIN_THRESHOLD, sorted by score desc
 """
 from __future__ import annotations
 
@@ -13,62 +15,82 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# ── Cache ─────────────────────────────────────────────────────────────────────
-_domain_cache: dict[str, str] = {}   # {code: description}
-_domain_cache_ts: float = 0.0
-_DOMAIN_TTL = 300.0
+DOMAIN_THRESHOLD = 0.3
+
+_DOMAIN_TTL = 300.0  # 5-minute cache
+_cache_lock = threading.Lock()
+
+# ── Domain description cache ──────────────────────────────────────────────────
+_domain_desc_cache: dict[str, str] = {}  # {code: description}
+_domain_desc_ts: float = 0.0
+
+# ── Domain entity type cache ──────────────────────────────────────────────────
+_domain_entity_cache: dict[str, set[str]] = {}  # {code: {entity_type}}
+_domain_entity_ts: float = 0.0
 
 
 def _get_domain_descriptions(db=None) -> dict[str, str]:
-    global _domain_cache, _domain_cache_ts
+    global _domain_desc_cache, _domain_desc_ts
     now = time.monotonic()
-    if now - _domain_cache_ts < _DOMAIN_TTL and _domain_cache:
-        return _domain_cache
+    if now - _domain_desc_ts < _DOMAIN_TTL and _domain_desc_cache:
+        return _domain_desc_cache
     if db is None:
-        return _domain_cache
-    try:
-        from app.repositories.policy_repository import policy_repository
-        domains = policy_repository.list_domains(db, active_only=True)
-        _domain_cache = {d.code: (d.description or d.name) for d in domains}
-        _domain_cache_ts = now
-        logger.debug("Domain description cache refreshed: %d domains", len(_domain_cache))
-    except Exception as exc:
-        logger.warning("Failed to refresh domain cache: %s", exc)
-    return _domain_cache
+        return _domain_desc_cache
+    with _cache_lock:
+        if now - _domain_desc_ts < _DOMAIN_TTL and _domain_desc_cache:
+            return _domain_desc_cache
+        try:
+            from app.repositories.policy_repository import policy_repository
+            domains = policy_repository.list_domains(db, active_only=True)
+            _domain_desc_cache = {d.code: (d.description or d.name) for d in domains}
+            _domain_desc_ts = now
+            logger.debug("Domain description cache refreshed: %d domains", len(_domain_desc_cache))
+        except Exception as exc:
+            logger.warning("Failed to refresh domain description cache: %s", exc)
+    return _domain_desc_cache
+
+
+def _get_domain_entity_types(db=None) -> dict[str, set[str]]:
+    global _domain_entity_cache, _domain_entity_ts
+    now = time.monotonic()
+    if now - _domain_entity_ts < _DOMAIN_TTL and _domain_entity_cache:
+        return _domain_entity_cache
+    if db is None:
+        return _domain_entity_cache
+    with _cache_lock:
+        if now - _domain_entity_ts < _DOMAIN_TTL and _domain_entity_cache:
+            return _domain_entity_cache
+        try:
+            from app.repositories.policy_repository import policy_repository
+            _domain_entity_cache = policy_repository.get_entity_types_grouped_by_domain(db)
+            _domain_entity_ts = now
+            logger.debug("Domain entity type cache refreshed: %d domains", len(_domain_entity_cache))
+        except Exception as exc:
+            logger.warning("Failed to refresh domain entity type cache: %s", exc)
+    return _domain_entity_cache
 
 
 def invalidate_domain_cache() -> None:
-    global _domain_cache_ts
-    _domain_cache_ts = 0.0
+    global _domain_desc_ts, _domain_entity_ts
+    _domain_desc_ts = 0.0
+    _domain_entity_ts = 0.0
 
-
-# ── Data classes ──────────────────────────────────────────────────────────────
 
 @dataclass
 class DomainPrediction:
     domain_code: str
-    confidence: float
+    confidence: float   # final_score combining LLM + entity overlap
 
-
-@dataclass
-class ClassificationResult:
-    primary: DomainPrediction
-    secondary: Optional[DomainPrediction]
-
-
-# ── LLM classifier ────────────────────────────────────────────────────────────
 
 _CLASSIFY_SYSTEM = (
     "You are a document domain classifier for an enterprise RAG system. "
-    "Given a text chunk and a list of business domains, identify which domains the chunk belongs to. "
-    "Return JSON only: "
-    "{\"primary_domain\": \"<code>\", \"primary_confidence\": <0..1>, "
-    "\"secondary_domain\": \"<code or null>\", \"secondary_confidence\": <0..1 or null>}. "
-    "No explanation."
+    "Given a text chunk and business domain definitions, assign a confidence score (0.0–1.0) "
+    "to EACH domain indicating how strongly the chunk belongs to it. "
+    "Return JSON only: {\"<domain_code>\": <score>, ...} for ALL listed domain codes. "
+    "Use 0.0 for clearly unrelated domains. No explanation, no extra keys."
 )
 
 
@@ -79,124 +101,75 @@ class DomainClassifier:
         chunk_text: str,
         *,
         db=None,
-        metadata_tags: list[str] | None = None,
-        metadata_department: str | None = None,
-        secondary_gap_threshold: float = 0.15,
-    ) -> ClassificationResult:
+        detected_entity_types: set[str] | None = None,
+    ) -> list[DomainPrediction]:
+        """Classify chunk into domains using LLM + entity overlap scoring.
+        Returns all domains with final_score >= DOMAIN_THRESHOLD, sorted by score desc."""
         domain_descriptions = _get_domain_descriptions(db)
+        domain_entities     = _get_domain_entity_types(db)
 
         if not domain_descriptions:
-            return ClassificationResult(
-                primary=DomainPrediction("GEN-00", 1.0),
-                secondary=None,
-            )
+            return [DomainPrediction("GEN-00", 1.0)]
 
-        # Try LLM classification first
-        result = self._classify_llm(
-            chunk_text, domain_descriptions, metadata_tags, metadata_department
-        )
-        if result:
-            return result
+        detected = detected_entity_types or set()
+        llm_scores = self._classify_llm(chunk_text, domain_descriptions)
+        print(f"[CLASSIFIER] llm_scores: {llm_scores}")
 
-        # Fallback: keyword/Jaccard similarity
-        return self._classify_keyword(
-            chunk_text, domain_descriptions, metadata_tags, metadata_department,
-            secondary_gap_threshold,
-        )
+        results: list[DomainPrediction] = []
+        for code in domain_descriptions:
+            llm_conf = llm_scores.get(code, 0.0)
+            overlap  = _entity_overlap(detected, domain_entities.get(code, set()))
+            final    = round(0.4 * llm_conf + 0.6 * overlap, 3)
+            print(f"[CLASSIFIER]   {code}: llm={llm_conf:.2f} overlap={overlap:.2f} final={final:.3f} {'✓' if final >= DOMAIN_THRESHOLD else '✗'}")
+            if final >= DOMAIN_THRESHOLD:
+                results.append(DomainPrediction(code, final))
+
+        if not results:
+            # Fallback: pick the domain with the highest LLM score
+            if llm_scores:
+                best = max(llm_scores, key=lambda k: llm_scores[k])
+                results = [DomainPrediction(best, round(llm_scores[best], 3))]
+            else:
+                results = [DomainPrediction("GEN-00", 1.0)]
+
+        return sorted(results, key=lambda x: x.confidence, reverse=True)
 
     def _classify_llm(
-        self,
-        chunk_text: str,
-        domain_descriptions: dict[str, str],
-        metadata_tags: list[str] | None,
-        metadata_department: str | None,
-    ) -> Optional[ClassificationResult]:
+        self, chunk_text: str, domain_descriptions: dict[str, str]
+    ) -> dict[str, float]:
+        """Ask LLM to score every domain; returns {domain_code: confidence 0-1}."""
         try:
             from app.services.llm_service import llm_service
             if not llm_service.is_configured():
-                return None
+                return {}
 
             domain_list = "\n".join(f"- {k}: {v}" for k, v in domain_descriptions.items())
             prompt = (
                 f"Domain list:\n{domain_list}\n\n"
                 f"Chunk text:\n\"\"\"{chunk_text[:800]}\"\"\"\n\n"
-                f"Metadata: department={metadata_department or 'N/A'}, "
-                f"tags={', '.join(metadata_tags or []) or 'N/A'}\n\n"
-                "Classify into the most relevant domain(s)."
+                "Score each domain code listed above."
             )
             text, _, _ = llm_service.generate(
                 prompt=prompt,
                 system=_CLASSIFY_SYSTEM,
-                max_tokens=128,
+                max_tokens=256,
                 temperature=0.0,
             )
             raw = _extract_json(text)
-            primary_code = raw.get("primary_domain", "")
-            primary_conf = float(raw.get("primary_confidence", 0.5))
-            sec_code     = raw.get("secondary_domain")
-            sec_conf     = raw.get("secondary_confidence")
-
-            # LLM trả về code không hợp lệ → fallthrough sang keyword classifier
-            if primary_code not in domain_descriptions:
-                return None
-            secondary = None
-            if sec_code and sec_code in domain_descriptions and sec_conf is not None:
-                secondary = DomainPrediction(sec_code, round(float(sec_conf), 3))
-
-            return ClassificationResult(
-                primary=DomainPrediction(primary_code, round(primary_conf, 3)),
-                secondary=secondary,
-            )
+            return {
+                k: max(0.0, min(1.0, float(v)))
+                for k, v in raw.items()
+                if k in domain_descriptions and isinstance(v, (int, float))
+            }
         except Exception as exc:
             logger.warning("LLM domain classification failed: %s", exc)
-            return None
+            return {}
 
-    def _classify_keyword(
-        self,
-        chunk_text: str,
-        domain_descriptions: dict[str, str],
-        metadata_tags: list[str] | None,
-        metadata_department: str | None,
-        secondary_gap_threshold: float,
-    ) -> ClassificationResult:
-        def tokenize(t: str) -> set[str]:
-            return set(w.lower().strip(".,!?():;\"'") for w in t.split())
 
-        combined = chunk_text + " " + " ".join(metadata_tags or [])
-        a = tokenize(combined)
-
-        scores: dict[str, float] = {}
-        for code, desc in domain_descriptions.items():
-            b = tokenize(desc)
-            if not a or not b:
-                scores[code] = 0.0
-                continue
-            inter = len(a & b)
-            union = len(a | b)
-            score = inter / union if union else 0.0
-            if metadata_department and metadata_department.lower() in code.lower():
-                score += 0.05
-            scores[code] = score
-
-        MIN_KEYWORD_SCORE = 0.03  # dưới ngưỡng này → không đủ evidence → GEN-00
-        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        if not ranked or ranked[0][1] < MIN_KEYWORD_SCORE:
-            return ClassificationResult(
-                primary=DomainPrediction("GEN-00", 1.0),
-                secondary=None,
-            )
-
-        top1_code, top1_score = ranked[0]
-        top2_code, top2_score = ranked[1] if len(ranked) > 1 else (None, 0.0)
-
-        secondary = None
-        if top2_code and (top1_score - top2_score) < secondary_gap_threshold:
-            secondary = DomainPrediction(top2_code, round(top2_score, 3))
-
-        return ClassificationResult(
-            primary=DomainPrediction(top1_code, round(top1_score, 3)),
-            secondary=secondary,
-        )
+def _entity_overlap(detected: set[str], domain_entities: set[str]) -> float:
+    if not domain_entities:
+        return 0.0
+    return len(detected & domain_entities) / len(domain_entities)
 
 
 def _extract_json(text: str) -> dict:

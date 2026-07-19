@@ -1,16 +1,14 @@
 """
-intent_classifier.py
-====================
-Lightweight intent classification for RAG queries.
-Layer 1: keyword matching (fast, no API call)
-Layer 2: LLM fallback if keyword matching returns "lookup" but query seems ambiguous
+Lightweight two-layer intent classifier for RAG queries.
+  Layer 1: keyword matching (fast, no API call)
+  Layer 2: LLM fallback when keyword matching is ambiguous
 
 Intent classes:
-  lookup     — Tra cứu thông tin cụ thể (default)
-  aggregate  — Tổng hợp / thống kê
-  export     — Xuất / tải dữ liệu
-  compare    — So sánh hai hay nhiều thứ
-  summarize  — Tóm tắt nội dung
+  lookup     — specific information retrieval (default)
+  aggregate  — aggregation / statistics
+  export     — data export / download
+  compare    — comparison between two or more items
+  summarize  — content summarisation
 """
 from __future__ import annotations
 
@@ -58,12 +56,8 @@ _CLASSIFY_SYSTEM = (
 
 class IntentClassifier:
 
+    # Classify query intent; tries keywords first, falls back to LLM for ambiguous queries.
     def classify(self, query: str, *, use_llm: bool = True) -> str:
-        """
-        Returns one of: lookup | aggregate | export | compare | summarize.
-        Tries keyword matching first; if result is 'lookup' and query looks
-        ambiguous, optionally calls LLM for confirmation.
-        """
         keyword_intent = self._keyword_classify(query)
 
         if keyword_intent != "lookup":
@@ -76,6 +70,7 @@ class IntentClassifier:
 
         return "lookup"
 
+    # Match query keywords against _KEYWORD_MAP; returns "lookup" when no match.
     def _keyword_classify(self, query: str) -> str:
         q_lower = query.lower()
         for intent, keywords in _KEYWORD_MAP.items():
@@ -83,6 +78,7 @@ class IntentClassifier:
                 return intent
         return "lookup"
 
+    # Call the LLM to classify an ambiguous query; returns None on failure or unconfigured service.
     def _llm_classify(self, query: str) -> str | None:
         try:
             from app.services.llm_service import llm_service
@@ -94,7 +90,7 @@ class IntentClassifier:
                 max_tokens=32,
                 temperature=0.0,
             )
-            import json, re
+            import json
             m = re.search(r'\{[\s\S]*\}', text)
             if m:
                 result = json.loads(m.group())
@@ -106,4 +102,5 @@ class IntentClassifier:
         return None
 
 
+# Module-level singleton; imported by the chat pipeline.
 intent_classifier = IntentClassifier()

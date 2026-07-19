@@ -1,18 +1,12 @@
 """
-embedding_service.py  –  v2
-============================
-Key improvements vs v1:
-  - embed_many() uses a single OpenAI API call (batch), not N calls
-  - dimensions default to 1536 (text-embedding-3-small native), configurable
-  - Ollama batch via single /api/embed endpoint (v0.3+), falls back to loop
-  - retry logic (3 attempts) for transient network errors
+Embedding service: batch text embedding via OpenAI or Ollama with retry and sub-batch support.
 """
 from __future__ import annotations
 
 import logging
 import os
 import time
-from typing import Iterable
+from collections.abc import Iterable
 
 import requests
 
@@ -67,14 +61,14 @@ class EmbeddingService:
         self.ollama_model = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 
         # ── Client ────────────────────────────────────────────────────
-        self.client: "OpenAI | None" = None
+        self.client: OpenAI | None = None
         if self.provider == "openai" and OpenAI is not None and self.api_key:
             self.client = OpenAI(
                 api_key=self.api_key,
                 base_url=self.base_url or None,
             )
 
-    # ------------------------------------------------------------------
+    # Return True if the embedding provider has the required credentials or server.
     def is_configured(self) -> bool:
         if self.provider == "openai":
             return self.client is not None
@@ -84,6 +78,7 @@ class EmbeddingService:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    # Embed a batch of texts via the OpenAI embeddings API with retry.
     def _openai_batch(self, texts: list[str]) -> list[list[float]]:
         if not self.client:
             raise RuntimeError("OpenAI embedding client is not configured")
@@ -106,11 +101,8 @@ class EmbeddingService:
 
         return []  # unreachable
 
+    # Embed a batch via Ollama /api/embed (v0.3+), falling back to sequential /api/embeddings.
     def _ollama_batch(self, texts: list[str]) -> list[list[float]]:
-        """
-        Ollama ≥ 0.3 supports /api/embed with multiple inputs.
-        Falls back to sequential /api/embeddings for older versions.
-        """
         try:
             r = requests.post(
                 f"{self.ollama_url}/api/embed",
@@ -124,7 +116,6 @@ class EmbeddingService:
         except Exception:
             pass  # fall through to legacy loop
 
-        # Legacy sequential
         results: list[list[float]] = []
         for text in texts:
             r = requests.post(
@@ -140,16 +131,13 @@ class EmbeddingService:
     # Public API
     # ------------------------------------------------------------------
 
+    # Embed a single text string; returns an empty list if embedding fails.
     def embed(self, text: str) -> list[float]:
-        """Embed a single text."""
         result = self.embed_many([text])
         return result[0] if result else []
 
+    # Batch-embed texts, splitting into sub-batches to stay within API limits.
     def embed_many(self, texts: Iterable[str]) -> list[list[float]]:
-        """
-        Batch embed.  Splits into sub-batches of _BATCH_SIZE to stay within
-        API limits while still being much faster than N individual calls.
-        """
         cleaned = [(t or "").strip() for t in texts]
         # keep track of original positions; skip empty but remember slots
         non_empty_idx: list[int] = []
@@ -162,7 +150,6 @@ class EmbeddingService:
         if not non_empty_texts:
             return [[] for _ in cleaned]
 
-        # sub-batch loop
         all_vectors: list[list[float]] = []
         for start in range(0, len(non_empty_texts), _BATCH_SIZE):
             batch = non_empty_texts[start: start + _BATCH_SIZE]
@@ -172,7 +159,6 @@ class EmbeddingService:
                 vecs = self._ollama_batch(batch)
             all_vectors.extend(vecs)
 
-        # reconstruct full list (empty slots stay [])
         output: list[list[float]] = [[] for _ in cleaned]
         for slot, vec in zip(non_empty_idx, all_vectors):
             output[slot] = vec
@@ -180,4 +166,5 @@ class EmbeddingService:
         return output
 
 
+# Module-level singleton; imported by the retrieval service and memory service.
 embedding_service = EmbeddingService()

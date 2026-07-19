@@ -1,10 +1,10 @@
-from sqlalchemy import Column, ForeignKey, JSON, String, Text, Integer, Table
+from sqlalchemy import Column, ForeignKey, Integer, JSON, String, Table, Text
 from sqlalchemy.orm import relationship
 
 from app.db.base import Base, TimestampMixin
 from app.utils.ids import new_uuid
 
-# Many-to-many: document ↔ org_unit_instance
+# Many-to-many: document <-> org_unit_instance.
 document_oui = Table(
     "document_oui",
     Base.metadata,
@@ -29,7 +29,7 @@ class Document(Base, TimestampMixin):
 
     current_version_id = Column(String(36), ForeignKey("document_versions.id"), nullable=True, index=True)
 
-    # Multi OUI
+    # Multi OUI.
     ouis = relationship("OrgUnitInstance", secondary=document_oui, back_populates="documents")
 
     owner = relationship("User")

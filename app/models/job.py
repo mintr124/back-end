@@ -26,3 +26,4 @@ class Job(Base, TimestampMixin):
     version = relationship("DocumentVersion")
     created_by = relationship("User")
     steps = relationship("JobStep", back_populates="job", cascade="all, delete-orphan")
+

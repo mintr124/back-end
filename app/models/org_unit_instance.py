@@ -1,8 +1,8 @@
-from sqlalchemy import Column, String, ForeignKey, Table
+from sqlalchemy import Column, ForeignKey, String, Table
 from sqlalchemy.orm import relationship
-from app.models.document import document_oui
 
 from app.db.base import Base, TimestampMixin
+from app.models.document import document_oui
 from app.utils.ids import new_uuid
 
 

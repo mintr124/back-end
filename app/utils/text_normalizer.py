@@ -1,3 +1,6 @@
+"""
+Text normalisation utilities: NFKC unicode, whitespace collapsing, hyphen-break removal, bullet stripping.
+"""
 from __future__ import annotations
 
 import re
@@ -15,6 +18,7 @@ _BULLET_RE = re.compile(
 )
 
 
+# Normalise whitespace, unicode, hyphen line-breaks, and bullet markers in extracted text.
 def normalize_text(text: str) -> str:
     if not text:
         return ""

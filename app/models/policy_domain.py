@@ -6,7 +6,7 @@ from app.utils.ids import new_uuid
 
 
 class PolicyDomain(Base, TimestampMixin):
-    """Định nghĩa một domain nghiệp vụ (HR, Finance, Sales, ...)."""
+    # Define a policy domain, which groups related access control rules and entity types.
     __tablename__ = "policy_domains"
 
     id          = Column(String(36), primary_key=True, default=new_uuid)
@@ -30,7 +30,7 @@ class PolicyDomain(Base, TimestampMixin):
 
 
 class DomainEntityType(Base, TimestampMixin):
-    """Các loại entity được detect trong domain (GLiNER labels)."""
+    # Entity types detected within the domain (GLiNER labels).
     __tablename__ = "domain_entity_types"
     __table_args__ = (
         UniqueConstraint("domain_id", "entity_type", name="uq_domain_entity"),
@@ -48,7 +48,7 @@ class DomainEntityType(Base, TimestampMixin):
 
 
 class DomainRule(Base, TimestampMixin):
-    """Quy tắc kiểm soát truy cập thuộc về một domain (hoặc global khi domain_id=None)."""
+    # Access control rules belonging to a policy domain (or global when domain_id=None).
     __tablename__ = "domain_rules"
 
     id        = Column(String(36), primary_key=True, default=new_uuid)
@@ -62,7 +62,7 @@ class DomainRule(Base, TimestampMixin):
     is_active = Column(Boolean, nullable=False, default=True)
     audit_log = Column(Boolean, nullable=False, default=True)
 
-    # Điều kiện kích hoạt rule
+    # Conditions for activating the rule
     conditions_json = Column(JSON, nullable=False, default=dict)
     # {
     #   "min_sensitivity": "Confidential",     # None = không giới hạn
@@ -75,13 +75,13 @@ class DomainRule(Base, TimestampMixin):
     #   "require_intent_risk": null            # normal|cross_dept|bulk_extraction|suspicious
     # }
 
-    # Điều kiện của policy-contract khi rule được kích hoạt
+    # Conditions of the policy-contract when the rule is activated
     contract_json = Column(JSON, nullable=False, default=dict)
     # {
     #   "max_detail": "department",            # company|department|project|individual
     #   "numeric_granularity": "aggregated",   # hidden|aggregated|exact
-    #   "allowed_entities": [],                # [] = theo domain entity types
     #   "violation_action": "redact"           # mask|generalize|deny|regenerate
     # }
 
     domain = relationship("PolicyDomain", back_populates="rules", foreign_keys=[domain_id])
+

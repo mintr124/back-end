@@ -1,9 +1,12 @@
+"""
+LLM service: unified generate/stream/json interface for OpenAI and Ollama providers.
+"""
 from __future__ import annotations
 
 import re
 import json as jsonlib
-from typing import Optional, Tuple, Any, Dict, Iterable
 import logging
+from typing import Any
 
 import httpx
 
@@ -34,6 +37,7 @@ Nguyên tắc:
 
 
 class LLMService:
+    # Return True if the configured LLM provider has the required credentials.
     def is_configured(self) -> bool:
         if settings.llm_provider == "openai":
             return bool(settings.openai_api_key)
@@ -41,11 +45,13 @@ class LLMService:
             return bool(settings.olama_url)
         return False
 
-    def _build_instructions(self, system: Optional[str]) -> str:
+    # Prepend the default Vietnamese system prompt to any caller-supplied system text.
+    def _build_instructions(self, system: str | None) -> str:
         if system and system.strip():
             return f"{DEFAULT_VI_SYSTEM_PROMPT}\n\n{system.strip()}"
         return DEFAULT_VI_SYSTEM_PROMPT
 
+    # Build the final user prompt from a question, retrieved contexts, and chat history.
     def build_prompt(
         self,
         *,
@@ -109,12 +115,13 @@ YÊU CẦU TRẢ LỜI
 - Lịch sử hội thoại chỉ dùng để hiểu đại từ/tham chiếu, không phải chủ đề để trả lời.
 - Nếu ngữ cảnh chứa bảng markdown (dòng bắt đầu và kết thúc bằng ký tự |), BẮT BUỘC trình bày dữ liệu đó dưới dạng bảng markdown trong câu trả lời. Không được chuyển thành danh sách hay văn xuôi.
 - Dùng danh sách khi nội dung là các bước tuần tự hoặc nhiều mục rời rạc không có cấu trúc bảng.
-- BẮT BUỘC trích dẫn (citation): mỗi Context được sử dụng để tổng hợp câu trả lời PHẢI xuất hiện ít nhất một lần dưới dạng [N] trong câu trả lời. Chèn [N] ngay sau câu/đoạn lấy thông tin từ Context N. Ví dụ: nếu dùng Context 1 và Context 2 thì phải có [1] và [2] trong câu trả lời. Không cite Context không được sử dụng.
+- BẮT BUỘC trích dẫn (citation): sau mỗi câu hoặc đoạn lấy từ ngữ cảnh, chèn số thứ tự Context trong dấu ngoặc vuông. Ví dụ: nếu thông tin đến từ Context 1 thì viết [1], từ Context 2 thì viết [2]. Mỗi Context được sử dụng phải xuất hiện ít nhất một lần. Không cite Context không dùng.
 
 ĐỊNH DẠNG TRẢ LỜI
 - Trả lời trực tiếp trước, giải thích sau nếu cần.
 - Không bắt đầu bằng "Dựa trên ngữ cảnh..." hay các cụm mở đầu thừa.
-- Giữ nguyên hoàn toàn định dạng markdown từ ngữ cảnh: **in đậm**, *in nghiêng*, | bảng |, danh sách. Khi trích dẫn nội dung, sao chép định dạng gốc, không chuyển thành văn xuôi hay định dạng khác.
+- Nếu ngữ cảnh có chuỗi các bước nối bằng →, trình bày lại dưới dạng danh sách có số thứ tự, không copy nguyên chuỗi dài.
+- Giữ nguyên định dạng markdown từ ngữ cảnh: **in đậm**, *in nghiêng*, | bảng |, danh sách. Khi trích dẫn nội dung dạng bảng, sao chép nguyên bảng; không chuyển thành văn xuôi.
 """.strip()
 
         if extra_instructions and extra_instructions.strip():
@@ -122,18 +129,15 @@ YÊU CẦU TRẢ LỜI
 
         return prompt
 
+    # Generate a completion; tries OpenAI first, falls back to Ollama. Returns (text, raw_response, source).
     def generate(
         self,
         prompt: str,
-        system: Optional[str] = None,
+        system: str | None = None,
         max_tokens: int = 512,
         temperature: float = 0.0,
         fallback_to_ollama: bool = True,
-    ) -> Tuple[str, Any, str]:
-        """
-        Returns: (text, raw_response, source)
-        source: openai | ollama | fallback
-        """
+    ) -> tuple[str, Any, str]:
         provider = settings.llm_provider
 
         logger.info(
@@ -197,7 +201,7 @@ YÊU CẦU TRẢ LỜI
             if system and system.strip():
                 final_prompt = f"{DEFAULT_VI_SYSTEM_PROMPT}\n\n{system.strip()}\n\n{prompt}"
 
-            payload: Dict[str, Any] = {
+            payload: dict[str, Any] = {
                 "model": model,
                 "prompt": final_prompt,
                 "stream": True,
@@ -235,13 +239,14 @@ YÊU CẦU TRẢ LỜI
 
         raise RuntimeError("No LLM provider configured")
 
+    # Stream completion tokens; supports both OpenAI and Ollama (single-turn and multi-turn).
     def generate_stream(
         self,
-        prompt: str = None,
+        prompt: str | None = None,
         messages: list | None = None,
         max_tokens: int = 256,
         temperature: float = 0.0,
-        system: Optional[str] = None,
+        system: str | None = None,
     ):
         provider = settings.llm_provider
         logger.info(
@@ -249,7 +254,6 @@ YÊU CẦU TRẢ LỜI
             provider, max_tokens, temperature,
         )
 
-        # Build messages array if not provided
         if messages is None:
             logger.info("LLM STREAM PROMPT:\n%s", prompt)
             messages = [{"role": "user", "content": prompt}]
@@ -330,15 +334,15 @@ YÊU CẦU TRẢ LỜI
                         except Exception:
                             continue
 
+    # Generate with response_format=json_object to guarantee valid JSON output.
     def generate_json(
         self,
         prompt: str,
-        system: Optional[str] = None,
+        system: str | None = None,
         max_tokens: int = 16000,
         temperature: float = 0.0,
         use_default_instructions: bool = True,
-    ) -> Tuple[str, Any, str]:
-        """Generate với response_format=json_object — đảm bảo output là valid JSON."""
+    ) -> tuple[str, Any, str]:
         if settings.llm_provider != "openai":
             return self.generate(prompt, system, max_tokens, temperature, fallback_to_ollama=True)
         if OpenAI is None:
@@ -354,14 +358,12 @@ YÊU CẦU TRẢ LỜI
         else:
             instructions = (system or "").strip() or "Bạn là hệ thống xử lý dữ liệu. Chỉ trả về JSON."
 
-        # --- LOG ĐẦY ĐỦ REQUEST GỬI LÊN LLM (system + user prompt thật) ---
         logger.info(
             "LLM generate_json REQUEST model=%s max_tokens=%s temperature=%s use_default_instructions=%s",
             model, max_tokens, temperature, use_default_instructions,
         )
         logger.info("LLM generate_json SYSTEM:\n%s", instructions)
         logger.info("LLM generate_json USER PROMPT:\n%s", prompt)
-        # -------------------------------------------------------------------
 
         resp = client.chat.completions.create(
             model=model,
@@ -378,4 +380,5 @@ YÊU CẦU TRẢ LỜI
         return text, resp, "openai"
 
 
+# Module-level singleton; imported by the chat pipeline, chunker, and intent classifier.
 llm_service = LLMService()

@@ -1,20 +1,20 @@
-from sqlalchemy import Column, String, ForeignKey, UniqueConstraint
+from sqlalchemy import Column, ForeignKey, String, UniqueConstraint
 from sqlalchemy.orm import relationship
 
 from app.db.base import Base, TimestampMixin
 from app.utils.ids import new_uuid
 
 
-class UserOuiPosition(Base, TimestampMixin):
-    """
-    Junction: user thuộc một OUI với một Position cụ thể.
-    UNIQUE(user_id, oui_id) — mỗi user chỉ có 1 position tại 1 OUI.
+"""
+Junction: user belongs to an OUI with a specific Position.
+UNIQUE(user_id, oui_id) — each user has only one position at any given OUI.
 
-    Conflict rule (enforce ở service layer):
-    - Không cho phép user có 2 records mà oui_id của chúng
-      có quan hệ ancestor–descendant trong cây OUI.
-    - Các OUI thuộc nhánh khác nhau → OK.
-    """
+Conflict rule (enforce at the service layer):
+- Does not allow a user to have two records where the oui_id values
+  have an ancestor–descendant relationship in the OUI tree.
+- Various OUIs belonging to different branches → OK.
+"""
+class UserOuiPosition(Base, TimestampMixin):
     __tablename__ = "user_oui_positions"
     __table_args__ = (
         UniqueConstraint("user_id", "oui_id", name="uq_user_oui"),

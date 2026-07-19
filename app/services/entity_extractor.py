@@ -1,10 +1,8 @@
 """
-entity_extractor.py
-====================
-Hybrid entity extraction pipeline:
-  Layer 1 (Regex)  → Structured PII (email, phone, national_id, ...)
-  Layer 2 (GLiNER) → Free-text entities from labels defined in active DB domains
-  Layer 3 (Rule)   → Boolean summary labels + chunk sensitivity scoring
+Hybrid entity extraction pipeline with three layers:
+  Layer 1 (Regex)  — structured PII (email, phone, national_id, ...)
+  Layer 2 (GLiNER) — free-text entities from labels defined in active DB domains
+  Layer 3 (Rule)   — boolean summary labels and chunk sensitivity scoring
 
 Boolean flags (fixed vocabulary, defined in policy_service.BOOLEAN_FLAGS):
   has_pii        — personal identifiable information
@@ -15,8 +13,8 @@ Boolean flags (fixed vocabulary, defined in policy_service.BOOLEAN_FLAGS):
   has_hr         — HR-specific sensitive data (salary, employment records)
 
 Entity type → flag mapping:
-  • Regex-detected types (email, phone, money …) → hardcoded _BUILTIN_ENTITY_FLAGS
-  • GLiNER-detected types (from DB domain entity types) → loaded from domain_entity_types.boolean_labels
+  Regex-detected types → hardcoded _BUILTIN_ENTITY_FLAGS
+  GLiNER-detected types → loaded from domain_entity_types.boolean_labels
   Both are merged into a single TTL cache refreshed every 5 minutes.
 """
 from __future__ import annotations
@@ -83,14 +81,8 @@ _FLAG_SENSITIVITY_WEIGHTS: dict[str, int] = {
 }
 
 
+# Derive chunk-level sensitivity from doc sensitivity and detected boolean flags; result clamped to [1, 5].
 def compute_chunk_sensitivity(doc_sensitivity: int, labels: dict[str, bool]) -> int:
-    """
-    Derive chunk-level sensitivity from doc sensitivity and detected boolean flags.
-
-    - No flags → delta = -1  (boilerplate/generic content)
-    - Any flags → delta = min(sum of weights, +2)
-    - Result clamped to [1, 5]
-    """
     if not any(labels.values()):
         delta = -1
     else:
@@ -102,14 +94,14 @@ def compute_chunk_sensitivity(doc_sensitivity: int, labels: dict[str, bool]) -> 
 # ── Combined entity cache (labels + flag mapping) ─────────────────────────────
 # One DB call serves both Layer 2 (GLiNER label list) and Layer 3 (entity→flags map).
 
-_cache: dict = {}   # {"labels": list[str], "flags": dict[str, list[str]]}
+_cache: dict[str, list] = {}
 _cache_ts: float = 0.0
-_cache_lock = threading.Lock()
+_cache_lock: threading.Lock = threading.Lock()
 _CACHE_TTL = 300.0  # 5 minutes
 
 
+# Return (active_gliner_labels, entity_flags_map) from the TTL cache, refreshing from DB when stale.
 def _refresh_cache(db=None) -> tuple[list[str], dict[str, list[str]]]:
-    """Return (active_gliner_labels, entity_flags_map) from cache or DB."""
     global _cache, _cache_ts
     now = time.monotonic()
 
@@ -145,8 +137,8 @@ def _refresh_cache(db=None) -> tuple[list[str], dict[str, list[str]]]:
     return _cache.get("labels", []), _cache.get("flags", dict(_BUILTIN_ENTITY_FLAGS))
 
 
+# Force a cache refresh on the next call; invoke after creating or deleting entity types.
 def invalidate_label_cache() -> None:
-    """Call after creating/deleting entity types to force cache refresh."""
     global _cache_ts
     _cache_ts = 0.0
 
@@ -157,6 +149,7 @@ _gliner_model = None
 _gliner_lock  = threading.Lock()
 
 
+# Lazily load and cache the GLiNER model; returns None if loading fails.
 def _get_gliner():
     global _gliner_model
     if _gliner_model is None:
@@ -175,6 +168,7 @@ def _get_gliner():
 
 # ── Layer 1: Regex extraction ─────────────────────────────────────────────────
 
+# Extract structured PII entities from text using regex patterns (Layer 1).
 def extract_structured_entities(text: str) -> list[dict]:
     results = []
     for label, pattern in REGEX_PATTERNS.items():
@@ -193,6 +187,7 @@ def extract_structured_entities(text: str) -> list[dict]:
 
 # ── Layer 2: GLiNER extraction ────────────────────────────────────────────────
 
+# Extract free-text entities using GLiNER with the given label list (Layer 2).
 def extract_freetext_entities(text: str, labels: list[str], threshold: float = 0.3) -> list[dict]:
     if not labels:
         return []
@@ -211,13 +206,10 @@ def extract_freetext_entities(text: str, labels: list[str], threshold: float = 0
 
 # ── Layer 3: Boolean labels ───────────────────────────────────────────────────
 
+# Map entity types to boolean flags and augment with keyword rules for patterns GLiNER may miss (Layer 3).
 def detect_boolean_labels(
     text: str, all_entities: list[dict], entity_flags: dict[str, list[str]]
 ) -> dict[str, bool]:
-    """
-    Map detected entity types → boolean flags via entity_flags (loaded from DB + builtins),
-    then augment with keyword-based rules for patterns GLiNER might miss.
-    """
     active_flags: set[str] = set()
 
     for entity in all_entities:
@@ -241,23 +233,58 @@ def detect_boolean_labels(
     }
 
 
+# ── Realtime extraction (retrieval time) ──────────────────────────────────────
+
+# Run GLiNER on a single text. Returns (entities, detected_entity_types).
+def extract_realtime(
+    text: str,
+    *,
+    db=None,
+    threshold: float = 0.3,
+) -> tuple[list[dict], set[str]]:
+    gliner_labels, _ = _refresh_cache(db)
+    entities = extract_freetext_entities(text, gliner_labels, threshold=threshold)
+    return entities, {e["label"] for e in entities}
+
+
+# Run GLiNER on multiple texts in one sequential batch — avoids model reload overhead.
+# Returns one set[str] of detected entity types per text.
+def extract_realtime_batch(
+    texts: list[str],
+    *,
+    db=None,
+    threshold: float = 0.3,
+) -> list[set[str]]:
+    if not texts:
+        return []
+    gliner_labels, _ = _refresh_cache(db)
+    if not gliner_labels:
+        return [set() for _ in texts]
+    model = _get_gliner()
+    if model is None:
+        return [set() for _ in texts]
+
+    results: list[set[str]] = []
+    try:
+        for text in texts:
+            raw = model.predict_entities(text, gliner_labels, threshold=threshold)
+            results.append({e["label"] for e in raw})
+    except Exception as exc:
+        logger.error("GLiNER batch inference error: %s", exc)
+        while len(results) < len(texts):
+            results.append(set())
+    return results
+
+
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 
+# Run all three extraction layers and return entities, boolean labels, and deduplicated entity types.
 def run_pipeline(
     text: str,
     *,
     db=None,
     gliner_threshold: float = 0.3,
 ) -> dict:
-    """
-    Returns:
-      {
-        "entities":     [{"text", "label", "start", "end", "score", "source"}, ...],
-        "labels":       {"has_pii", "has_financial", "has_credential",
-                         "has_legal", "has_strategic", "has_hr"},
-        "entity_types": [...]   # deduplicated entity type strings found
-      }
-    """
     gliner_labels, entity_flags = _refresh_cache(db)
 
     structured = extract_structured_entities(text)

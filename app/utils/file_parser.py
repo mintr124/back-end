@@ -1,3 +1,8 @@
+"""
+File parser utilities: extract text and tables from PDF, DOCX, image, and plain-text files
+into a normalised ParsedDocument structure.
+"""
+import re
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -23,8 +28,8 @@ class ParsedDocument:
 # PDF helpers
 # ---------------------------------------------------------------------------
 
+# Return True if two (x0, y0, x1, y1) rectangles overlap within an optional margin.
 def _rects_overlap(r1: tuple, r2: tuple, margin: float = 2.0) -> bool:
-    """Return True if two (x0, y0, x1, y1) rectangles overlap."""
     return not (
         r1[2] + margin < r2[0]
         or r2[2] + margin < r1[0]
@@ -33,17 +38,8 @@ def _rects_overlap(r1: tuple, r2: tuple, margin: float = 2.0) -> bool:
     )
 
 
+# Merge adjacent column pairs caused by PDF merged-cell artifacts (handles spanned-cell layouts).
 def _merge_complementary_cols(rows: list[list[str]]) -> list[list[str]]:
-    """Merge adjacent column pairs caused by PDF merged-cell artifacts.
-
-    Two adjacent columns are mergeable when they never simultaneously contain
-    *different* non-empty values — i.e., each row either:
-      • has at most one non-empty cell (true complementary split), OR
-      • has the same non-empty value in both (duplicate from a spanning cell).
-
-    This handles both the simple case (empty | value) and the duplicate case
-    ((b) | (b)) that PyMuPDF produces for some merged-cell layouts.
-    """
     if not rows or len(rows[0]) < 2:
         return rows
 
@@ -72,11 +68,8 @@ def _merge_complementary_cols(rows: list[list[str]]) -> list[list[str]]:
     return [[col_groups[c][r] for c in range(n_out)] for r in range(n_rows)]
 
 
+# Convert a PyMuPDF Table object to a Markdown table string, handling merged-cell artifacts.
 def _table_to_markdown(table) -> str:
-    """Convert a PyMuPDF Table object to a Markdown table string.
-    Handles merged-cell artifacts: removes fully-empty columns, then merges
-    adjacent complementary column pairs caused by spanned cells.
-    """
     try:
         rows = table.extract()
         if not rows:
@@ -117,8 +110,8 @@ def _table_to_markdown(table) -> str:
         return ""
 
 
+# Wrap non-empty text with **bold** / *italic* markers, preserving surrounding whitespace.
 def _apply_markdown_fmt(text: str, is_bold: bool, is_italic: bool) -> str:
-    """Wrap non-empty text with **bold** / *italic* markers, preserving surrounding spaces."""
     stripped = text.strip()
     if not stripped:
         return text
@@ -136,12 +129,8 @@ def _apply_markdown_fmt(text: str, is_bold: bool, is_italic: bool) -> str:
 _BOLD_FONT_HINTS = frozenset({"bold", "black", "heavy", "demi", "semibold", "extrabold"})
 
 
+# Convert a PyMuPDF dict-mode text block to Markdown, detecting bold/italic from span flags and font names.
 def _block_to_formatted_text(block: dict) -> str:
-    """Convert a PyMuPDF dict-mode text block to a string with Markdown formatting.
-
-    Detects bold/italic from span flags (bit 16 = bold, bit 2 = italic) and
-    from font name keywords as a fallback for PDFs that don't set flags correctly.
-    """
     line_texts: list[str] = []
     for line in block.get("lines", []):
         span_parts: list[str] = []
@@ -160,13 +149,77 @@ def _block_to_formatted_text(block: dict) -> str:
     return "\n".join(line_texts).strip()
 
 
+# Remove OCR noise: keep only lines that have ≥2 meaningful words (each ≥2 alpha chars).
+# Returns cleaned word-only text (strips pipe chars and other OCR artifacts from each line).
+def _clean_ocr_text(raw: str) -> str:
+    good: list[str] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        valid_words: list[str] = []
+        for token in line.split():
+            # Strip leading/trailing non-alphanumeric characters
+            core = re.sub(r'^[^\w]+|[^\w]+$', '', token)
+            if len(core) < 2:
+                continue
+            alpha = sum(1 for c in core if c.isalpha())
+            # Need ≥2 alphabetic chars and ≥50% of the token to be alphabetic
+            if alpha >= 2 and alpha / len(core) >= 0.5:
+                valid_words.append(core)
+        if len(valid_words) >= 2:
+            # Return cleaned words only (strips | and other non-word artifacts)
+            good.append(' '.join(valid_words))
+    return '\n'.join(good)
+
+
+# If OCR lines look like flowchart labels (short, uniform), join with → to indicate sequence.
+def _maybe_join_as_flow(lines: list[str]) -> str:
+    if len(lines) < 3:
+        return '\n'.join(lines)
+    word_counts = [len(l.split()) for l in lines]
+    avg_words = sum(word_counts) / len(word_counts)
+    max_words = max(word_counts)
+    # Flowchart heuristic: all labels short (avg ≤ 5 words, no outlier > 2× average)
+    if avg_words <= 5 and max_words <= max(avg_words * 2, 6):
+        return ' → '.join(lines)
+    return '\n'.join(lines)
+
+
+# OCR a rectangular region of a PDF page.
+# Runs two PSM passes (auto + sparse) at high zoom, deduplicates, returns cleaned text.
+def _ocr_page_region(page: fitz.Page, bbox: tuple, zoom: float = 4.0) -> str:
+    try:
+        from PIL import ImageEnhance, ImageFilter
+        clip = fitz.Rect(bbox)
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat, clip=clip, colorspace=fitz.csGRAY)
+        img = Image.open(BytesIO(pix.tobytes("png")))
+        # Enhance contrast + sharpen to help OCR on faint/compressed text
+        img = ImageEnhance.Contrast(img).enhance(1.8)
+        img = img.filter(ImageFilter.SHARPEN)
+
+        seen: set[str] = set()
+        collected: list[str] = []
+        # PSM 3 = full auto (good for structured diagrams)
+        # PSM 11 = sparse text (good for scattered labels)
+        for psm in (3, 11):
+            raw = pytesseract.image_to_string(img, lang="vie+eng", config=f"--oem 1 --psm {psm}")
+            for line in _clean_ocr_text(raw).splitlines():
+                key = re.sub(r'\s+', ' ', line.strip().lower())
+                if key and key not in seen:
+                    seen.add(key)
+                    collected.append(line.strip())
+        # Join short uniform labels with → (flowchart heuristic) to signal sequential flow to LLM
+        return _maybe_join_as_flow(collected)
+    except Exception as e:
+        logger.debug("_ocr_page_region failed: %s", e)
+        return ""
+
+
+# Extract text from one PDF page: tables → Markdown, other text preserves bold/italic; no duplication of table regions.
+# Image/drawing blocks (type==1) are OCR-ed so flowcharts and diagrams are captured.
 def _extract_pdf_page(page: fitz.Page) -> str:
-    """
-    Extract text from one PDF page.
-    - Detected tables → Markdown table syntax.
-    - Other text → Markdown bold/italic based on font flags from get_text("dict").
-    Content inside table bounding boxes is not duplicated.
-    """
     try:
         tab_finder = page.find_tables()
         tables = tab_finder.tables if tab_finder else []
@@ -181,9 +234,23 @@ def _extract_pdf_page(page: fitz.Page) -> str:
     items: list[tuple[float, str]] = []
 
     for block in page_dict.get("blocks", []):
-        if block.get("type") != 0:      # skip image/drawing blocks
-            continue
+        btype = block.get("type", 0)
         bx0, by0, bx1, by1 = block["bbox"]
+
+        if btype == 1:
+            # Image/drawing block — OCR it to capture flowchart / diagram text.
+            # Skip if the region is tiny (icons, bullets).
+            width, height = bx1 - bx0, by1 - by0
+            if width < 15 or height < 10:
+                continue
+            if table_rects and any(_rects_overlap((bx0, by0, bx1, by1), tr) for tr in table_rects):
+                continue
+            ocr_text = _ocr_page_region(page, (bx0, by0, bx1, by1))
+            if ocr_text:
+                items.append((by0, ocr_text))
+            continue
+
+        # type == 0: regular text block
         if table_rects and any(_rects_overlap((bx0, by0, bx1, by1), tr) for tr in table_rects):
             continue                    # covered by table markdown below
         block_text = _block_to_formatted_text(block)
@@ -205,11 +272,21 @@ def _extract_pdf_page(page: fitz.Page) -> str:
 # DOCX helpers
 # ---------------------------------------------------------------------------
 
+# Extract text from a w:drawing element (SmartArt, shapes, text boxes) by collecting
+# all a:t (DrawingML text run) nodes recursively. Returns empty string if nothing found.
+def _drawing_to_text(drawing_elem) -> str:
+    # DrawingML text nodes live under the "a" namespace
+    _A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    texts: list[str] = []
+    for node in drawing_elem.iter(f"{{{_A_NS}}}t"):
+        t = (node.text or "").strip()
+        if t:
+            texts.append(t)
+    return " → ".join(texts) if texts else ""
+
+
+# Parse a DOCX file to text preserving paragraphs, tables (as Markdown), and drawings/SmartArt in document order.
 def _docx_to_text(raw_bytes: bytes) -> str:
-    """
-    Parse a DOCX file preserving both paragraph text and table content
-    (as Markdown tables) in document order.
-    """
     doc = DocxDocument(BytesIO(raw_bytes))
 
     parts: list[str] = []
@@ -229,6 +306,11 @@ def _docx_to_text(raw_bytes: bytes) -> str:
             text = "".join(run_parts).strip()
             if text:
                 parts.append(text)
+            # Also capture any drawings embedded inside this paragraph
+            for drawing in child.iter(docx_qn("w:drawing")):
+                d_text = _drawing_to_text(drawing)
+                if d_text:
+                    parts.append(d_text)
 
         elif tag == docx_qn("w:tbl"):
             # Table: convert directly from XML to avoid nested-para confusion
@@ -255,6 +337,12 @@ def _docx_to_text(raw_bytes: bytes) -> str:
                     lines.append("| " + " | ".join(padded) + " |")
                 parts.append("\n".join(lines))
 
+        elif tag == docx_qn("w:drawing"):
+            # Top-level drawing (rare but possible)
+            d_text = _drawing_to_text(child)
+            if d_text:
+                parts.append(d_text)
+
     return "\n\n".join(parts)
 
 
@@ -262,6 +350,7 @@ def _docx_to_text(raw_bytes: bytes) -> str:
 # Public API
 # ---------------------------------------------------------------------------
 
+# Dispatch raw file bytes to the appropriate parser and return a normalised ParsedDocument.
 def parse_file_bytes(raw_bytes: bytes, filename: str, mime_type: str) -> ParsedDocument:
     ext = Path(filename).suffix.lower()
     pages: list[tuple[int, str]] = []
@@ -298,10 +387,8 @@ def parse_file_bytes(raw_bytes: bytes, filename: str, mime_type: str) -> ParsedD
     return ParsedDocument(pages=pages, full_text=full_text)
 
 
+# Strip repeated header/footer lines that appear on at least 'threshold' pages.
 def _strip_headers_footers(pages: list[tuple[int, str]], threshold: int = 3) -> list[tuple[int, str]]:
-    """Detect và strip các dòng lặp lại ở đầu/cuối nhiều trang (header/footer).
-    threshold: xuất hiện ở ít nhất N trang thì coi là header/footer.
-    """
     if len(pages) < 2:
         return pages
 

@@ -1,24 +1,6 @@
 """
-retrieval_service.py  –  v2
-=============================
-Strategy: Hybrid retrieval with Reciprocal Rank Fusion (RRF)
-
-Pipeline:
-  1. Parallel semantic search  (Chroma ANN via embedding)
-  2. Parallel BM25-style lexical search  (Chroma full-text with where_document)
-  3. RRF fusion  → single ranked list
-  4. Optional score-threshold filter
-  5. FGA permission gate  (chunk-level, not just document-level)
-
-Why RRF instead of weighted sum:
-  - Score scales of semantic (cosine distance) and BM25 are incomparable.
-    Normalising each independently before weighted sum is fragile.
-  - RRF only needs rank positions → robust, parameter-free.
-  - k=60 is the standard constant proven to work well empirically.
-
-Cosine distance → similarity:
-  Chroma returns  distance = 1 − cosine_sim  (for cosine space).
-  So  similarity = 1 − distance  (NOT  1/(1+d) which is for L2).
+Retrieval service: hybrid RAG retrieval using Reciprocal Rank Fusion (RRF) over semantic and BM25 results,
+with FGA permission gating and chunk-level sensitivity filtering.
 """
 from __future__ import annotations
 from rank_bm25 import BM25Okapi
@@ -56,18 +38,8 @@ _DISPLAY_ALPHA_SEMANTIC = 0.6
 _BM25_SATURATION_SCALE = 5.0
 
 
+# Convert a raw BM25 score to an absolute [0,1] relevance score via sigmoid saturation (batch-independent).
 def _bm25_raw_to_absolute_score(raw_score: float) -> float:
-    """
-    Convert a raw BM25 score into an absolute [0, 1] relevance score that
-    does NOT depend on the other candidates in the current query's batch.
-
-    BM25 raw scores have no fixed upper bound, so instead of normalising
-    by the max score within the current result set (which always forces
-    the top result to 1.0 regardless of how good the actual match is),
-    we saturate the raw score with a sigmoid. A higher raw score still
-    maps to a higher fraction, but the ceiling is fixed and the result is
-    comparable across different queries/result sets.
-    """
     try:
         r = float(raw_score)
     except (TypeError, ValueError):
@@ -93,8 +65,8 @@ class RetrievalService:
     # Similarity conversion  (cosine space only)
     # ------------------------------------------------------------------
 
+    # Convert a Chroma cosine distance to similarity in [0, 1].
     def _cosine_sim(self, distance: Any) -> float:
-        """Chroma cosine distance → similarity in [0, 1]."""
         try:
             d = float(distance)
             if not math.isfinite(d):
@@ -108,6 +80,7 @@ class RetrievalService:
     # BM25 lexical search 
     # ------------------------------------------------------------------
 
+    # BM25 lexical search over the full Chroma corpus; returns top-k scored chunk dicts.
     def _bm25_search(
             self,
             *,
@@ -174,20 +147,16 @@ class RetrievalService:
     # RRF fusion
     # ------------------------------------------------------------------
 
+    # Return the RRF score for a 0-based rank position.
     def _rrf_score(self, rank: int) -> float:
-        """Reciprocal Rank Fusion score for a given 0-based rank."""
         return 1.0 / (_RRF_K + rank + 1)
 
+    # Merge semantic and lexical result lists via RRF; returns list sorted by rrf_score descending.
     def _fuse(
         self,
         semantic_results: list[dict],
         lexical_results: list[dict],
     ) -> list[dict]:
-        """
-        Merge two ranked lists using RRF.
-        Each input item must have keys: chunk_id, document_text, metadata, distance.
-        Returns merged list sorted by rrf_score descending.
-        """
         scores: dict[str, float]  = {}
         registry: dict[str, dict] = {}
 
@@ -241,6 +210,7 @@ class RetrievalService:
     # Parse Chroma raw result → list[dict]
     # ------------------------------------------------------------------
 
+    # Unpack a raw Chroma query result into a flat list of chunk dicts.
     def _parse_chroma(self, raw: dict) -> list[dict]:
         ids       = (raw.get("ids")       or [[]])[0]
         docs      = (raw.get("documents") or [[]])[0]
@@ -261,6 +231,7 @@ class RetrievalService:
     # Build where clause for Chroma
     # ------------------------------------------------------------------
 
+    # Build a Chroma where-clause restricting results to allowed document IDs.
     def _build_where(
         self,
         allowed_doc_ids: list[str] | None,
@@ -270,18 +241,18 @@ class RetrievalService:
             return {"document_id": {"$in": allowed_doc_ids}}
         return None
     
+    # Post-filter results to keep only chunks whose document belongs to at least one requested OUI.
     def _post_filter_oui(
         self,
         results: list[dict],
         oui_ids: list[str] | None,
     ) -> list[dict]:
-        """Filter sau khi retrieve: giữ chunk nếu document thuộc ít nhất 1 oui_id yêu cầu."""
         if not oui_ids:
             return results
         oui_set = set(oui_ids)
         filtered = []
         for chunk in results:
-            # oui_id metadata là "abc,def,ghi"
+            # oui_id metadata is a comma-separated string, e.g. "abc,def,ghi".
             chunk_ouis = set(
                 (chunk.get("metadata", {}).get("oui_id") or "").split(",")
             )
@@ -290,8 +261,8 @@ class RetrievalService:
                 filtered.append(chunk)
         return filtered
     
+    # Return chunk sensitivity as int 1-5; falls back to regex pattern scan if metadata is absent.
     def _classify_chunk_sensitivity(self, chunk: dict) -> int:
-        """Trả về sensitivity int 1-5."""
         meta = chunk.get("metadata", {}).get("sensitivity")
         if meta is not None:
             try:
@@ -301,9 +272,9 @@ class RetrievalService:
             except (ValueError, TypeError):
                 pass
 
-        # Fallback: regex scan nội dung
+        # Fallback: regex scan on chunk text.
         text = chunk.get("document_text", "")
-        for level in [5, 4, 3, 2]:  # scan từ cao xuống thấp
+        for level in [5, 4, 3, 2]:  # scan from high to low
             for pattern in SENSITIVITY_PATTERNS.get(level, []):
                 if re.search(pattern, text, re.IGNORECASE):
                     return level
@@ -311,14 +282,14 @@ class RetrievalService:
         return 1  # default PUBLIC
 
 
-    # Trong _apply_sensitivity_gate, thay toàn bộ hàm:
+    # Legacy sensitivity gate (superseded by _retrieve_main FGA logic; kept for compatibility).
     def _apply_sensitivity_gate(self, chunks: list[dict], user) -> list[dict]:
         if user is None:
             return [c for c in chunks
                     if self._classify_chunk_sensitivity(c) == SensitivityLevel.PUBLIC]
 
         max_clearance = getattr(user, "max_clearance", 1)
-        # clearance 1-5 map sang SensitivityLevel 1-5 trực tiếp
+        # clearance 1-5 maps directly to SensitivityLevel 1-5.
         max_level = SensitivityLevel(max_clearance)
         allowed: list[dict] = []
 
@@ -336,11 +307,8 @@ class RetrievalService:
         return allowed
 
 
+    # Redact salary, phone, email, and ID numbers from a chunk for director-level access.
     def _redact_for_director(self, chunk: dict) -> dict:
-        """
-        Director được xem CONFIDENTIAL nhưng một số field
-        trong RESTRICTED patterns vẫn bị redact.
-        """
         REDACT_PATTERNS = [
             (r"\b\d{1,3}(?:[.,]\d{3})+\s*(?:VND|đồng)\b", "[SỐ TIỀN ĐÃ ẨN]"),
             (r"\b(?:\+84|0)(?:3[2-9]|5[6-9]|7[0-9]|8[0-9]|9[0-9])[\s\-]?\d{3}[\s\-]?\d{3}\b",
@@ -360,23 +328,12 @@ class RetrievalService:
     # Absolute (batch-independent) display score
     # ------------------------------------------------------------------
 
+    # Combine semantic similarity and BM25 score into an absolute [0,1] display score (batch-independent).
     def _compute_display_score(
         self,
         sem: float | None,
         lexical_raw_score: float | None,
     ) -> tuple[float, float | None]:
-        """
-        Combine semantic similarity and keyword relevance into a single
-        absolute [0, 1] score for UI display, WITHOUT depending on the
-        other results in the current batch.
-
-        - sem: cosine similarity, already absolute (0..1).
-        - lexical_raw_score: raw BM25 score (unbounded, batch-independent
-          input), converted here via a fixed saturation function instead
-          of dividing by the batch max.
-
-        Returns (display_score, keyword_absolute_score).
-        """
         sem_val = sem if sem is not None else 0.0
         kw_abs = (
             _bm25_raw_to_absolute_score(lexical_raw_score)
@@ -405,6 +362,7 @@ class RetrievalService:
     # Main retrieve
     # ------------------------------------------------------------------
 
+    # Route the query to the appropriate retrieval method based on chat_mode.
     def retrieve(
         self,
         *,
@@ -423,7 +381,7 @@ class RetrievalService:
         if not embedding_service.is_configured():
             raise RuntimeError("Embedding service is not configured")
 
-        # Lấy user_id sớm để tránh DetachedInstanceError
+        # Resolve user_id early to avoid DetachedInstanceError.
         user_id = str(user.id) if user else None
 
         if chat_mode == "gmail":
@@ -450,6 +408,7 @@ class RetrievalService:
             )
             
             
+    # Retrieve from an arbitrary Chroma collection (e.g. gmail_chunks) filtered only by extra_where.
     def _retrieve_from_collection(
         self,
         *,
@@ -462,11 +421,6 @@ class RetrievalService:
         semantic_candidates: int | None = None,
         lexical_candidates: int | None = None,
     ) -> list[dict]:
-        """
-        Retrieve từ 1 collection Chroma tuỳ ý (vd gmail_chunks).
-        Không qua FGA document permission — chỉ filter theo extra_where
-        (vd user_id) để đảm bảo user chỉ thấy dữ liệu của chính họ.
-        """
         where = extra_where
         sem_k = semantic_candidates or self.semantic_candidates
         lex_k = lexical_candidates or self.lexical_candidates
@@ -525,6 +479,7 @@ class RetrievalService:
         return results[:top_k]
     
 
+    # Retrieve from the main document_chunks collection with FGA gating and clearance-based blurring.
     def _retrieve_main(
         self,
         *,
@@ -535,16 +490,6 @@ class RetrievalService:
         oui_ids: list[str] | None = None,
         db=None,
     ) -> list[dict]:
-        """Retrieve từ collection chính (document_chunks).
-
-        Access logic (ưu tiên từ trên xuống):
-          FGA allow + approved request              → include, full source
-          FGA allow + chunk_sensitivity ≤ clearance → include, full source
-          FGA allow + chunk_sensitivity > clearance  → exclude
-          FGA deny  + chunk_sensitivity ≤ clearance
-                    + in query scope                 → include, doc_restricted=True
-          FGA deny  + chunk_sensitivity > clearance  → exclude
-        """
         if user is None:
             return []
 
@@ -569,8 +514,8 @@ class RetrievalService:
             scope_mode = system_setting_repository.get(db, "query_scope_mode") or "full_db"
 
         # ── Chroma query scope ──────────────────────────────────────────
-        # full_db  → query toàn bộ Chroma (không filter doc_id)
-        # branch_only → chỉ query doc thuộc nhánh OUI của user
+        # full_db: query all Chroma (no doc_id filter).
+        # branch_only: query only docs in the user's OUI branch.
         if scope_mode == "branch_only" and db is not None:
             from app.services.oui_tree_service import oui_tree_service
             branch_oui_ids = oui_tree_service.get_user_branch_oui_ids(db, user)
@@ -580,7 +525,7 @@ class RetrievalService:
             if not query_doc_ids:
                 return []
         else:
-            # full_db: không filter → Chroma trả tất cả
+            # full_db: no filter — Chroma returns all.
             where = None if not oui_ids else self._build_where(None, oui_ids)
 
         semantic_list: list[dict] = []
@@ -673,9 +618,8 @@ class RetrievalService:
         # top-ranked chunk no longer automatically gets score = 1.0 just
         # because it happened to rank first within THIS query's batch.
         results = []
-        # Docs FGA-allowed nhưng có chunk vượt clearance mà chưa được approve.
-        # Pass 2 sẽ set doc_restricted=True cho tất cả chunk của các doc này
-        # để frontend ẩn Eye/Plus (không được mở full file).
+        # FGA-allowed docs with chunks that exceed clearance and have no approval yet.
+        # Pass 2 sets doc_restricted=True on all chunks of these docs so the frontend hides Eye/Plus.
         fga_has_blocked: set[str] = set()
 
         for item in fused:
@@ -693,8 +637,8 @@ class RetrievalService:
             has_approval = doc_id in approved_doc_ids
 
             if fga_allow:
-                # Case 3.1/3.2: FGA allow → trả TẤT CẢ chunks.
-                # chunk_blurred=True nếu chunk_sens > clearance và chưa approve (case 3.2a).
+                # FGA allow → return ALL chunks; blur those exceeding clearance without approval.
+                # chunk_blurred=True if chunk_sens > clearance and not yet approved.
                 is_blurred = chunk_sens > user_clearance and not has_approval
                 if is_blurred:
                     fga_has_blocked.add(doc_id)
@@ -710,7 +654,7 @@ class RetrievalService:
                     "chunk_blurred":  is_blurred,
                 })
             else:
-                # FGA deny — chỉ hiện nếu chunk_sensitivity ≤ clearance (case 3.3)
+                # FGA deny — include only if chunk_sensitivity ≤ clearance.
                 if chunk_sens <= user_clearance:
                     results.append({
                         "chunk_id":       item["chunk_id"],
@@ -720,11 +664,11 @@ class RetrievalService:
                         "semantic_score": round(sem, 6) if sem is not None else None,
                         "keyword_score":  round(kw_abs, 6) if kw_abs is not None else None,
                         "sources":        item.get("sources", []),
-                        "doc_restricted": True,   # frontend ẩn Eye/Plus
+                        "doc_restricted": True,   # frontend hides Eye/Plus
                         "chunk_blurred":  False,
                     })
 
-        # Pass 2: docs FGA-allow có chunk bị chặn → ẩn Eye/Plus trên tất cả chunk của doc đó
+        # Pass 2: FGA-allowed docs with blocked chunks → set doc_restricted=True on all their chunks.
         if fga_has_blocked:
             for r in results:
                 if (r.get("metadata") or {}).get("document_id") in fga_has_blocked:
@@ -734,8 +678,8 @@ class RetrievalService:
         return results[:top_k]
 
 
+    # Return the highest clearance level across all of the user's OUI positions (1-5).
     def _get_user_clearance(self, user) -> int:
-        """Lấy clearance cao nhất từ tất cả positions của user. Trả về int 1-5."""
         if user is None:
             return 1
 
@@ -753,6 +697,7 @@ class RetrievalService:
         return max_clearance
 
 
+    # Filter chunks whose sensitivity exceeds the user's maximum clearance level.
     def _apply_sensitivity_gate(self, chunks: list[dict], user) -> list[dict]:
         user_clearance = self._get_user_clearance(user)
         allowed = []
@@ -772,6 +717,7 @@ class RetrievalService:
     
 
 
+# Module-level singleton; imported by the chat service.
 retrieval_service = RetrievalService(
     semantic_candidates=20,
     lexical_candidates=20,

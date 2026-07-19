@@ -15,16 +15,15 @@ except Exception:
     JobRead = None
 
 
-# ── Chunking config ───────────────────────────────────────────────────────────
-
+# Chunking config
 class ChunkingConfig(BaseModel):
     """
-    Tham số chunking được gửi khi upload version.
-    Mặc định dùng chunker nội bộ (legacy).
-    Khi mode = hierarchical/hybrid thì dùng Docling.
+    The chunking parameter is sent when uploading the version.
+    By default, an internal (legacy) chunker is used.
+    When mode = hierarchical/hybrid, Docling is used.
     """
     mode: Literal["legacy", "hierarchical", "hybrid", "llm_structured"] = "llm_structured"
-    max_tokens: int = Field(default=512, ge=64, le=4096)
+    max_tokens: int = Field(default=1500, ge=64, le=4096)
     overlap_tokens: int = Field(default=80, ge=0, le=512)
     ocr: bool = False
 
@@ -38,13 +37,12 @@ class ChunkingConfig(BaseModel):
         return cls(**data)
 
 
-# ── Document CRUD ─────────────────────────────────────────────────────────────
-
+# Document CRUD 
 class DocumentCreateRequest(BaseModel):
     title: str
     description: Optional[str] = None
-    oui_ids: list[str] = []           # multi OUI
-    sensitivity: int = 2              # 1-5
+    oui_ids: list[str] = []           # Multi OUI.
+    sensitivity: int = 2              # 1-5.
     document_type: str = "general"
     data_type: str = "text"
     tags: Optional[list[str]] = None
@@ -65,10 +63,11 @@ class DocumentRead(BaseModel):
     id: str
     title: str
     description: Optional[str] = None
-    oui_ids: list[str] = []        # ← computed từ doc.ouis
+    oui_ids: list[str] = []        # ← Computed from doc.ouis
     owner_user_id: str
+    owner_name: Optional[str] = None
     document_type: str
-    sensitivity: int               # 1-5
+    sensitivity: int               # 1-5.
     data_type: str
     tags: list[str] = []
     status: str
@@ -80,9 +79,16 @@ class DocumentRead(BaseModel):
     @classmethod
     def model_validate(cls, obj, **kwargs):
         data = super().model_validate(obj, **kwargs)
-        # Populate oui_ids từ relationship
         if hasattr(obj, "ouis"):
             data.oui_ids = [o.id for o in (obj.ouis or [])]
+        if hasattr(obj, "owner") and obj.owner:
+            data.owner_name = obj.owner.name
+        # Derive document_type from the uploaded file extension when not explicitly set.
+        if data.document_type == "general" and hasattr(obj, "current_version") and obj.current_version:
+            fname: str = obj.current_version.file_name or ""
+            dot = fname.rfind(".")
+            if dot != -1:
+                data.document_type = fname[dot + 1:].lower()
         return data
 
 

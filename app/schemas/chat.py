@@ -25,8 +25,8 @@ class MessageCreateRequest(BaseModel):
     content: str
     clientMessageId: Optional[str] = None
     oui_ids: Optional[list[str]] = None
-    mode: str = "rag"           
-    chat_source: str = "rag"    
+    mode: str = "rag"
+    chat_source: str = "rag"
     file_content: Optional[str] = None
     file_name: Optional[str] = None
 
@@ -76,7 +76,7 @@ class MessageRead(BaseModel):
     role: str
     content: Optional[str]
     created_at: datetime
-    # other fields optional and may be null
+    # Other fields optional and may be null
     messageId: Optional[str] = None
     conversationId: Optional[str] = None
     traceId: Optional[str] = None
@@ -91,6 +91,7 @@ class ConversationMessageRead(BaseModel):
     messageId: str
     content: Optional[str]
     createdAt: Optional[datetime]
+    attachedFileName: Optional[str] = None
     assistantMessage: Optional[AssistantMessage] = None
     traceId: Optional[str] = None
     sources: Optional[list[SourceRead]] = None

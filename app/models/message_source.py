@@ -1,4 +1,5 @@
-from sqlalchemy import Column, String, Float, Text
+from sqlalchemy import Column, Float, String, Text
+
 from app.db.base import Base, TimestampMixin
 from app.utils.ids import new_uuid
 
@@ -11,7 +12,7 @@ class MessageSource(Base, TimestampMixin):
     document_id = Column(String(255), nullable=True)
     document_title = Column(String(1000), nullable=True)
     version_id = Column(String(255), nullable=True)
-    section_path = Column(String(512), nullable=True) #TODO: add the section process
+    section_path = Column(String(512), nullable=True)
     relevance = Column(Float, nullable=True)
     excerpt = Column(Text, nullable=True)
     surrounding_context = Column(Text, nullable=True)

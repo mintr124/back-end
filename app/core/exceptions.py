@@ -1,9 +1,15 @@
+"""
+Global exception handlers. Attaches structured JSON error responses with trace IDs
+to all FastAPI validation errors and unhandled exceptions.
+"""
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 
+# Register application-wide exception handlers onto the FastAPI instance.
 def register_exception_handlers(app: FastAPI):
+    # Return a 422 with field-level validation details and the current trace ID.
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(request: Request, exc: RequestValidationError):
         return JSONResponse(
@@ -14,6 +20,7 @@ def register_exception_handlers(app: FastAPI):
             },
         )
 
+    # Return a 500 with a generic message and the current trace ID.
     @app.exception_handler(Exception)
     async def generic_exception_handler(request: Request, exc: Exception):
         return JSONResponse(

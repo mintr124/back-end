@@ -1,3 +1,6 @@
+"""
+FastAPI application entry point: middleware, CORS, startup hooks, router registration, and auth dependency.
+"""
 import time
 import uuid
 
@@ -20,6 +23,7 @@ from app.api.v1.policy import router as policy_router
 from app.api.v1.settings import router as settings_router
 from app.api.v1.document_access_requests import router as access_requests_router
 from app.core.exceptions import register_exception_handlers
+from app.core.logging import configure_logging
 from app.db.init_db import init_db
 from app.db.session import SessionLocal, engine, get_db
 from app.models.user import User
@@ -31,15 +35,17 @@ from app.services.document_service import document_service
 from app.services.job_service import job_service
 from app.services.storage_service import storage_service
 from app.workers.ingest_tasks import process_ingest_job
-from app.core.logging import configure_logging
+
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 configure_logging()
 
+# Module-level FastAPI application instance; imported by uvicorn as the ASGI entrypoint.
 app = FastAPI(title="rag-role-enterprise-api", version="1.0.0")
 
 
+# Attach a trace ID to every request and echo it in the response headers.
 @app.middleware("http")
 async def trace_middleware(request: Request, call_next):
     request.state.trace_id = request.headers.get("X-Trace-Id", uuid.uuid4().hex)
@@ -61,10 +67,12 @@ app.add_middleware(
 
 register_exception_handlers(app)
 
+# Extract the trace ID from request state, generating a fallback UUID if absent.
 def get_trace_id(request: Request) -> str:
     return getattr(request.state, "trace_id", uuid.uuid4().hex)
 
 
+# Poll MySQL up to 30 times (2 s apart) until it accepts connections, then raise on timeout.
 def wait_for_database():
     for _ in range(30):
         try:
@@ -76,6 +84,7 @@ def wait_for_database():
     raise RuntimeError("MySQL is not ready")
 
 
+# Wait for DB readiness, run migrations, seed defaults, and ensure MinIO buckets exist.
 @app.on_event("startup")
 def startup_event():
     wait_for_database()
@@ -90,6 +99,7 @@ def startup_event():
             time.sleep(2)
 
 
+# FastAPI dependency: decode the Bearer token and return the active User, raising 401 otherwise.
 def get_current_user(db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)) -> User:
     payload = auth_service.decode_access_token(token)
     user = db.get(User, payload["sub"])

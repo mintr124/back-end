@@ -1,20 +1,17 @@
-from __future__ import annotations
-
+"""
+System settings endpoints. Read and update key-value configuration entries
+such as RAG parameters and query scope mode.
+"""
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
-from app.db.session import get_db
-from app.models.user import User
+from app.core.deps import get_db
 from app.repositories.system_setting_repository import system_setting_repository
 
 router = APIRouter()
 
 
-def _get_current_user_dep():
-    from app.main import get_current_user
-    return Depends(get_current_user)
-
-
+# Return all system settings as a flat key-value map.
 @router.get("")
 def get_settings(
     db: Session = Depends(get_db),
@@ -22,11 +19,13 @@ def get_settings(
     return system_setting_repository.get_all(db)
 
 
+# Update one or more system settings. Only whitelisted keys are accepted.
 @router.put("")
 def update_settings(
     payload: dict,
     db: Session = Depends(get_db),
 ):
+    # Whitelist of mutable keys to prevent unintended config overrides.
     allowed_keys = {
         "rag.top_k",
         "rag.similarity_threshold",

@@ -18,13 +18,13 @@ class EntityTypeRead(BaseModel):
     is_system_suggested: bool
     is_active: bool
     created_at: datetime
-    boolean_labels: list[str] = []   # computed from ENTITY_FLAG_MAP, not stored in DB
+    boolean_labels: list[str] = []   # Computed from ENTITY_FLAG_MAP, not stored in DB.
 
 
 class EntityTypeCreate(BaseModel):
     entity_type: str = Field(..., min_length=1, max_length=128)
     label_vi: Optional[str] = Field(None, max_length=255)
-    boolean_labels: list[str] = []   # populated when returned from suggestion/list endpoints
+    boolean_labels: list[str] = []   # Populated when returned from suggestion/list endpoints.
 
 
 class EntityTypeBulkCreate(BaseModel):
@@ -34,22 +34,21 @@ class EntityTypeBulkCreate(BaseModel):
 # ── Rules ─────────────────────────────────────────────────────────────────────
 
 class RuleConditions(BaseModel):
-    min_sensitivity: Optional[str] = None           # Public|Internal|Confidential|Restricted|TopSecret
-    applicable_roles: list[str] = []                # Miễn trừ: role này → rule không áp dụng
-    blocked_roles: list[str] = []                   # Ép buộc: role này → rule tự động áp dụng
-    cross_dept_only: bool = False                   # Kích hoạt khi tài liệu ở cấp tổ chức cao hơn user
-    applicable_intents: list[str] = []              # Bỏ trống = tất cả intents
+    min_sensitivity: Optional[str] = None           # Public|Internal|Confidential|Restricted|TopSecret.
+    applicable_roles: list[str] = []                # Exemption: This role → rule does not apply.
+    blocked_roles: list[str] = []                   # Coercion: This role → Rule automatically applied.
+    cross_dept_only: bool = False                   # Activated when the document is at a higher organizational level than the user.
+    applicable_intents: list[str] = []              # Leave blank = all intents.
     min_user_level: Optional[int] = None
 
 
 class RuleContract(BaseModel):
-    # Hành động vi phạm (top-level)
-    violation_action: str = "conditional"    # block | watermark | allow | conditional
+    # Top-level violation.
+    violation_action: str = "conditional"    # Block | Watermark | Allow | Conditional.
 
-    # Chỉ dùng khi violation_action = "conditional"
-    max_detail: str = "generalize"           # redact | anonymize | generalize | summarize
-    numeric_granularity: str = "aggregated"  # hidden | aggregated | range_only | exact
-    allowed_entities: list[str] = []         # entity types được phép hiển thị nguyên bản
+    # Use only when violation_action = "conditional".
+    max_detail: str = "generalize"           # Redact | Anonymize | Generalize | Summarize.
+    numeric_granularity: str = "aggregated"  # Hidden | Aggregated | Range_only | Exact.
 
 
 def derive_action(violation_action: str, max_detail: str = "") -> str:
@@ -69,8 +68,8 @@ def derive_action(violation_action: str, max_detail: str = "") -> str:
             return "ANONYMIZE"
         if d == "summarize":
             return "SUMMARIZE"
-        return "GENERALIZE"   # default conditional = generalize
-    # backward-compat: old violation_action values
+        return "GENERALIZE"   # Default conditional = generalize.
+    # Backward-compat: old violation_action values.
     _legacy = {"mask": "REDACT", "generalize": "GENERALIZE"}
     return _legacy.get(v, "ALLOW")
 
@@ -102,7 +101,7 @@ class DomainRuleRead(BaseModel):
     domain_id: Optional[str]
     rule_code: str
     name: str
-    action: str           # derived từ violation_action, dùng nội bộ
+    action: str           # Derived from violation_action, used internally.
     priority: int
     mandatory: bool
     is_active: bool
@@ -184,7 +183,6 @@ class PolicyContractRead(BaseModel):
     decision: Literal["ALLOW", "DENY", "REDACT", "ANONYMIZE", "GENERALIZE", "SUMMARIZE", "ALLOW_WITH_WATERMARK"]
     max_detail: str
     numeric_granularity: str
-    allowed_entities: list[str]
     violation_action: str
 
     applied_rules: list[dict]

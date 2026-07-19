@@ -1,6 +1,7 @@
+"""
+Repository for policy domains, entity types, and domain rules persistence and retrieval.
+"""
 from __future__ import annotations
-
-from typing import Optional
 
 from sqlalchemy.orm import Session
 
@@ -12,20 +13,24 @@ class PolicyRepository:
 
     # ── Domains ───────────────────────────────────────────────────────────────
 
+    # Return all policy domains, optionally filtered to active ones only.
     def list_domains(self, db: Session, *, active_only: bool = False) -> list[PolicyDomain]:
         q = db.query(PolicyDomain)
         if active_only:
             q = q.filter(PolicyDomain.is_active.is_(True))
         return q.order_by(PolicyDomain.code).all()
 
-    def get_domain(self, db: Session, domain_id: str) -> Optional[PolicyDomain]:
+    # Return a policy domain by ID.
+    def get_domain(self, db: Session, domain_id: str) -> PolicyDomain | None:
         return db.get(PolicyDomain, domain_id)
 
-    def get_domain_by_code(self, db: Session, code: str) -> Optional[PolicyDomain]:
+    # Return a policy domain by its unique code.
+    def get_domain_by_code(self, db: Session, code: str) -> PolicyDomain | None:
         return db.query(PolicyDomain).filter(PolicyDomain.code == code).first()
 
+    # Create and persist a new policy domain.
     def create_domain(self, db: Session, *, code: str, name: str,
-                      description: Optional[str], base_sensitivity: int) -> PolicyDomain:
+                      description: str | None, base_sensitivity: int) -> PolicyDomain:
         domain = PolicyDomain(
             id=new_uuid(),
             code=code,
@@ -37,6 +42,7 @@ class PolicyRepository:
         db.flush()
         return domain
 
+    # Update non-None fields on an existing policy domain.
     def update_domain(self, db: Session, domain: PolicyDomain, **kwargs) -> PolicyDomain:
         for k, v in kwargs.items():
             if v is not None:
@@ -44,12 +50,14 @@ class PolicyRepository:
         db.flush()
         return domain
 
+    # Delete a policy domain.
     def delete_domain(self, db: Session, domain: PolicyDomain) -> None:
         db.delete(domain)
         db.flush()
 
     # ── Entity Types ──────────────────────────────────────────────────────────
 
+    # Return all entity types for a domain ordered by entity_type name.
     def list_entity_types(self, db: Session, domain_id: str) -> list[DomainEntityType]:
         return (
             db.query(DomainEntityType)
@@ -58,8 +66,8 @@ class PolicyRepository:
             .all()
         )
 
+    # Return all active entity types across all active domains (used by the entity extractor).
     def get_all_active_entity_types(self, db: Session) -> list[DomainEntityType]:
-        """Used by entity extractor to load all labels across all active domains."""
         return (
             db.query(DomainEntityType)
             .join(PolicyDomain, DomainEntityType.domain_id == PolicyDomain.id)
@@ -70,14 +78,31 @@ class PolicyRepository:
             .all()
         )
 
+    # Return {domain_code: {entity_type strings}} for entity overlap scoring in domain classification.
+    def get_entity_types_grouped_by_domain(self, db: Session) -> dict[str, set[str]]:
+        rows = (
+            db.query(PolicyDomain.code, DomainEntityType.entity_type)
+            .join(DomainEntityType, DomainEntityType.domain_id == PolicyDomain.id)
+            .filter(
+                DomainEntityType.is_active.is_(True),
+                PolicyDomain.is_active.is_(True),
+            )
+            .all()
+        )
+        result: dict[str, set[str]] = {}
+        for code, entity_type in rows:
+            result.setdefault(code, set()).add(entity_type)
+        return result
+
+    # Create and persist a new entity type within a domain.
     def create_entity_type(
         self,
         db: Session,
         *,
         domain_id: str,
         entity_type: str,
-        label_vi: Optional[str] = None,
-        boolean_labels: Optional[list] = None,
+        label_vi: str | None = None,
+        boolean_labels: list | None = None,
         is_system_suggested: bool = False,
     ) -> DomainEntityType:
         obj = DomainEntityType(
@@ -92,16 +117,19 @@ class PolicyRepository:
         db.flush()
         return obj
 
+    # Delete an entity type.
     def delete_entity_type(self, db: Session, entity_type: DomainEntityType) -> None:
         db.delete(entity_type)
         db.flush()
 
-    def get_entity_type(self, db: Session, entity_type_id: str) -> Optional[DomainEntityType]:
+    # Return an entity type by ID.
+    def get_entity_type(self, db: Session, entity_type_id: str) -> DomainEntityType | None:
         return db.get(DomainEntityType, entity_type_id)
 
+    # Return an entity type by domain ID and type name.
     def get_entity_type_by_name(
         self, db: Session, domain_id: str, entity_type: str
-    ) -> Optional[DomainEntityType]:
+    ) -> DomainEntityType | None:
         return (
             db.query(DomainEntityType)
             .filter(
@@ -113,7 +141,8 @@ class PolicyRepository:
 
     # ── Rules ─────────────────────────────────────────────────────────────────
 
-    def list_rules(self, db: Session, domain_id: Optional[str], *,
+    # Return rules for a domain (or global rules when domain_id=None), sorted by priority descending.
+    def list_rules(self, db: Session, domain_id: str | None, *,
                    active_only: bool = False) -> list[DomainRule]:
         if domain_id is None:
             q = db.query(DomainRule).filter(DomainRule.domain_id.is_(None))
@@ -123,8 +152,8 @@ class PolicyRepository:
             q = q.filter(DomainRule.is_active.is_(True))
         return q.order_by(DomainRule.priority.desc()).all()
 
+    # Load active rules for the given domain codes plus global rules (domain_id=None).
     def get_rules_for_domains(self, db: Session, domain_codes: list[str]) -> list[DomainRule]:
-        """Load rules for given domain codes + global rules (domain_id=None)."""
         domain_ids = (
             db.query(PolicyDomain.id)
             .filter(PolicyDomain.code.in_(domain_codes), PolicyDomain.is_active.is_(True))
@@ -141,17 +170,20 @@ class PolicyRepository:
             .all()
         )
 
-    def get_rule(self, db: Session, rule_id: str) -> Optional[DomainRule]:
+    # Return a rule by ID.
+    def get_rule(self, db: Session, rule_id: str) -> DomainRule | None:
         return db.get(DomainRule, rule_id)
 
-    def get_rule_by_code(self, db: Session, rule_code: str) -> Optional[DomainRule]:
+    # Return a rule by its unique code.
+    def get_rule_by_code(self, db: Session, rule_code: str) -> DomainRule | None:
         return db.query(DomainRule).filter(DomainRule.rule_code == rule_code).first()
 
+    # Create and persist a new domain rule.
     def create_rule(
         self,
         db: Session,
         *,
-        domain_id: Optional[str],
+        domain_id: str | None,
         rule_code: str,
         name: str,
         action: str,
@@ -179,6 +211,7 @@ class PolicyRepository:
         db.flush()
         return rule
 
+    # Update non-None fields on an existing rule.
     def update_rule(self, db: Session, rule: DomainRule, **kwargs) -> DomainRule:
         for k, v in kwargs.items():
             if v is not None:
@@ -186,9 +219,11 @@ class PolicyRepository:
         db.flush()
         return rule
 
+    # Delete a rule.
     def delete_rule(self, db: Session, rule: DomainRule) -> None:
         db.delete(rule)
         db.flush()
 
 
+# Module-level singleton; imported by the policy API router and policy agent.
 policy_repository = PolicyRepository()

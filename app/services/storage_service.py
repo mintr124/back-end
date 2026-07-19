@@ -1,3 +1,6 @@
+"""
+Service facade for MinIO object storage: upload raw files and processed text, download bytes.
+"""
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -9,12 +12,15 @@ class StorageService:
     def __init__(self):
         self.repo = StorageRepository()
 
+    # Create the raw and processed MinIO buckets if they do not exist.
     def ensure_buckets(self):
         self.repo.ensure_buckets()
 
+    # Return the SHA-256 hex digest of a byte payload.
     def checksum(self, data: bytes) -> str:
         return self.repo.checksum(data)
 
+    # Upload raw file bytes to the raw bucket and persist a StorageObject record.
     def upload_raw(
         self,
         db: Session,
@@ -34,6 +40,7 @@ class StorageService:
             object_kind="raw_source",
         )
 
+    # Upload UTF-8-encoded text to the processed bucket and persist a StorageObject record.
     def upload_processed_text(
         self,
         db: Session,
@@ -52,8 +59,10 @@ class StorageService:
             object_kind="normalized_text",
         )
 
+    # Download and return the raw bytes for an object.
     def download(self, bucket: str, object_key: str) -> bytes:
         return self.repo.get_bytes(bucket, object_key)
 
 
+# Module-level singleton; imported by the ingest pipeline and document service.
 storage_service = StorageService()

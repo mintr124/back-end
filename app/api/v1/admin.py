@@ -1,47 +1,70 @@
+"""
+Admin-only endpoints for system operations: rule reload, FGA sync, reindex,
+job management (retry/cancel), and audit trace inspection.
+"""
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_user, get_db
-from app.models.user import User
-from app.models.trace import Trace
+from app.fga.adapter import fga_adapter
+from app.models.document import Document as DocumentModel
 from app.models.job import Job as JobModel
-from app.models.document import Document
-from sqlalchemy.orm import Session
+from app.models.trace import Trace
+from app.models.user import User
+from app.services.document_service import document_service
 from app.services.user_service import user_service as _user_service
+from app.workers.ingest_tasks import process_ingest_job
 
 router = APIRouter()
 
 
+# Raise 403 if the caller is not a corp-level member.
 def require_admin(user: User, db: Session):
     user_resp = _user_service.build_user_response(db, user)
     if not user_resp.is_corp_member:
         raise HTTPException(status_code=403, detail="Corp-level admin required")
 
 
+# Reload authorization rules (placeholder — returns ok immediately).
 @router.post("/rules/reload")
-def reload_rules(db: Session = Depends(get_db),  current_user: User = Depends(get_current_user)):
+def reload_rules(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     require_admin(current_user, db)
     return {"status": "ok", "message": "rules reloaded"}
 
 
+# Re-sync FGA tuples for all approved documents. Fixes stale access grants after org changes.
 @router.post("/fga/sync")
 def sync_fga(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     require_admin(current_user, db)
-    return {"status": "ok", "message": "fga sync completed"}
+    docs = db.query(DocumentModel).filter(DocumentModel.status == "approved").all()
+    synced = 0
+    errors = 0
+    for doc in docs:
+        try:
+            old = fga_adapter.get_document_tuples(doc.id)
+            fga_adapter.delete_document_tuples(doc.id, old)
+            document_service._sync_fga(db, doc)
+            synced += 1
+        except Exception:
+            errors += 1
+    return {"status": "ok", "synced": synced, "errors": errors}
 
 
+# Queue a full document reindex (placeholder — returns ok immediately).
 @router.post("/reindex")
 def reindex(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     require_admin(current_user, db)
     return {"status": "ok", "message": "reindex queued"}
 
 
+# Accept a manual metadata override request (placeholder — returns ok immediately).
 @router.post("/override-metadata")
 def override_metadata(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     require_admin(current_user, db)
     return {"status": "ok", "message": "override accepted"}
 
 
+# Return the 200 most recent request traces ordered by creation time.
 @router.get("/traces")
 def list_traces(
     db: Session = Depends(get_db),
@@ -51,7 +74,7 @@ def list_traces(
     traces = db.query(Trace).order_by(Trace.created_at.desc()).limit(200).all()
     result = []
     for t in traces:
-        # Lấy tên user nếu cần — hiện trả user_id, frontend tự map
+        # Returns user_id only; the frontend resolves display names.
         result.append({
             "id": t.id,
             "trace_id": t.trace_id,
@@ -68,6 +91,7 @@ def list_traces(
     return result
 
 
+# Return the 200 most recent ingest jobs ordered by creation time.
 @router.get("/jobs")
 def list_jobs(
     db: Session = Depends(get_db),
@@ -97,6 +121,7 @@ def list_jobs(
     return result
 
 
+# Reset a failed job to queued and re-dispatch it to the Celery worker.
 @router.post("/jobs/{job_id}/retry")
 def retry_job(
     job_id: str,
@@ -111,11 +136,11 @@ def retry_job(
     job.retry_count += 1
     job.error_message = None
     db.commit()
-    from app.workers.ingest_tasks import process_ingest_job
     process_ingest_job.delay(job.id)
     return {"status": "queued"}
 
 
+# Mark a queued or running job as failed with a cancellation message.
 @router.post("/jobs/{job_id}/cancel")
 def cancel_job(
     job_id: str,
