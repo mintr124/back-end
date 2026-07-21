@@ -138,11 +138,13 @@ services:
     image: caddy:2-alpine
     environment:
       API_DOMAIN: ${API_DOMAIN:?API_DOMAIN is required}
+      FRONTEND_DOMAIN: ${FRONTEND_DOMAIN:?FRONTEND_DOMAIN is required}
     ports:
       - "80:80"
       - "443:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${FRONTEND_DIST_PATH:-../frontend/dist}:/srv/frontend:ro
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
