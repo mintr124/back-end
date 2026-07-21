@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     env: str = "dev"
     cors_origins: str = (
         "http://localhost:5173,http://localhost:8083,"
+        "https://main.d37e45ukb2hsrw.amplifyapp.com,"
         "https://main.roles-aware-rag.amplifyapp.com"
     )
 
