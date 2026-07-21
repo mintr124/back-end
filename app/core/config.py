@@ -11,6 +11,10 @@ class Settings(BaseSettings):
 
     app_name: str = "rag-role-enterprise-api"
     env: str = "dev"
+    cors_origins: str = (
+        "http://localhost:5173,http://localhost:8083,"
+        "https://main.roles-aware-rag.amplifyapp.com"
+    )
 
     database_url: str = "mysql+pymysql://rag:rag@mysql:3306/ragdb?charset=utf8mb4"
     redis_url: str = "redis://redis:6379/0"

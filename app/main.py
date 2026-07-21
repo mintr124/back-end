@@ -23,6 +23,7 @@ from app.api.v1.policy import router as policy_router
 from app.api.v1.settings import router as settings_router
 from app.api.v1.document_access_requests import router as access_requests_router
 from app.core.exceptions import register_exception_handlers
+from app.core.config import settings
 from app.core.logging import configure_logging
 from app.db.init_db import init_db
 from app.db.session import SessionLocal, engine, get_db
@@ -57,8 +58,9 @@ async def trace_middleware(request: Request, call_next):
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:8083",
+        origin.strip()
+        for origin in settings.cors_origins.split(",")
+        if origin.strip()
     ],
     allow_credentials=False,
     allow_methods=["*"],

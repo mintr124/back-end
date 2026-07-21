@@ -58,3 +58,43 @@ OLAMA_MODEL=ggml-vicuna-13b
 ```
 
 To test OpenAI locally, set `LLM_PROVIDER=openai` and `OPENAI_API_KEY` then restart the service.
+
+## Production deployment on one EC2 instance
+
+The production stack keeps the API, Celery worker, MySQL, Redis, MinIO, ChromaDB,
+OpenFGA, and its PostgreSQL datastore on one EC2 instance. Caddy provides HTTPS
+for the API domain and forwards requests to FastAPI.
+
+1. Copy the project to the EC2 instance and enter this directory:
+
+```bash
+cd back-end
+cp .env.prod.example .env
+```
+
+2. Replace every `change-me` value in `.env`, set `API_DOMAIN` to the DNS name
+   pointing to the EC2 Elastic IP, and set `CORS_ORIGINS` to the deployed front-end URL.
+
+3. Start the production stack:
+
+```bash
+docker compose -f docker-compose.prod.yml run --rm openfga-migrate
+docker compose -f docker-compose.prod.yml up -d --build
+```
+
+4. Create the OpenFGA store and model once, then copy the printed IDs into `.env`:
+
+```bash
+docker compose -f docker-compose.prod.yml exec api python -m app.fga.setup
+docker compose -f docker-compose.prod.yml up -d
+```
+
+5. Check the API:
+
+```bash
+curl https://api.example.com/health
+docker compose -f docker-compose.prod.yml logs -f api
+```
+
+Do not expose MySQL, Redis, PostgreSQL, MinIO, ChromaDB, or OpenFGA ports in the
+EC2 security group. Keep `.env` outside Git and back up the Docker volumes.
