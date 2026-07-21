@@ -26,8 +26,9 @@ from app.utils.ids import new_uuid
 
 logger = logging.getLogger(__name__)
 
-# Allows OAuth2 over plain HTTP in local development; must be removed in production.
-os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+# Allow OAuth2 over plain HTTP only for local development. Production uses HTTPS.
+if settings.env != "prod":
+    os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
 # Gmail readonly scope — sufficient for listing and fetching email content.
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]

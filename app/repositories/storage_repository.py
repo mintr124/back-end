@@ -53,6 +53,27 @@ class StorageRepository:
             length=len(data),
             content_type=content_type,
         )
+
+        # Ingest jobs can be retried after the object has already been written
+        # to MinIO but before the rest of the pipeline completed. Reuse the
+        # existing database row for the same object key instead of violating
+        # the unique constraint on storage_objects.object_key.
+        existing = (
+            db.query(StorageObject)
+            .filter(StorageObject.object_key == object_key)
+            .one_or_none()
+        )
+        if existing:
+            existing.provider = "minio"
+            existing.bucket = bucket
+            existing.object_kind = object_kind
+            existing.original_filename = original_filename
+            existing.content_type = content_type
+            existing.size_bytes = len(data)
+            existing.checksum = self.checksum(data)
+            db.flush()
+            return existing
+
         obj = StorageObject(
             provider="minio",
             bucket=bucket,
