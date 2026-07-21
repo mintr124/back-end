@@ -696,7 +696,8 @@ def _chunk_with_llm(parsed: ParsedDocument, cfg: ChunkConfig, doc_sensitivity: i
 
     text = clean_text[:_LLM_CHUNK_MAX_INPUT_CHARS]
     prompt = _LLM_CHUNK_PROMPT.format(text=text, doc_sensitivity=doc_sensitivity)
-    logger.info("LLM chunker input prompt len=%d preview=%r", len(prompt), prompt)
+    # Do not log prompt contents: prompts contain the uploaded document text.
+    logger.info("LLM chunker input prompt len=%d", len(prompt))
 
     try:
         raw, _, source = llm_service.generate_json(
@@ -706,7 +707,7 @@ def _chunk_with_llm(parsed: ParsedDocument, cfg: ChunkConfig, doc_sensitivity: i
             temperature=0.0,
             use_default_instructions=False,
         )
-        logger.info("LLM chunker response source=%s len=%d raw_preview=%r", source, len(raw), raw[:200])
+        logger.info("LLM chunker response source=%s len=%d", source, len(raw))
     except Exception as exc:
         logger.error("LLM chunker generate EXCEPTION type=%s msg=%s", type(exc).__name__, exc)
         raise RuntimeError(f"LLM chunker generate failed: {exc}") from exc

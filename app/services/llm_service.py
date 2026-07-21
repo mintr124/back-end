@@ -146,7 +146,8 @@ YÊU CẦU TRẢ LỜI
             max_tokens,
             temperature,
         )
-        logger.info("LLM PROMPT:\n%s", prompt)
+        # Prompts can contain private document content; never write them to logs.
+        logger.info("LLM prompt prepared len=%d", len(prompt))
 
         # 1) OpenAI
         if provider == "openai":
@@ -165,7 +166,7 @@ YÊU CẦU TRẢ LỜI
                 model = settings.openai_model or "gpt-4.1-mini"
                 instructions = self._build_instructions(system)
 
-                logger.info("LLM generate SYSTEM:\n%s", instructions)
+                logger.info("LLM generate system instructions prepared len=%d", len(instructions))
 
                 resp = client.chat.completions.create(
                     model=model,
@@ -255,7 +256,7 @@ YÊU CẦU TRẢ LỜI
         )
 
         if messages is None:
-            logger.info("LLM STREAM PROMPT:\n%s", prompt)
+            logger.info("LLM stream prompt prepared len=%d", len(prompt))
             messages = [{"role": "user", "content": prompt}]
 
         if provider == "openai":
@@ -267,7 +268,7 @@ YÊU CẦU TRẢ LỜI
             )
             model = settings.openai_model or "gpt-4o-mini"
             instructions = system if system else self._build_instructions(None)
-            logger.info("LLM generate_stream SYSTEM:\n%s", instructions)
+            logger.info("LLM generate_stream system instructions prepared len=%d", len(instructions))
             api_messages = [{"role": "system", "content": instructions}] + messages
             with client.chat.completions.create(
                 model=model,
@@ -362,8 +363,8 @@ YÊU CẦU TRẢ LỜI
             "LLM generate_json REQUEST model=%s max_tokens=%s temperature=%s use_default_instructions=%s",
             model, max_tokens, temperature, use_default_instructions,
         )
-        logger.info("LLM generate_json SYSTEM:\n%s", instructions)
-        logger.info("LLM generate_json USER PROMPT:\n%s", prompt)
+        logger.info("LLM generate_json system instructions prepared len=%d", len(instructions))
+        logger.info("LLM generate_json user prompt prepared len=%d", len(prompt))
 
         resp = client.chat.completions.create(
             model=model,

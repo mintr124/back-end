@@ -16,6 +16,7 @@ class Settings(BaseSettings):
         "https://main.d37e45ukb2hsrw.amplifyapp.com,"
         "https://main.roles-aware-rag.amplifyapp.com"
     )
+    gmail_redirect_uri: str = "http://localhost:8083/gmail/callback"
 
     database_url: str = "mysql+pymysql://rag:rag@mysql:3306/ragdb?charset=utf8mb4"
     redis_url: str = "redis://redis:6379/0"

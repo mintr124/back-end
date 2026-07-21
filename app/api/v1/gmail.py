@@ -5,14 +5,16 @@ email listing, inbox sync, and account disconnect.
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.deps import get_current_user, get_db
 from app.models.user import User
 from app.services.gmail_service import gmail_service
 
 router = APIRouter()
 
-# OAuth2 redirect URI; must match the URI registered in the Google Cloud Console.
-REDIRECT_URI = "http://localhost:8083/gmail/callback"
+# OAuth2 redirect URI; must exactly match the URI registered in Google Cloud Console.
+# Local development keeps the localhost callback; production sets GMAIL_REDIRECT_URI.
+REDIRECT_URI = settings.gmail_redirect_uri
 
 
 # Return the Google OAuth2 authorization URL for the user to open in the browser.
