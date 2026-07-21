@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+!.env.prod.example
+.git
+.gitignore
+__pycache__
+*.py[cod]
+.mypy_cache
+.pytest_cache
+data
+mysql_data
+minio_data
+chroma_data
+*.log
+api_log.txt
