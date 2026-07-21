@@ -1,11 +1,11 @@
-from sqlalchemy import Column, String, Text, Boolean
-from sqlalchemy.orm import relationship
+from sqlalchemy import Column, Boolean, String, Text
+
 from app.db.base import Base, TimestampMixin
 from app.utils.ids import new_uuid
 
 
+# Save Gmail OAuth tokens for each user.
 class GmailToken(Base, TimestampMixin):
-    """Lưu OAuth token của từng user."""
     __tablename__ = "gmail_tokens"
 
     id           = Column(String(36), primary_key=True, default=new_uuid)
@@ -13,8 +13,8 @@ class GmailToken(Base, TimestampMixin):
     token_json   = Column(Text, nullable=False)  # pickle → base64 → str
 
 
+# Save synced Gmail emails to avoid duplicates.
 class GmailSyncedEmail(Base, TimestampMixin):
-    """Lưu message_id đã embed để tránh sync trùng."""
     __tablename__ = "gmail_synced_emails"
 
     id            = Column(String(36), primary_key=True, default=new_uuid)

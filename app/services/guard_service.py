@@ -1,24 +1,10 @@
 """
-guard_service.py  –  v2
-========================
-Pre/Post guards cho RAG pipeline tiếng Việt.
+Guard service: pre/post safety guards for the RAG pipeline.
 
-Flow:
-  [Guard 1 - Pre Query]    Intent classification via OpenAI
-  [Guard 2 - Pre LLM]      Presidio PII scan trên retrieved chunks
-  [Guard 3a - Post LLM]    Presidio + keyword scan nhanh (< 5ms)
-  [Guard 3b - Post LLM]    LLM-as-judge – chỉ chạy khi 3a có tín hiệu (~500ms)
-
-Guard 3b chỉ được kích hoạt khi:
-  - has_pii = True  (Presidio/regex phát hiện PII trong response)
-  - hard_keywords found (keyword chắc chắn nhạy cảm)
-  - soft_keywords found (keyword có thể nhạy cảm tùy context)
-
-JudgeResult:
-  - leaked   : bool   – có leak thực sự không
-  - severity : HIGH | MEDIUM | LOW
-  - action   : BLOCK | REDACT | ALLOW
-  - reason   : str
+  Guard 1 (pre-query)  — intent classification (LLM).
+  Guard 2 (pre-LLM)    — PII scan on retrieved chunks (Presidio + regex).
+  Guard 3a (post-LLM)  — fast PII + keyword scan on the LLM response.
+  Guard 3b (post-LLM)  — LLM-as-judge, triggered only when Guard 3a fires.
 """
 
 from __future__ import annotations
@@ -27,7 +13,6 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Optional
 
 from app.core.config import settings
 
@@ -37,13 +22,13 @@ logger = logging.getLogger(__name__)
 # Dataclasses
 # ---------------------------------------------------------------------------
 
+# Result from Guard 1 intent classification.
 @dataclass
 class IntentResult:
-    """Kết quả từ Guard 1 - Intent Classification."""
     action: str          # ALLOW | BLOCK | REWRITE
     risk: str            # LOW | MEDIUM | HIGH
     class_: str          # PROMPT_INJECTION | HARMFUL_INTENT | OFF_TOPIC | SAFE | ...
-    rewrite: Optional[str] = None
+    rewrite: str | None = None
     reason: str = ""
 
     @property
@@ -55,9 +40,9 @@ class IntentResult:
         return self.action == "REWRITE" and bool(self.rewrite)
 
 
+# A single detected PII entity with span and confidence score.
 @dataclass
 class PIIEntity:
-    """Một PII entity được detect."""
     entity_type: str
     text: str
     start: int
@@ -65,10 +50,10 @@ class PIIEntity:
     score: float
 
 
+# Result from Guard 3b LLM-as-judge evaluation.
 @dataclass
 class JudgeResult:
-    """Kết quả từ Guard 3b - LLM-as-judge."""
-    leaked: bool              # có leak thực sự không
+    leaked: bool              # whether a real leak was detected.
     severity: str             # HIGH | MEDIUM | LOW
     action: str               # BLOCK | REDACT | ALLOW
     reason: str = ""
@@ -83,15 +68,15 @@ class JudgeResult:
         return self.action == "REDACT"
 
 
+# Result from Guard 2/3 PII and secret keyword scan.
 @dataclass
 class PIIScanResult:
-    """Kết quả từ Guard 2/3 - PII & Secret scan."""
     has_pii: bool
     has_secret: bool
     entities: list[PIIEntity] = field(default_factory=list)
     redacted_text: str = ""
     secret_keywords_found: list[str] = field(default_factory=list)
-    judge: Optional[JudgeResult] = None   # None nếu Guard 3b không chạy
+    judge: JudgeResult | None = None   # None if Guard 3b did not run.
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +166,7 @@ Trả về JSON DUY NHẤT, không giải thích thêm:
 """.strip()
 
 
+# Call the OpenAI API to classify the user query intent; returns raw JSON dict.
 def _call_openai_intent(query: str) -> dict:
     try:
         from openai import OpenAI
@@ -213,6 +199,7 @@ def _call_openai_intent(query: str) -> dict:
     return parsed
 
 
+# Parse the raw LLM JSON into an IntentResult, normalising unknown values to safe defaults.
 def _parse_intent_response(raw: dict, query: str) -> IntentResult:
     action  = str(raw.get("action",  "ALLOW")).upper()
     risk    = str(raw.get("risk",    "LOW")).upper()
@@ -272,8 +259,8 @@ Trả về JSON DUY NHẤT:
 """.strip()
 
 
+# Call the OpenAI API to judge whether the LLM response leaks sensitive information.
 def _call_openai_judge(response_text: str, triggered_by: str) -> dict:
-    """Gọi OpenAI để judge xem LLM response có leak thông tin không."""
     try:
         from openai import OpenAI
     except ImportError:
@@ -314,6 +301,7 @@ def _call_openai_judge(response_text: str, triggered_by: str) -> dict:
     return parsed
 
 
+# Parse the raw judge JSON into a JudgeResult with validated enum fields.
 def _parse_judge_response(raw: dict, triggered_by: str) -> JudgeResult:
     leaked   = bool(raw.get("leaked", False))
     severity = str(raw.get("severity", "LOW")).upper()
@@ -344,23 +332,23 @@ _VI_PII_PATTERNS: list[dict] = [
                 r"(?:\s+[A-ZÀÁÂÃÈÉÊÌÍÒÓÔÕÙÚÝĂĐƠƯ][a-zàáâãèéêìíòóôõùúýăđơưạảấầẩẫậắằẳẵặẹẻẽếềểễệỉịọỏốồổỗộớờởỡợụủứừửữựỳỵỷỹ]+){1,3}\b",
      "entity_type": "PERSON_NAME", "score": 0.8},
     
-    # Fix phone: cho phép dấu cách/gạch giữa các nhóm số
+    # Allow spaces or hyphens between digit groups.
     {"name": "VN_PHONE",
      "pattern": r"\b(?:\+84|0)(?:3[2-9]|5[6-9]|7[0-9]|8[0-9]|9[0-9])[\s\-]?\d{3}[\s\-]?\d{3}\b",
      "entity_type": "PHONE_NUMBER", "score": 0.85},
 
-    # Thêm mới: số tiền lương VND
+    # Vietnamese salary amounts in VND.
     {"name": "VN_SALARY",
      "pattern": r"\b\d{1,3}(?:[.,]\d{3})+\s*(?:VND|đồng|vnđ)\b",
      "entity_type": "SALARY_AMOUNT", "score": 0.85},
 
-    # Thêm mới: địa chỉ Việt Nam
+    # Vietnamese street addresses.
     {"name": "VN_ADDRESS",
      "pattern": r"(?:Số\s+\d+[^,\n]{0,30}(?:đường|phố|ngõ|ngách)[^,\n]{0,40}"
                 r"|(?:Căn hộ|Phòng)\s+\w+[^,\n]{0,60})",
      "entity_type": "ADDRESS", "score": 0.75},
 
-    # Giữ nguyên các pattern cũ
+    # Retain original patterns.
     {"name": "VN_CCCD",      "pattern": r"\b\d{9}(?:\d{3})?\b",                                                    "entity_type": "CCCD_CMND",    "score": 0.7},
     {"name": "EMAIL",        "pattern": r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",                     "entity_type": "EMAIL_ADDRESS","score": 0.9},
     {"name": "VN_BANK_ACCOUNT","pattern": r"\b\d{10,19}\b",                                                        "entity_type": "BANK_ACCOUNT", "score": 0.5},
@@ -369,7 +357,7 @@ _VI_PII_PATTERNS: list[dict] = [
     {"name": "VN_PASSPORT",  "pattern": r"\b[A-Z]\d{7,8}\b",                                                       "entity_type": "PASSPORT",     "score": 0.6},
 ]
 
-# Keyword chắc chắn nhạy cảm → kích hoạt Guard 3b ngay
+# Hard keywords — definitely sensitive; immediately trigger Guard 3b.
 _HARD_SECRET_KEYWORDS: list[str] = [
     "api key", "secret key", "private key",
     "mật khẩu hệ thống", "credentials nội bộ",
@@ -382,7 +370,7 @@ _HARD_SECRET_KEYWORDS: list[str] = [
     "giá thỏa thuận riêng",
 ]
 
-# Keyword có thể nhạy tùy context → kích hoạt Guard 3b để xác nhận
+# Soft keywords — context-dependent; trigger Guard 3b to confirm.
 _SOFT_SECRET_KEYWORDS: list[str] = [
     "doanh thu nội bộ", "ngân sách nội bộ", "chi phí nội bộ",
     "báo cáo tài chính nội bộ", "kế hoạch tài chính",
@@ -410,6 +398,7 @@ _COMPILED_PII = [
 ]
 
 
+# Scan text for PII entities using compiled Vietnamese regex patterns.
 def _regex_scan_pii(text: str) -> list[PIIEntity]:
     entities: list[PIIEntity] = []
     seen: set[tuple[int, int]] = set()
@@ -427,6 +416,7 @@ def _regex_scan_pii(text: str) -> list[PIIEntity]:
     return entities
 
 
+# Scan text using Presidio; falls back to an empty list if Presidio is unavailable.
 def _presidio_scan_pii(text: str) -> list[PIIEntity]:
     try:
         from presidio_analyzer import AnalyzerEngine
@@ -463,6 +453,7 @@ def _presidio_scan_pii(text: str) -> list[PIIEntity]:
         return []
 
 
+# Replace each detected entity span with a [ENTITY_TYPE] placeholder.
 def _redact_text(text: str, entities: list[PIIEntity]) -> str:
     if not entities:
         return text
@@ -476,25 +467,8 @@ def _redact_text(text: str, entities: list[PIIEntity]) -> str:
 # GuardService  –  public interface
 # ---------------------------------------------------------------------------
 
+# Orchestrates all three guard stages for the RAG chat pipeline.
 class GuardService:
-    """
-    Sử dụng trong chat_service:
-
-        # Guard 1
-        intent = guard_service.check_intent(query)
-        if intent.blocked:
-            return block_response()
-        query = intent.rewrite or query
-
-        # Guard 2
-        retrieved = guard_service.scan_chunks(retrieved)
-
-        # Guard 3 (3a + 3b tự động)
-        post = guard_service.scan_response(llm_output)
-        if post.judge and post.judge.should_block:
-            return block_response("Nội dung không thể hiển thị.")
-        final_text = post.redacted_text
-    """
 
     def __init__(self, enable_judge: bool = True):
         self.enable_judge = enable_judge
@@ -503,6 +477,7 @@ class GuardService:
     # Guard 1
     # ------------------------------------------------------------------
 
+    # Guard 1: classify query intent; block or rewrite if unsafe.
     def check_intent(self, query: str) -> IntentResult:
         query = (query or "").strip()
         if not query:
@@ -528,7 +503,8 @@ class GuardService:
             return IntentResult(action="ALLOW", risk="LOW", class_="SAFE",
                                 reason="Intent guard error – defaulting to allow")
 
-    def _local_injection_check(self, query: str) -> Optional[IntentResult]:
+    # Fast regex check for prompt-injection patterns before calling the LLM.
+    def _local_injection_check(self, query: str) -> IntentResult | None:
         q_lower = query.lower()
         INJECTION_PATTERNS = [
             r"ignore\s+(all\s+)?previous\s+instructions?",
@@ -557,14 +533,8 @@ class GuardService:
     # Guard 2
     # ------------------------------------------------------------------
 
+    # Guard 2: PII-scan retrieved chunks and redact based on the user's clearance level.
     def scan_chunks(self, chunks: list[dict], user=None) -> list[dict]:
-        """
-        Guard 2: PII scan trên retrieved chunks.
-        - admin_auditor → không mask gì cả, trả nguyên
-        - director      → mask SALARY_AMOUNT, PHONE_NUMBER, EMAIL, CCCD, ADDRESS
-                        nhưng giữ PERSON_NAME (cần để đọc hiểu context)
-        - everyone else → mask toàn bộ PII
-        """
         is_corp = getattr(user, "is_corp_member", False) if user else False
         max_clearance = getattr(user, "max_clearance", 1) if user else 1
 
@@ -572,7 +542,7 @@ class GuardService:
             logger.info("Guard2 SKIP: corp_member clearance=5 sees raw chunks")
             return [{**chunk, "_pii_redacted": False} for chunk in chunks]
 
-        # Với director: chỉ mask một số entity type nhất định
+        # Director: mask only a specific set of entity types.
         DIRECTOR_MASK_TYPES = {
             "SALARY_AMOUNT", "PHONE_NUMBER", "EMAIL_ADDRESS",
             "CCCD_CMND", "BANK_ACCOUNT", "ADDRESS", "DATE_OF_BIRTH",
@@ -603,7 +573,7 @@ class GuardService:
                 else:
                     new_chunk["_pii_redacted"] = False
             else:
-                # employee, manager, guest → mask toàn bộ
+                # All other roles → mask all PII.
                 new_chunk["document_text"] = scan.redacted_text
                 new_chunk["_pii_redacted"] = True
                 new_chunk["_pii_entities"] = [e.entity_type for e in scan.entities]
@@ -617,6 +587,7 @@ class GuardService:
     # Guard 3 (3a + 3b)
     # ------------------------------------------------------------------
 
+    # Guard 3 (3a + 3b): scan the LLM response for PII and secrets, optionally calling the judge.
     def scan_response(self, text: str, user=None) -> PIIScanResult:
         is_corp = getattr(user, "is_corp_member", False) if user else False
         max_clearance = getattr(user, "max_clearance", 1) if user else 1
@@ -644,12 +615,12 @@ class GuardService:
         has_secret    = len(all_keywords) > 0
 
         if has_pii or has_secret:
-            logger.info("Guard3a: role=%s has_pii=%s entities=%s hard=%s soft=%s",
-                        user_role, has_pii, [e.entity_type for e in all_entities],
+            logger.info("Guard3a: has_pii=%s entities=%s hard=%s soft=%s",
+                        has_pii, [e.entity_type for e in all_entities],
                         hard_keywords[:3], soft_keywords[:3])
 
         # ── Guard 3b: LLM judge ───────────────────────────────────────
-        judge_result: Optional[JudgeResult] = None
+        judge_result: JudgeResult | None = None
 
         if self.enable_judge and (has_pii or hard_keywords or soft_keywords):
             if has_pii:
@@ -668,9 +639,8 @@ class GuardService:
                             judge_result.action, judge_result.reason)
 
                 if skip_redact:
-                    # admin_auditor: chỉ BLOCK khi severity=HIGH và leaked thật sự
-                    # REDACT → bỏ qua, admin xem full
-                    judge_result.action = "ALLOW" 
+                    # admin_auditor: only BLOCK on severity=HIGH with real leak; REDACT → skip, admin sees full.
+                    judge_result.action = "ALLOW"
                 else:
                     if judge_result.action == "ALLOW":
                         redacted = text
@@ -688,8 +658,8 @@ class GuardService:
             judge=judge_result,
         )
 
+    # Pure PII scan for Guard 2 — does not invoke the LLM judge.
     def scan_pii(self, text: str) -> PIIScanResult:
-        """Scan PII thuần cho Guard 2. Không chạy judge."""
         if not text or not text.strip():
             return PIIScanResult(has_pii=False, has_secret=False, redacted_text=text)
 
@@ -712,5 +682,5 @@ class GuardService:
         )
 
 
-# Singleton  –  set enable_judge=False trong dev để giảm latency
+# Module-level singleton; imported by the chat service. Set enable_judge=False in dev to reduce latency.
 guard_service = GuardService(enable_judge=False)

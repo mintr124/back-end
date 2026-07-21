@@ -1,3 +1,6 @@
+"""
+Text normalisation utilities: NFKC unicode, whitespace collapsing, hyphen-break removal, bullet stripping.
+"""
 from __future__ import annotations
 
 import re
@@ -7,9 +10,15 @@ _ZERO_WIDTH_RE = re.compile(r"[\u200B-\u200D\uFEFF]")
 _MULTI_SPACE_RE = re.compile(r"[ \t]+")
 _MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
 _HYPHEN_LINEBREAK_RE = re.compile(r"(?<=\w)-\n(?=\w)")
-_BULLET_RE = re.compile(r"^[\s\-\*\u2022\u00B7\u2219]+", re.MULTILINE)
+# Match bullet-list markers (hyphen/bullet/single-asterisk + space) but NOT
+# markdown bold (**text**) or italic (*text*) which have no trailing space.
+_BULLET_RE = re.compile(
+    r"^[ \t]*[-\u2022\u00B7\u2219][ \t]+|^[ \t]*\*(?!\*)[ \t]+",
+    re.MULTILINE,
+)
 
 
+# Normalise whitespace, unicode, hyphen line-breaks, and bullet markers in extracted text.
 def normalize_text(text: str) -> str:
     if not text:
         return ""

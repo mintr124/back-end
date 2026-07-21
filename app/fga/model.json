@@ -36,16 +36,16 @@
       "relations": {
         "owner": { "this": {} },
 
-        "oui_member": { "this": {} },
+        "viewer": { "this": {} },
 
-        "ancestor_viewer": { "this": {} },
+        "editor": { "this": {} },
 
         "can_view": {
           "union": {
             "child": [
               { "computedUserset": { "relation": "owner" } },
-              { "computedUserset": { "relation": "oui_member" } },
-              { "computedUserset": { "relation": "ancestor_viewer" } }
+              { "computedUserset": { "relation": "editor" } },
+              { "computedUserset": { "relation": "viewer" } }
             ]
           }
         },
@@ -54,22 +54,43 @@
           "union": {
             "child": [
               { "computedUserset": { "relation": "owner" } },
-              { "computedUserset": { "relation": "ancestor_viewer" } }
+              { "computedUserset": { "relation": "editor" } }
             ]
           }
         }
       },
       "metadata": {
         "relations": {
-          "owner": { "directly_related_user_types": [{ "type": "user" }] },
-          "oui_member": { "directly_related_user_types": [{ "type": "user" }] },
-          "ancestor_viewer": {
+          "owner": {
             "directly_related_user_types": [{ "type": "user" }]
+          },
+          "viewer": {
+            "directly_related_user_types": [
+              { "type": "user" },
+              { "type": "oui", "relation": "member", "condition": "clearance_sufficient" },
+              { "type": "oui", "relation": "ancestor_member", "condition": "clearance_sufficient" }
+            ]
+          },
+          "editor": {
+            "directly_related_user_types": [
+              { "type": "user" },
+              { "type": "oui", "relation": "member", "condition": "clearance_sufficient" }
+            ]
           },
           "can_view": { "directly_related_user_types": [] },
           "can_edit": { "directly_related_user_types": [] }
         }
       }
     }
-  ]
+  ],
+  "conditions": {
+    "clearance_sufficient": {
+      "name": "clearance_sufficient",
+      "expression": "user_clearance >= required_clearance",
+      "parameters": {
+        "user_clearance": { "type_name": "TYPE_NAME_INT" },
+        "required_clearance": { "type_name": "TYPE_NAME_INT" }
+      }
+    }
+  }
 }

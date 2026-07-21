@@ -1,22 +1,34 @@
+"""
+Service for traversing the OUI (multi-parent DAG) tree: conflict checks, FGA sync, and access scope queries.
+"""
 from __future__ import annotations
 from sqlalchemy.orm import Session
 from app.models.org_unit_instance import OrgUnitInstance, oui_parent
 
 
+# Service for traversing the OUI (multi-parent DAG) tree: conflict checks, FGA sync, and access scope queries.
 class OuiTreeService:
-    """
-    Helper để duyệt cây OUI (multi-parent DAG).
-    Dùng cho:
-    - Conflict check khi assign user
-    - Sync FGA tuples (lấy ancestors để grant quyền)
-    - Access check (node con xem doc public của node cha)
-    """
 
+    # Return the list of immediate parent OUI IDs (non-recursive).
+    def get_direct_parents(self, db: Session, oui_id: str) -> list[str]:
+        rows = db.execute(
+            oui_parent.select().where(oui_parent.c.oui_id == oui_id)
+        ).fetchall()
+        return [row.parent_oui_id for row in rows]
+
+    # Traverse up to the root and return the OUI ID of the node with no parent.
+    def get_root_oui_id(self, db: Session, oui_id: str) -> str:
+        current = oui_id
+        while True:
+            rows = db.execute(
+                oui_parent.select().where(oui_parent.c.oui_id == current)
+            ).fetchall()
+            if not rows:
+                return current
+            current = rows[0].parent_oui_id
+
+    # Return all ancestor OUI IDs (excluding the node itself) via BFS over oui_parents.
     def get_ancestors(self, db: Session, oui_id: str) -> list[str]:
-        """
-        Trả về list oui_id của tất cả ancestors (không bao gồm chính nó).
-        BFS duyệt lên qua bảng oui_parents.
-        """
         visited: set[str] = set()
         queue = [oui_id]
         while queue:
@@ -31,11 +43,8 @@ class OuiTreeService:
                     queue.append(pid)
         return list(visited)
 
+    # Return all descendant OUI IDs (excluding the node itself) via BFS.
     def get_descendants(self, db: Session, oui_id: str) -> list[str]:
-        """
-        Trả về list oui_id của tất cả descendants (không bao gồm chính nó).
-        BFS duyệt xuống.
-        """
         visited: set[str] = set()
         queue = [oui_id]
         while queue:
@@ -50,27 +59,24 @@ class OuiTreeService:
                     queue.append(cid)
         return list(visited)
 
+    # Return the union of all ancestors and descendants (used for conflict checks).
     def get_ancestor_and_descendant_ids(self, db: Session, oui_id: str) -> set[str]:
-        """Trả về union của ancestors + descendants (dùng cho conflict check)."""
         return set(self.get_ancestors(db, oui_id)) | set(self.get_descendants(db, oui_id))
 
+    # Check if the user can be assigned to oui_id; return None if OK or an error message on conflict.
     def check_conflict(self, db: Session, user_id: str, oui_id: str) -> str | None:
-        """
-        Kiểm tra xem user có thể được assign vào oui_id không.
-        Trả về None nếu OK, hoặc thông báo lỗi nếu conflict.
-        """
         from app.models.user_oui_position import UserOuiPosition
 
-        # Lấy tất cả OUI user đang thuộc
+        # Fetch all OUI records the user is currently assigned to.
         existing = db.query(UserOuiPosition).filter(
             UserOuiPosition.user_id == user_id
         ).all()
         if not existing:
             return None
 
-        # Các OUI trên cùng nhánh với oui_id
+        # OUIs on the same branch as oui_id.
         forbidden = self.get_ancestor_and_descendant_ids(db, oui_id)
-        forbidden.add(oui_id)  # không được assign vào cùng OUI 2 lần (đã có UNIQUE nhưng check rõ hơn)
+        forbidden.add(oui_id)  # also block re-assigning to the same OUI (UNIQUE handles it, but this is explicit)
 
         for rec in existing:
             if rec.oui_id in forbidden:
@@ -83,4 +89,25 @@ class OuiTreeService:
         return None
 
 
+    # Return the set of all OUI IDs in the user's tree branches: own OUIs plus all ancestors and descendants.
+    def get_user_branch_oui_ids(self, db: Session, user) -> set[str]:
+        user_oui_ids = {uop.oui_id for uop in getattr(user, "oui_positions", [])}
+        all_ids: set[str] = set(user_oui_ids)
+        for oui_id in user_oui_ids:
+            all_ids.update(self.get_ancestors(db, oui_id))
+            all_ids.update(self.get_descendants(db, oui_id))
+        return all_ids
+
+    # Return all document IDs belonging to the given set of OUI IDs.
+    def get_doc_ids_for_oui_ids(self, db: Session, oui_ids: set[str]) -> set[str]:
+        if not oui_ids:
+            return set()
+        from app.models.document import document_oui
+        rows = db.execute(
+            document_oui.select().where(document_oui.c.oui_id.in_(list(oui_ids)))
+        ).fetchall()
+        return {row.document_id for row in rows}
+
+
+# Module-level singleton; imported by the policy agent, FGA sync, and document service.
 oui_tree_service = OuiTreeService()

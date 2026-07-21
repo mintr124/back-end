@@ -131,7 +131,7 @@ services:
       - minio
       - openfga
       - chroma
-    command: celery -A app.workers.tasks.celery_app worker -Q ingest_queue -l info
+    command: celery -A app.workers.tasks.celery_app worker -Q ingest_queue -l info --concurrency=1
     volumes:
       - .:/app
     restart: unless-stopped

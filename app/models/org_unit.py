@@ -1,17 +1,17 @@
-from sqlalchemy import Column, String, ForeignKey
+from sqlalchemy import Column, ForeignKey, String
 from sqlalchemy.orm import relationship
 
 from app.db.base import Base, TimestampMixin
 from app.utils.ids import new_uuid
 
 
+"""
+Define the organizational unit type (OU type).
+E.g., Corp., Department, Division, Branch, Project, Team, ...
+Corp. is the only root (parent_id = None), and cannot be deleted.
+The OU type hierarchy defines the structure — parent nodes can always view documents of child nodes.
+"""
 class OrgUnit(Base, TimestampMixin):
-    """
-    Định nghĩa loại đơn vị tổ chức (OU type).
-    VD: Corp., Department, Division, Branch, Project, Team, ...
-    Corp. là root duy nhất (parent_id = None), không được xóa.
-    Cây OU type xác định hierarchy — node cha luôn xem được doc của node con.
-    """
     __tablename__ = "org_units"
 
     id          = Column(String(36), primary_key=True, default=new_uuid)

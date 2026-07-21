@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, ForeignKey, Text, JSON
+from sqlalchemy import Column, ForeignKey, JSON, String, Text
 from sqlalchemy.orm import relationship
 
 from app.db.base import Base, TimestampMixin
@@ -17,5 +17,6 @@ class Message(Base, TimestampMixin):
     client_message_id = Column(String(36), nullable=True, index=True)
     status = Column(String(36), nullable=True, index=True)
     trace_id = Column(String(64), nullable=True, index=True)
+    attached_file_name = Column(String(512), nullable=True)
 
     conversation = relationship("Conversation")

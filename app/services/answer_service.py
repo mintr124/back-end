@@ -1,11 +1,14 @@
-from typing import Tuple
+"""
+Minimal answer generator: concatenates retrieved excerpts and formats source citations.
+"""
 
 
 class AnswerService:
     def __init__(self):
         pass
 
-    def generate(self, *, user_input: str, retrieved: list[dict]) -> Tuple[str, list[dict]]:
+    # Concatenate top retrieved excerpts into an answer string and build a source list.
+    def generate(self, *, user_input: str, retrieved: list[dict]) -> tuple[str, list[dict]]:
         # Minimal answer generator: concatenate top excerpts and label sources
         if not retrieved:
             answer = "Sorry, can't find the source of information."
@@ -19,9 +22,9 @@ class AnswerService:
             parts.append(excerpt)
             sources.append(
                 {
-                    "documentId": md.get("document_id") or md.get("document_id"),
+                    "documentId": md.get("document_id"),
                     "documentTitle": md.get("document_title") or md.get("document_id"),
-                    "versionId": md.get("document_version_id") or md.get("document_version_id"),
+                    "versionId": md.get("document_version_id"),
                     "sectionPath": md.get("section_path"),
                     "relevance": r.get("relevance"),
                     "excerpt": excerpt,
@@ -35,4 +38,5 @@ class AnswerService:
         return answer_text, sources
 
 
+# Module-level singleton; imported by the chat pipeline.
 answer_service = AnswerService()

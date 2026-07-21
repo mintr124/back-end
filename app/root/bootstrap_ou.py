@@ -45,8 +45,6 @@ def main():
         db.flush()
 
         # ── Positions cho Corp. ───────────────────────────────────────────────
-        Position(name="Admin",    ou_id=corp.id, clearance=5)
-        Position(name="Director", ou_id=corp.id, clearance=5)
         corp_positions = [
             Position(name="Admin",    ou_id=corp.id, clearance=5),
             Position(name="Director", ou_id=corp.id, clearance=4),

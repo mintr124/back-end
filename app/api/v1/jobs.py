@@ -1,3 +1,7 @@
+"""
+Job inspection endpoints. Allow users to poll their own job status and step logs.
+Director and admin_auditor roles can view any job.
+"""
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
@@ -9,6 +13,7 @@ from app.services.job_service import job_service
 router = APIRouter()
 
 
+# Retrieve a job by ID. Enforces ownership unless the caller has an elevated role.
 @router.get("/{job_id}", response_model=JobRead)
 def get_job(job_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     job = job_service.get_job(db, job_id)
@@ -21,6 +26,7 @@ def get_job(job_id: str, db: Session = Depends(get_db), current_user: User = Dep
     return JobRead.model_validate(job)
 
 
+# Retrieve all processing steps for a job. Same access rules as get_job.
 @router.get("/{job_id}/steps", response_model=list[JobStepRead])
 def get_job_steps(job_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     job = job_service.get_job(db, job_id)

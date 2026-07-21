@@ -1,4 +1,5 @@
-from sqlalchemy import Column, String, JSON
+from sqlalchemy import Column, JSON, String
+
 from app.db.base import Base, TimestampMixin
 from app.utils.ids import new_uuid
 
@@ -19,3 +20,4 @@ class Trace(Base, TimestampMixin):
     timings = Column(JSON, nullable=True)
     token_usage = Column(JSON, nullable=True)
     status = Column(String(32), nullable=True)
+

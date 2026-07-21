@@ -1,3 +1,6 @@
+"""
+Service for creating and tracking ingest jobs and their pipeline steps.
+"""
 from datetime import datetime, timezone
 import uuid
 
@@ -12,6 +15,7 @@ class JobService:
     def __init__(self):
         self.repo = JobRepository()
 
+    # Return an existing ingest job for the version (idempotent) or create a new one.
     def create_or_get_ingest_job(
         self,
         db: Session,
@@ -21,6 +25,7 @@ class JobService:
         version_id: str,
         created_by_user_id: str,
         force_new: bool = False,
+        initial_status: str = "queued",
     ) -> tuple[Job, bool]:
         key = f"ingest:{version_id}" if not force_new else f"ingest:{version_id}:{uuid.uuid4().hex}"
         existing = self.repo.get_by_idempotency_key(db, key)
@@ -29,7 +34,7 @@ class JobService:
 
         job = Job(
             job_type="document_ingest",
-            status="queued",
+            status=initial_status,
             progress=0,
             idempotency_key=key,
             trace_id=trace_id,
@@ -41,6 +46,7 @@ class JobService:
         self.repo.create(db, job)
         return job, True
 
+    # Append a new running step to a job and persist it.
     def add_step(self, db: Session, *, job_id: str, step_name: str, detail_json: dict | None = None) -> JobStep:
         step = JobStep(
             job_id=job_id,
@@ -52,6 +58,7 @@ class JobService:
         self.repo.add_step(db, step)
         return step
 
+    # Mark a step as completed and record its duration.
     def finish_step(self, db: Session, step: JobStep, status_name: str = "succeeded", detail_json: dict | None = None):
         step.status = status_name
         if detail_json is not None:
@@ -60,11 +67,14 @@ class JobService:
         if step.started_at:
             step.duration_ms = int((step.ended_at - step.started_at).total_seconds() * 1000)
 
+    # Return a job by its ID, or None if not found.
     def get_job(self, db: Session, job_id: str) -> Job | None:
         return self.repo.get_by_id(db, job_id)
 
+    # Return all steps belonging to a job.
     def get_steps(self, db: Session, job_id: str) -> list[JobStep]:
         return self.repo.list_steps(db, job_id)
 
 
+# Module-level singleton; imported by the ingest pipeline.
 job_service = JobService()

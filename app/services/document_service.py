@@ -1,31 +1,38 @@
+"""
+Service for document CRUD, versioning, FGA synchronisation, and ingest job management.
+"""
+from __future__ import annotations
+
+import logging
+from collections import defaultdict
 from pathlib import Path
+
 from fastapi import HTTPException
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
-from app.fga.adapter import fga_adapter
+
 from app.core.config import settings
-from app.models.document import Document, document_oui
+from app.fga.adapter import fga_adapter
+from app.models.chunk_embedding import ChunkEmbedding
+from app.models.document import Document
 from app.models.document_chunk import DocumentChunk
 from app.models.document_version import DocumentVersion
-from app.models.policy_snapshot import DocumentPolicySnapshot
+from app.models.job import Job
+from app.models.job_step import JobStep
 from app.models.org_unit_instance import OrgUnitInstance
-from app.models.storage_object import StorageObject
+from app.models.policy_snapshot import DocumentPolicySnapshot
 from app.models.user import User
 from app.repositories.chunk_repository import ChunkRepository
 from app.repositories.document_repository import DocumentRepository
 from app.repositories.version_repository import VersionRepository
 from app.schemas.document import ChunkingConfig, DocumentCreateRequest, DocumentUpdateRequest
 from app.services.audit_service import audit_service
-from app.services.job_service import job_service
-from app.services.storage_service import storage_service
-from app.models.chunk_embedding import ChunkEmbedding
-from app.models.job import Job
-from app.models.job_step import JobStep
 from app.services.chroma_service import chroma_service
-from app.services.user_service import user_service as _user_service
+from app.services.job_service import job_service
 from app.services.oui_tree_service import oui_tree_service
+from app.services.storage_service import storage_service
+from app.services.user_service import user_service as _user_service
 
-
-import logging
 logger = logging.getLogger(__name__)
 
 
@@ -37,31 +44,35 @@ class DocumentService:
 
     # ── Permission helpers ────────────────────────────────────────────────────
 
+    # Return True if the user belongs to the corporate root OUI.
     def _is_corp_member(self, db: Session, user: User) -> bool:
         resp = _user_service.build_user_response(db, user)
         return resp.is_corp_member
 
+    # Return the user's maximum clearance level.
     def _user_clearance(self, db: Session, user: User) -> int:
         resp = _user_service.build_user_response(db, user)
         return resp.max_clearance
 
+    # Return True if FGA grants view access; owner always passes.
     def _can_view(self, db: Session, user: User, doc: Document) -> tuple[bool, str]:
-        """User xem được doc nếu FGA cho phép."""
         if doc.owner_user_id == user.id:
             return True, ""
-        if fga_adapter.can_view(user.id, doc.id):
+        if fga_adapter.can_view(user.id, doc.id, self._user_clearance(db, user)):
             return True, ""
         return False, "No permission to view this document"
 
+    # Return True if FGA grants edit access; owner always passes.
     def _can_edit(self, db: Session, user: User, doc: Document) -> tuple[bool, str]:
         if doc.owner_user_id == user.id:
             return True, ""
-        if fga_adapter.can_edit(user.id, doc.id):
+        if fga_adapter.can_edit(user.id, doc.id, self._user_clearance(db, user)):
             return True, ""
         return False, "No permission to edit this document"
 
     # ── FGA sync ──────────────────────────────────────────────────────────────
 
+    # Delete and re-sync all FGA tuples for a document.
     def _sync_fga(self, db: Session, doc: Document) -> None:
         old = fga_adapter.get_document_tuples(doc.id)
         fga_adapter.delete_document_tuples(doc.id, old)
@@ -69,6 +80,7 @@ class DocumentService:
 
     # ── Policy contract ───────────────────────────────────────────────────────
 
+    # Build a policy contract dict based on the document's sensitivity level.
     def _policy_contract(self, doc: Document) -> dict:
         if doc.sensitivity >= 4:
             max_detail = "department"
@@ -87,13 +99,12 @@ class DocumentService:
 
     # ── CRUD ──────────────────────────────────────────────────────────────────
 
+    # Return all documents the user may view via FGA grants and ownership.
     def list_documents(self, db: Session, user: User) -> list[Document]:
-        """Trả về docs mà user có quyền xem qua FGA."""
-        viewable_ids = fga_adapter.list_viewable_document_ids(user.id)
+        viewable_ids = fga_adapter.list_viewable_document_ids(user.id, self._user_clearance(db, user))
         if not viewable_ids:
-            # Owner luôn xem được doc của mình
+            # Owner can always view their own document.
             return db.query(Document).filter(Document.owner_user_id == user.id).all()
-        from sqlalchemy import or_
         return db.query(Document).filter(
             or_(
                 Document.id.in_(viewable_ids),
@@ -101,6 +112,7 @@ class DocumentService:
             )
         ).all()
 
+    # Fetch a document by ID, raising 403/404 if missing or inaccessible.
     def get_document(self, db: Session, user: User, doc_id: str) -> Document:
         doc = self.docs.get_by_id(db, doc_id)
         if not doc:
@@ -110,6 +122,7 @@ class DocumentService:
             raise HTTPException(status_code=403, detail=reason)
         return doc
 
+    # Create a new document, validate OUI membership, persist it, and sync FGA tuples.
     def create_document(
         self, db: Session, user: User, payload: DocumentCreateRequest, trace_id: str
     ) -> Document:
@@ -124,7 +137,8 @@ class DocumentService:
                 raise HTTPException(status_code=404, detail=f"OUI not found: {oui_id}")
 
             if not is_corp:
-                # User phải thuộc oui_id hoặc một ancestor của nó
+                # User must belong to oui_id or one of its ancestors.
+
                 ancestors = set(oui_tree_service.get_ancestors(db, oui_id))
                 if not (user_oui_ids & ({oui_id} | ancestors)):
                     raise HTTPException(
@@ -158,6 +172,7 @@ class DocumentService:
         self._sync_fga(db, doc)
         return doc
 
+    # Update mutable document fields, re-sync chunk sensitivity on sensitivity change, and re-sync FGA.
     def update_document(
         self, db: Session, user: User, doc_id: str,
         payload: DocumentUpdateRequest, trace_id: str,
@@ -188,7 +203,10 @@ class DocumentService:
         if payload.document_type is not None:
             doc.document_type = payload.document_type
         if payload.sensitivity is not None:
+            old_sensitivity = doc.sensitivity
             doc.sensitivity = payload.sensitivity
+            if old_sensitivity != payload.sensitivity:
+                self._resync_chunk_sensitivity(db, doc, payload.sensitivity, old_sensitivity)
         if payload.tags is not None:
             doc.tags = payload.tags
 
@@ -205,10 +223,67 @@ class DocumentService:
         self._sync_fga(db, doc)
         return doc
 
+    # Re-compute chunk_sensitivity for all chunks after a doc sensitivity change.
+    # Uses the LLM-assigned llm_chunk_sensitivity stored in Chroma to preserve the
+    # relative delta: new_cs = clamp(new_sensitivity + (llm_cs - old_sensitivity), 1, 5).
+    def _resync_chunk_sensitivity(
+        self, db: Session, doc: Document, new_sensitivity: int, old_sensitivity: int
+    ) -> None:
+        version_ids = [
+            row[0]
+            for row in db.query(DocumentVersion.id)
+            .filter(DocumentVersion.document_id == doc.id)
+            .all()
+        ]
+        if not version_ids:
+            return
+
+        chunks = db.query(DocumentChunk).filter(
+            DocumentChunk.document_version_id.in_(version_ids)
+        ).all()
+        if not chunks:
+            return
+
+        chunk_ids = [c.id for c in chunks]
+        chunk_by_id = {c.id: c for c in chunks}
+
+        try:
+            chroma_metas = chroma_service.get_metadatas_by_ids(chunk_ids)
+        except Exception as exc:
+            logger.warning("Could not fetch Chroma metadata for doc %s: %s", doc.id, exc)
+            chroma_metas = {}
+
+        groups: dict[int, list[str]] = defaultdict(list)
+        for cid in chunk_ids:
+            chroma_meta = chroma_metas.get(cid, {})
+            llm_cs = chroma_meta.get("llm_chunk_sensitivity")
+            if llm_cs is not None:
+                delta = int(llm_cs) - old_sensitivity
+                new_cs = max(1, min(5, new_sensitivity + delta))
+            else:
+                # Fallback for chunks ingested before llm_chunk_sensitivity was stored.
+                new_cs = new_sensitivity
+            groups[new_cs].append(cid)
+
+            chunk = chunk_by_id[cid]
+            meta = dict(chunk.metadata_json or {})
+            meta["chunk_sensitivity"] = new_cs
+            chunk.metadata_json = meta
+
+        for cs_val, cids in groups.items():
+            try:
+                chroma_service.update_document_metadata(
+                    cids, {"chunk_sensitivity": cs_val, "sensitivity": new_sensitivity}
+                )
+            except Exception as exc:
+                logger.warning("Failed to update Chroma chunk_sensitivity for doc %s: %s", doc.id, exc)
+
+    # Return all versions of a document the user can view.
     def get_versions(self, db: Session, user: User, doc_id: str) -> list[DocumentVersion]:
         doc = self.get_document(db, user, doc_id)
         return self.versions.list_by_document(db, doc.id)
 
+    # Upload a new file version, create storage/version/job records, and snapshot the policy contract.
     def create_version(
         self, db: Session, user: User, doc_id: str, *,
         raw_bytes: bytes, filename: str, content_type: str,
@@ -264,6 +339,7 @@ class DocumentService:
         job, created = job_service.create_or_get_ingest_job(
             db, trace_id=trace_id, document_id=doc.id,
             version_id=version.id, created_by_user_id=user.id,
+            initial_status="pending_approval",
         )
 
         audit_service.log_action(
@@ -280,6 +356,7 @@ class DocumentService:
         db.refresh(job)
         return doc, version, job, created
 
+    # Create or retrieve an ingest job for a document version; optionally force a new job.
     def start_ingest(
         self, db: Session, user: User, doc_id: str, *,
         version_id: str | None, force_new: bool, trace_id: str,
@@ -310,12 +387,13 @@ class DocumentService:
         db.refresh(job)
         return job
 
+    # Delete a document and all its associated versions, chunks, jobs, and FGA tuples.
     def delete_document(self, db: Session, user: User, doc_id: str, trace_id: str) -> None:
         doc = self.docs.get_by_id(db, doc_id)
         if not doc:
             raise HTTPException(status_code=404, detail="Document not found")
 
-        # Chỉ corp member hoặc owner mới xóa được
+        # Only corp members or the owner may delete the document.
         if doc.owner_user_id != user.id and not self._is_corp_member(db, user):
             raise HTTPException(status_code=403, detail="No permission to delete")
 
@@ -365,4 +443,5 @@ class DocumentService:
         db.commit()
 
 
+# Module-level singleton; imported by the document API router.
 document_service = DocumentService()

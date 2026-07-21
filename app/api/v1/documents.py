@@ -1,15 +1,28 @@
+"""
+Document management endpoints: create, list, update, delete, version upload,
+file streaming, review workflow (submit/approve/reject), and ingest triggering.
+"""
+import io
 import urllib.parse
-from app.models.document import Document as DocumentModel
-from fastapi import APIRouter, Depends, File, Form, UploadFile, Request, HTTPException
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_user, get_db
-from app.models.user import User
+from app.models.document import Document as DocumentModel
 from app.models.document_version import DocumentVersion
+from app.models.job import Job as JobModel
+from app.models.user import User
+from app.repositories.document_access_request_repository import doc_access_request_repo
+from app.repositories.storage_repository import StorageRepository
 from app.schemas.document import (
-    ChunkingConfig, DocumentCreateRequest, DocumentRead,
-    DocumentUpdateRequest, DocumentVersionRead, UploadVersionResponse,
+    ChunkingConfig,
+    DocumentCreateRequest,
+    DocumentRead,
+    DocumentUpdateRequest,
+    DocumentVersionRead,
+    UploadVersionResponse,
 )
 from app.schemas.job import JobRead
 from app.services.document_service import document_service
@@ -19,10 +32,24 @@ from app.workers.ingest_tasks import process_ingest_job
 router = APIRouter()
 
 
+# Return True if the user holds a corp-level (root OUI) membership.
 def _is_corp_member(db: Session, user: User) -> bool:
     return _user_service.build_user_response(db, user).is_corp_member
 
 
+# Find the latest pending-approval job for a document and queue it for processing.
+def _trigger_pending_job(db: Session, document_id: str) -> None:
+    job = db.query(JobModel).filter(
+        JobModel.document_id == document_id,
+        JobModel.status == "pending_approval",
+    ).order_by(JobModel.created_at.desc()).first()
+    if job:
+        job.status = "queued"
+        db.commit()
+        process_ingest_job.delay(job.id)
+
+
+# Create a new document record for the current user.
 @router.post("", response_model=DocumentRead)
 def create_document(
     payload: DocumentCreateRequest,
@@ -34,6 +61,7 @@ def create_document(
     return DocumentRead.model_validate(doc)
 
 
+# List all documents visible to the current user.
 @router.get("", response_model=list[DocumentRead])
 def list_documents(
     db: Session = Depends(get_db),
@@ -43,6 +71,19 @@ def list_documents(
     return [DocumentRead.model_validate(d) for d in docs]
 
 
+# Return the count of documents currently awaiting corp-level review.
+@router.get("/pending-review-count")
+def pending_review_count(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not _is_corp_member(db, current_user):
+        return {"count": 0}
+    count = db.query(DocumentModel).filter(DocumentModel.status == "review").count()
+    return {"count": count}
+
+
+# Retrieve a single document by ID, enforcing access control.
 @router.get("/{document_id}", response_model=DocumentRead)
 def get_document(
     document_id: str,
@@ -53,6 +94,7 @@ def get_document(
     return DocumentRead.model_validate(doc)
 
 
+# Update document metadata (title, sensitivity, OUI assignment, etc.).
 @router.patch("/{document_id}", response_model=DocumentRead)
 def update_document(
     document_id: str,
@@ -65,6 +107,7 @@ def update_document(
     return DocumentRead.model_validate(doc)
 
 
+# List all versions for a document.
 @router.get("/{document_id}/versions", response_model=list[DocumentVersionRead])
 def get_versions(
     document_id: str,
@@ -75,6 +118,7 @@ def get_versions(
             for v in document_service.get_versions(db, current_user, document_id)]
 
 
+# Upload a new file version (max 50 MB) and create a pending ingest job.
 @router.post("/{document_id}/versions", response_model=UploadVersionResponse)
 async def upload_version(
     document_id: str,
@@ -102,8 +146,11 @@ async def upload_version(
         trace_id=request.state.trace_id, chunking_config=chunking_config,
     )
 
-    if queued:
-        process_ingest_job.delay(job.id)
+    if _is_corp_member(db, current_user):
+        # Corp members bypass the review step; trigger ingest immediately.
+        doc.status = "approved"
+        db.commit()
+        _trigger_pending_job(db, document_id)
 
     return UploadVersionResponse(
         document=DocumentRead.model_validate(doc),
@@ -113,6 +160,7 @@ async def upload_version(
     )
 
 
+# Stream the source file for a document version, enforcing chunk-level clearance.
 @router.get("/{document_id}/versions/{version_id}/file")
 def view_document_file(
     document_id: str,
@@ -120,10 +168,26 @@ def view_document_file(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    import io
-    from app.repositories.storage_repository import StorageRepository
-
     document_service.get_document(db, current_user, document_id)
+
+    # Chunk-level sensitivity gate: block if any chunk > user clearance without approval
+    user_clearance = max(
+        (uop.position.clearance for uop in getattr(current_user, "oui_positions", []) if uop.position),
+        default=1,
+    )
+    if not _is_corp_member(db, current_user):
+        # Read from Chroma — same source as /access-status (the lock icon) so both
+        # always agree. Legacy-ingested chunks lack chunk_sensitivity in MySQL.
+        from app.services.chroma_service import chroma_service
+        max_chunk_sens = chroma_service.get_max_chunk_sensitivity(document_id)
+        if max_chunk_sens > user_clearance:
+            approved_ids = doc_access_request_repo.get_active_approved_doc_ids(db, str(current_user.id))
+            if document_id not in approved_ids:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Tài liệu này chứa nội dung vượt mức độ phân quyền của bạn. Vui lòng gửi yêu cầu xem tài liệu.",
+                )
+
     version = db.query(DocumentVersion).filter(
         DocumentVersion.id == version_id,
         DocumentVersion.document_id == document_id,
@@ -146,6 +210,7 @@ def view_document_file(
     )
 
 
+# Submit a document for corp-level review, or auto-approve if caller is a corp member.
 @router.post("/{document_id}/submit-review")
 def submit_for_review(
     document_id: str,
@@ -162,14 +227,17 @@ def submit_for_review(
 
     if _is_corp_member(db, current_user):
         doc.status = "approved"
+        db.commit()
+        _trigger_pending_job(db, doc.id)
     else:
         doc.status = "review"
+        db.commit()
 
-    db.commit()
     db.refresh(doc)
     return DocumentRead.model_validate(doc)
 
 
+# Approve a document and trigger its ingest pipeline. Requires corp-level access.
 @router.post("/{document_id}/approve")
 def approve_document(
     document_id: str,
@@ -185,10 +253,12 @@ def approve_document(
         raise HTTPException(status_code=400, detail=f"Cannot approve with status '{doc.status}'")
     doc.status = "approved"
     db.commit()
+    _trigger_pending_job(db, doc.id)
     db.refresh(doc)
     return DocumentRead.model_validate(doc)
 
 
+# Reject a document and cancel its pending ingest job. Requires corp-level access.
 @router.post("/{document_id}/reject")
 def reject_document(
     document_id: str,
@@ -204,11 +274,19 @@ def reject_document(
     if doc.status not in {"review", "uploaded"}:
         raise HTTPException(status_code=400, detail=f"Cannot reject with status '{doc.status}'")
     doc.status = "draft"
+    job = db.query(JobModel).filter(
+        JobModel.document_id == doc.id,
+        JobModel.status == "pending_approval",
+    ).order_by(JobModel.created_at.desc()).first()
+    if job:
+        job.status = "cancelled"
+        job.error_message = "Rejected by reviewer"
     db.commit()
     db.refresh(doc)
     return DocumentRead.model_validate(doc)
 
 
+# Permanently delete a document and all associated data.
 @router.delete("/{document_id}")
 def delete_document(
     document_id: str,
@@ -220,6 +298,7 @@ def delete_document(
     return {"ok": True}
 
 
+# Manually start or re-trigger the ingest pipeline for a specific document version.
 @router.post("/{document_id}/ingest", response_model=JobRead)
 def start_ingest(
     document_id: str,

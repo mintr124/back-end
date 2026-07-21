@@ -1,15 +1,11 @@
 """
-ingest_pipeline_service.py  –  v3
-===================================
-Thay đổi so với v2:
-  - Đọc chunk_config_json từ DocumentVersion để lấy ChunkConfig
-  - Truyền config vào chunker_service.chunk(parsed, config=cfg)
-  - Mọi thứ khác giữ nguyên
+Ingest pipeline service: orchestrates download → parse → chunk → entity detection → embed for a document version.
 """
 from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from sqlalchemy.orm import Session
@@ -33,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 class IngestPipelineService:
 
+    # Execute the full ingest pipeline for a job, writing step records and updating status fields.
     def run(self, db: Session, job_id: str):
         job = job_service.get_job(db, job_id)
         if not job:
@@ -54,6 +51,7 @@ class IngestPipelineService:
             return
 
         try:
+            pre_ingest_status     = doc.status   # saved to restore doc status after ingest.
             doc.status            = "processing"
             version.ingest_status = "running"
             version.parse_status  = "running"
@@ -61,9 +59,9 @@ class IngestPipelineService:
             version.embed_status  = "pending"
             db.commit()
 
-            # ── Đọc chunking config từ version ────────────────────────
-            # version.chunk_config_json được lưu lúc upload
-            # Nếu None (version cũ) → dùng legacy defaults
+            # ── Read chunking config from version ─────────────────────
+            # version.chunk_config_json is saved at upload time.
+            # If None (legacy version) → use legacy defaults.
             chunking_cfg = ChunkConfig(
                 **ChunkingConfig.from_json(version.chunk_config_json).model_dump(
                     exclude={"embed_model"}  # ChunkingConfig không có field này
@@ -139,8 +137,8 @@ class IngestPipelineService:
             )
             t0 = time.perf_counter()
 
-            # ← THAY ĐỔI DUY NHẤT: truyền config vào
-            chunks = chunker_service.chunk(parsed, config=chunking_cfg)
+            # Pass the per-version chunking config to the chunker.
+            chunks = chunker_service.chunk(parsed, config=chunking_cfg, doc_sensitivity=doc.sensitivity)
 
             chunk_models: list[DocumentChunk] = []
             for c in chunks:
@@ -169,6 +167,8 @@ class IngestPipelineService:
             version.chunk_status = "completed"
             db.commit()
 
+            db.commit()
+
             # ── embed  (BATCH) ────────────────────────────────────────
             embed_step = job_service.add_step(
                 db, job_id=job.id, step_name="embed",
@@ -181,14 +181,13 @@ class IngestPipelineService:
 
             for chunk_model, chunk_dict, vector in zip(chunk_models, chunks, vectors):
                 meta_json = chunk_dict.get("metadata_json") or {}
-                # Dòng ~184, thay đoạn metadata:
                 metadata = {
                     "document_id":         doc.id,
                     "document_version_id": version.id,
                     "document_title":      doc.title,
                     "oui_ids":             ",".join(sorted([o.id for o in (doc.ouis or [])])),
                     "document_type":       doc.document_type,
-                    "sensitivity":         str(doc.sensitivity),
+                    "sensitivity":         doc.sensitivity,
                     "data_type":           doc.data_type,
                     "chunk_index":         chunk_model.chunk_index,
                     "page_start":          chunk_model.page_start,
@@ -198,10 +197,12 @@ class IngestPipelineService:
                     "section_index":       meta_json.get("section_index", 0),
                     "position_ratio":      meta_json.get("position_ratio", 0.0),
                     "chunker_mode":        meta_json.get("chunker_mode", "legacy"),
+                    "chunk_sensitivity":     meta_json.get("chunk_sensitivity", doc.sensitivity),
+                    "llm_chunk_sensitivity": meta_json.get("chunk_sensitivity", doc.sensitivity),
                 }
                 chroma_service.upsert_chunk(
                     chunk_id=chunk_model.id,
-                    document_text=chunk_dict["chunk_text"],
+                        document_text=chunk_dict.get("embed_text") or chunk_dict["chunk_text"],  
                     embedding=vector,
                     metadata=metadata,
                 )
@@ -227,19 +228,17 @@ class IngestPipelineService:
             version.embed_status  = "completed"
             version.ingest_status = "succeeded"
 
-            creator = job.created_by
-            from app.services.user_service import user_service as _user_service
-            if creator:
-                from app.services.user_service import user_service as _user_service
-                from app.db.session import SessionLocal
-                with SessionLocal() as tmp_db:
-                    creator_resp = _user_service.build_user_response(tmp_db, creator)
-                    if creator_resp.is_corp_member:
-                        doc.status = "approved"
-                    elif doc.status not in {"approved", "ready"}:
-                        doc.status = "review"
+            if pre_ingest_status == "approved":
+                doc.status = "approved"
             else:
-                if doc.status not in {"approved", "ready"}:
+                creator = job.created_by
+                if creator:
+                    from app.services.user_service import user_service as _user_service
+                    from app.db.session import SessionLocal
+                    with SessionLocal() as tmp_db:
+                        creator_resp = _user_service.build_user_response(tmp_db, creator)
+                        doc.status = "approved" if creator_resp.is_corp_member else "review"
+                else:
                     doc.status = "review"
 
             doc.current_version_id = version.id
@@ -274,8 +273,9 @@ class IngestPipelineService:
                 latency_ms=int((time.perf_counter() - start_total) * 1000),
             )
 
-            job.status   = "succeeded"
-            job.progress = 100
+            job.status      = "succeeded"
+            job.progress    = 100
+            job.finished_at = datetime.now(timezone.utc).isoformat()
             db.commit()
 
         except Exception as exc:
@@ -288,6 +288,7 @@ class IngestPipelineService:
                 job.status        = "failed"
                 job.error_message = str(exc)
                 job.progress      = min(job.progress or 0, 99)
+                job.finished_at   = datetime.now(timezone.utc).isoformat()
             if doc:
                 doc.status = "failed"
             if version:
@@ -318,4 +319,5 @@ class IngestPipelineService:
             raise
 
 
+# Module-level singleton; imported by the ingest worker and job API router.
 ingest_pipeline_service = IngestPipelineService()

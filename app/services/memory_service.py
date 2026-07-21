@@ -1,24 +1,15 @@
 """
-memory_service.py
-==================
-Hybrid Conversation Memory:
+Hybrid conversation memory: history = rolling summary + relevant Q&A pairs + recent Q&A pairs.
 
-  history = [summary của messages cũ] + [3 recent Q&A] + [3 relevant Q&A]
-
-Pipeline mỗi lần user gửi message:
-  1. load_history(conv_id, query)
-     → trả về list[dict] để nhét vào LLM prompt
-  2. update_summary(conv_id, new_messages)  (gọi sau khi có assistant reply)
-     → cập nhật rolling summary bằng LLM nếu conversation đủ dài
+  load_history(conv_id, query)   — build the history list to inject into the LLM prompt.
+  update_summary(conv_id)        — update the rolling summary via LLM after each assistant reply.
 
 Design:
-  - Recent:   3 cặp Q&A gần nhất (6 messages) — đảm bảo mạch hội thoại
-  - Relevant: 3 cặp Q&A liên quan nhất với query hiện tại (cosine sim trên embedding)
-              dedup với recent để không trùng
-  - Summary:  1 đoạn tóm tắt ngắn (~150 token) của tất cả messages cũ hơn recent
-              được update mỗi SUMMARY_UPDATE_EVERY lượt
-
-Embedding dùng lại embedding_service (OpenAI/Ollama) — không cần infra thêm.
+  Recent:   last RECENT_PAIRS Q&A pairs — preserves immediate conversational flow.
+  Relevant: top RELEVANT_PAIRS pairs most similar to the current query (cosine on embeddings),
+            deduplicated against recent.
+  Summary:  one short paragraph (~150 tokens) covering all messages older than recent,
+            refreshed every SUMMARY_UPDATE_EVERY turns.
 """
 from __future__ import annotations
 
@@ -36,14 +27,15 @@ from app.services.embedding_service import embedding_service
 logger = logging.getLogger(__name__)
 
 # ── Tunable constants ──────────────────────────────────────────────────────
-RECENT_PAIRS    = 3    # số cặp Q&A gần nhất giữ nguyên
-RELEVANT_PAIRS  = 3    # số cặp Q&A liên quan nhất
-SUMMARY_UPDATE_EVERY = 6   # update summary sau mỗi N cặp Q&A mới
-MAX_SUMMARY_TOKENS   = 150 # LLM prompt token limit cho summary
-DONE_STATUSES = {"success", "fallback", "no_answer", "llm_error"}
+RECENT_PAIRS    = 3    # most-recent Q&A pairs always included verbatim
+RELEVANT_PAIRS  = 3    # top similar Q&A pairs retrieved by embedding
+SUMMARY_UPDATE_EVERY = 6   # refresh summary every N new Q&A pairs
+MAX_SUMMARY_TOKENS   = 150 # token budget for the LLM-generated summary
+DONE_STATUSES = {"success", "fallback", "no_answer", "llm_error", "blocked"}
 # ──────────────────────────────────────────────────────────────────────────
 
 
+# Compute cosine similarity between two embedding vectors.
 def _cosine(a: list[float], b: list[float]) -> float:
     if not a or not b or len(a) != len(b):
         return 0.0
@@ -63,18 +55,14 @@ class MemoryService:
     # Public: load history for prompt
     # ------------------------------------------------------------------
 
+    # Build the prompt history list: summary → relevant pairs → recent pairs.
     def load_history(
         self,
         db: Session,
         conversation_id: str,
         query: str,
     ) -> list[dict]:
-        """
-        Returns list[dict] with keys: role, content
-        Order: summary (if any) → relevant pairs → recent pairs
-        Deduplication: relevant pairs that overlap with recent are dropped.
-        """
-        # Load all messages (max 200 để tránh OOM)
+        # Load all messages (max 200 to avoid OOM)
         all_msgs = self.msg_repo.list_by_conversation(db, conversation_id, limit=200)
 
         # Build Q&A pairs: [(user_msg, assistant_msg), ...]
@@ -84,7 +72,7 @@ class MemoryService:
             return []
 
         # Split: recent vs older
-        recent_pairs  = pairs[-RECENT_PAIRS:]          # cuối cùng
+        recent_pairs  = pairs[-RECENT_PAIRS:]
         older_pairs   = pairs[:-RECENT_PAIRS] if len(pairs) > RECENT_PAIRS else []
 
         # Get summary from conversation
@@ -94,9 +82,9 @@ class MemoryService:
         # Find relevant pairs from older_pairs
         relevant_pairs = self._find_relevant(query, older_pairs, top_k=RELEVANT_PAIRS)
 
-        # Dedup: remove relevant pairs already in recent
-        recent_ids = {id(p) for p in recent_pairs}
-        relevant_pairs = [p for p in relevant_pairs if id(p) not in recent_ids]
+        # Dedup: remove relevant pairs already in recent (compare by message ID)
+        recent_ids = {u.id for u, a in recent_pairs}
+        relevant_pairs = [p for p in relevant_pairs if p[0].id not in recent_ids]
 
         # Build history list
         history: list[dict] = []
@@ -122,26 +110,21 @@ class MemoryService:
     # Public: update rolling summary after assistant replies
     # ------------------------------------------------------------------
 
+    # Regenerate the rolling summary via LLM if the conversation is long enough.
     def update_summary(
         self,
         db: Session,
         conversation_id: str,
     ) -> None:
-        """
-        Gọi sau khi assistant đã reply.
-        Chỉ update summary nếu số cặp Q&A vượt ngưỡng SUMMARY_UPDATE_EVERY.
-        Summary chỉ tóm tắt các messages CŨ HƠN RECENT_PAIRS cặp cuối.
-        """
         all_msgs = self.msg_repo.list_by_conversation(db, conversation_id, limit=200)
         pairs    = self._build_pairs(all_msgs)
 
-        # Chỉ update khi đủ dài
         if len(pairs) < RECENT_PAIRS + SUMMARY_UPDATE_EVERY:
             return
 
         older_pairs = pairs[:-RECENT_PAIRS]
 
-        # Gọi LLM để tạo summary
+        # Call the LLM to generate a new summary.
         try:
             from app.services.llm_service import llm_service
             if not llm_service.is_configured():
@@ -180,6 +163,7 @@ class MemoryService:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    # Group a flat message list into consecutive (user, assistant) Q&A pairs.
     def _build_pairs(self, messages):
         pairs = []
         i = 0
@@ -204,17 +188,13 @@ class MemoryService:
                 i += 1
         return pairs
 
+    # Return the top_k pairs most relevant to the query via embedding similarity, falling back to keyword overlap.
     def _find_relevant(
         self,
         query: str,
         pairs: list[tuple[Message, Message]],
         top_k: int,
     ) -> list[tuple[Message, Message]]:
-        """
-        Tìm top_k cặp Q&A có nội dung liên quan nhất đến query.
-        Dùng cosine similarity trên embedding của user message.
-        Fallback về keyword overlap nếu embedding không khả dụng.
-        """
         if not pairs or not query.strip():
             return []
 
@@ -228,6 +208,7 @@ class MemoryService:
         # Fallback: keyword overlap
         return self._relevant_by_keyword(query, pairs, top_k)
 
+    # Rank pairs by cosine similarity between the query embedding and each user-message embedding.
     def _relevant_by_embedding(
         self,
         query: str,
@@ -249,6 +230,7 @@ class MemoryService:
         scored.sort(key=lambda x: x[0], reverse=True)
         return [pair for _, _, pair in scored[:top_k]]
 
+    # Rank pairs by token-overlap count between the query and each user message.
     def _relevant_by_keyword(
         self,
         query: str,
@@ -267,4 +249,5 @@ class MemoryService:
         return [pair for _, pair in scored[:top_k]]
 
 
+# Module-level singleton; imported by the chat service.
 memory_service = MemoryService()

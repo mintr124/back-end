@@ -1,4 +1,5 @@
-from sqlalchemy import Column, DateTime, Integer, JSON, String, func
+from sqlalchemy import Column, DateTime, func, Integer, JSON, String
+
 from app.db.base import Base, TimestampMixin
 from app.utils.ids import new_uuid
 
